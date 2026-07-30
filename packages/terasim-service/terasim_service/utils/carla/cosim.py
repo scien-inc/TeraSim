@@ -88,6 +88,41 @@ class CarlaCosim(object):
         # 2026-07-28): min/max of CARLA-synced vehicles within the same window.
         self._tick_veh_min = None
         self._tick_veh_max = None
+        # Stage 3b async mode (run_cosim --tick_mode async): nobody ticks the
+        # world; the CARLA server free-runs with a variable delta and this
+        # process paces SUMO on a step_length wall-clock grid (_tick_async).
+        self.tick_async = bool(getattr(args, "tick_async", False))
+        # Catch-up cap: a late cycle runs at most this many SUMO steps in one
+        # go; debt beyond it is dropped (SUMO slow motion, never a long step
+        # burst) and reported as dropped= in [async-timing].
+        self._async_catchup_max_steps = 5
+        # Cycles without a new CARLA frame before warning that the world looks
+        # stuck in synchronous mode again (a relaunched bridge re-applies it;
+        # the runbook says restart this process to clear the settings).
+        self._async_stall_warn_cycles = 40  # ~2s at 50ms
+        # [async-timing] window stats, printed every ~60s like [tick-timing].
+        # Window-scoped (reset after each print):
+        self._async_work_ms = []
+        self._async_sumo_ms = []
+        self._async_write_ms = []
+        self._async_overrun_cycles = 0
+        self._async_catchup_steps = 0
+        self._async_dropped_periods = 0
+        self._async_frames_advanced = 0
+        self._async_delta_ms_samples = []
+        self._async_delta_over_100ms = 0
+        self._async_veh_min = None
+        self._async_veh_max = None
+        self._async_sumo_veh_min = None
+        self._async_sumo_veh_max = None
+        self._async_window_start = None
+        # Cumulative (never reset; feeds the drift figures):
+        self._async_prev_frame = None
+        self._async_stalled_cycles = 0
+        self._async_sumo_steps_total = 0
+        self._async_start_wall = None
+        self._async_start_carla_elapsed = None
+        self._async_last_carla_elapsed = None
         self._spawn_failures = {}
         self._missing_angle_warnings = set()
         self._invalid_location_warnings = set()
@@ -383,14 +418,18 @@ class CarlaCosim(object):
         return [offset_x, offset_y]
 
     def tick(self):
-        """One co-sim step. Dispatches on the tick mode (design: stage 3a doc).
+        """One co-sim step. Dispatches on the tick mode (design: stage 3a/3b docs).
 
-        follow (default): _tick_follow() - the current passive pipeline, kept
-        unchanged for the future async configuration.
+        follow (default): _tick_follow() - the passive pipeline (the bridge
+        owns world.tick(); this process follows via wait_for_tick).
         master: _tick_master() - fixed-cadence world.tick() + serial SUMO step.
+        async: _tick_async() - nobody ticks; wall-clock-paced SUMO steps
+        against a free-running CARLA server.
         """
         if self.tick_master:
             return self._tick_master()
+        if self.tick_async:
+            return self._tick_async()
         return self._tick_follow()
 
     def _tick_master(self):
@@ -462,6 +501,187 @@ class CarlaCosim(object):
             if not getattr(self.args, "skip_tls", False):
                 self.sync_cosim_tls_to_carla(self._inproc_prev_state)
         return True
+
+    def _tick_async(self):
+        """One cycle in async mode (stage 3b: free-running CARLA, wall-paced SUMO).
+
+        Nobody calls world.tick(): run_cosim cleared synchronous_mode, so the
+        server advances by itself with a variable delta (sim time tracks real
+        time by construction). This loop paces SUMO on the same step_length
+        wall-clock grid as _tick_master; a cycle that arrives late additionally
+        runs the missed periods as extra SUMO steps so SUMO time keeps tracking
+        real time (traffic-cosim-sync-design.md §4.1), capped at
+        _async_catchup_max_steps (debt beyond the cap is dropped = slow motion,
+        never a long burst). All CARLA reads in the cycle (get_snapshot(),
+        get_transform()) are served from the client-side state cache fed by the
+        server's frame stream, so no part of the cycle waits on the server.
+        """
+        now = time.monotonic()
+        steps_due = 1
+        if self._next_tick_deadline is None:
+            self._next_tick_deadline = now + self.step_length
+        elif now < self._next_tick_deadline:
+            time.sleep(self._next_tick_deadline - now)
+            self._next_tick_deadline += self.step_length
+        else:
+            # Late: also run the periods that already elapsed. Past the cap,
+            # drop the remaining debt and re-pin the grid to "now".
+            missed = 1 + int((now - self._next_tick_deadline) / self.step_length)
+            self._async_overrun_cycles += 1
+            if missed > self._async_catchup_max_steps:
+                self._async_dropped_periods += missed - self._async_catchup_max_steps
+                steps_due = self._async_catchup_max_steps
+                self._next_tick_deadline = time.monotonic() + self.step_length
+            else:
+                steps_due = missed
+                self._next_tick_deadline += missed * self.step_length
+            self._async_catchup_steps += steps_due - 1
+
+        t0 = time.monotonic()
+        if self._async_window_start is None:
+            self._async_window_start = t0
+        snapshot = self.world.get_snapshot()
+        frame = getattr(snapshot, "frame", None)
+        self._last_world_frame = frame
+        timestamp = getattr(snapshot, "timestamp", None)
+        if timestamp is not None:
+            if self._async_start_wall is None:
+                self._async_start_wall = t0
+                self._async_start_carla_elapsed = timestamp.elapsed_seconds
+            self._async_last_carla_elapsed = timestamp.elapsed_seconds
+            delta = getattr(timestamp, "delta_seconds", None)
+            if delta:
+                self._async_delta_ms_samples.append(delta * 1000.0)
+                if delta > 0.1:
+                    # Above 100ms per frame CARLA's physics substepping
+                    # (<=10 substeps of <=10ms) can no longer cover the frame.
+                    self._async_delta_over_100ms += 1
+        if frame is not None:
+            if self._async_prev_frame is not None:
+                advanced = frame - self._async_prev_frame
+                if advanced > 0:
+                    self._async_frames_advanced += advanced
+                    self._async_stalled_cycles = 0
+                else:
+                    self._async_stalled_cycles += 1
+                    if self._async_stalled_cycles == self._async_stall_warn_cycles:
+                        print(
+                            "[async-timing] WARN: no new CARLA frame for "
+                            f"{self._async_stall_warn_cycles} cycles - the "
+                            "world looks stuck in synchronous mode (a "
+                            "relaunched bridge re-applies it; restart this "
+                            "process to clear the settings)",
+                            flush=True,
+                        )
+            self._async_prev_frame = frame
+
+        sumo_ms = 0.0
+        for _ in range(steps_due):
+            commands = []
+            if self.control_av:
+                av_command = self._build_av_command()
+                if av_command is not None:
+                    commands.append(av_command)
+            s0 = time.monotonic()
+            handle = self.inprocess_plugin.tick_async(commands)
+            try:
+                result = handle.result(timeout=300.0)
+            except TimeoutError as e:
+                print(f"TeraSim in-process tick failed: {e}. Exiting...")
+                return False
+            sumo_ms += (time.monotonic() - s0) * 1000.0
+            self._async_sumo_steps_total += 1
+            if result.status in ("finished", "error"):
+                print(f"TeraSim ended (status={result.status}). Exiting...")
+                return False
+            if result.state is not None:
+                self._inproc_prev_state = result.state
+
+        w0 = time.monotonic()
+        if self._inproc_prev_state is not None:
+            self.sync_cosim_actor_to_carla(self._inproc_prev_state)
+            if not getattr(self.args, "skip_tls", False):
+                self.sync_cosim_tls_to_carla(self._inproc_prev_state)
+        done = time.monotonic()
+
+        self._async_sumo_ms.append(sumo_ms)
+        self._async_write_ms.append((done - w0) * 1000.0)
+        self._async_work_ms.append((done - t0) * 1000.0)
+        nveh = len(self._vehicle_actor_index)
+        self._async_veh_min = nveh if self._async_veh_min is None else min(self._async_veh_min, nveh)
+        self._async_veh_max = nveh if self._async_veh_max is None else max(self._async_veh_max, nveh)
+        state = self._inproc_prev_state
+        if isinstance(state, dict):
+            sveh = len(state.get("agent_details", {}).get("vehicle", {}))
+            self._async_sumo_veh_min = (
+                sveh if self._async_sumo_veh_min is None else min(self._async_sumo_veh_min, sveh)
+            )
+            self._async_sumo_veh_max = (
+                sveh if self._async_sumo_veh_max is None else max(self._async_sumo_veh_max, sveh)
+            )
+        if len(self._async_work_ms) >= 1200:
+            self._print_async_timing_window(done)
+        return True
+
+    def _print_async_timing_window(self, now):
+        """Emit the ~60s [async-timing] line and reset the window counters.
+
+        Timing comes with the vehicle counts (carla_veh = actors synced into
+        CARLA, sumo_veh = vehicles in the SUMO state), the CARLA frame stats
+        (fps + sampled per-frame delta; over100ms counts frames that break the
+        physics substep guarantee), and the cumulative drift of SUMO time and
+        CARLA time against the wall clock (a growing negative sumo drift means
+        dropped catch-up debt = SUMO slow motion).
+        """
+        work = sorted(self._async_work_ms)
+        sumo = sorted(self._async_sumo_ms)
+        write = sorted(self._async_write_ms)
+        n = len(work)
+        window_s = max(1e-9, now - self._async_window_start)
+        fps = self._async_frames_advanced / window_s
+        if self._async_delta_ms_samples:
+            deltas = sorted(self._async_delta_ms_samples)
+            delta_txt = (
+                f"frame_ms p50={deltas[len(deltas) // 2]:.1f} "
+                f"max={deltas[-1]:.1f} over100ms={self._async_delta_over_100ms}"
+            )
+        else:
+            delta_txt = "frame_ms n/a"
+        wall_elapsed = now - self._async_start_wall
+        sumo_drift = self._async_sumo_steps_total * self.step_length - wall_elapsed
+        if self._async_last_carla_elapsed is not None:
+            carla_drift = (
+                self._async_last_carla_elapsed - self._async_start_carla_elapsed
+            ) - wall_elapsed
+            drift_txt = f"drift_s sumo={sumo_drift:+.2f} carla={carla_drift:+.2f}"
+        else:
+            drift_txt = f"drift_s sumo={sumo_drift:+.2f} carla=n/a"
+        print(
+            f"[async-timing] cycle work ms: p50={work[n // 2]:.1f} "
+            f"p95={work[int(n * 0.95)]:.1f} max={work[-1]:.1f} "
+            f"(sumo p50={sumo[n // 2]:.1f} write p50={write[n // 2]:.1f}) n={n} | "
+            f"overrun={self._async_overrun_cycles} "
+            f"catchup={self._async_catchup_steps} "
+            f"dropped={self._async_dropped_periods} | "
+            f"carla_fps={fps:.1f} {delta_txt} | {drift_txt} | "
+            f"carla_veh={self._async_veh_min}-{self._async_veh_max} "
+            f"sumo_veh={self._async_sumo_veh_min}-{self._async_sumo_veh_max}",
+            flush=True,
+        )
+        self._async_work_ms = []
+        self._async_sumo_ms = []
+        self._async_write_ms = []
+        self._async_overrun_cycles = 0
+        self._async_catchup_steps = 0
+        self._async_dropped_periods = 0
+        self._async_frames_advanced = 0
+        self._async_delta_ms_samples = []
+        self._async_delta_over_100ms = 0
+        self._async_veh_min = None
+        self._async_veh_max = None
+        self._async_sumo_veh_min = None
+        self._async_sumo_veh_max = None
+        self._async_window_start = None
 
     def _tick_follow(self):
         """One co-sim step over the in-process link (single process, no RPC).
@@ -1377,12 +1597,17 @@ class CarlaCosim(object):
         """
         Cleans synchronization and resets the simulation settings.
         """
-        # In both 3-cosim modes (follow AND master) the psim side is still
-        # alive when this process exits, so the world settings and the ego are
-        # preserved. In follow mode the bridge owns synchronous_mode; in master
-        # mode nobody ticks after us and the operating rule is the same as a
-        # dead bridge today: restart CARLA before the next run.
-        preserve_world = getattr(self.args, "passive_tick", False) or self.tick_master
+        # In all 3-cosim modes (follow, master AND async) the psim side is
+        # still alive when this process exits, so the world settings and the
+        # ego are preserved. In follow mode the bridge owns synchronous_mode;
+        # in master mode nobody ticks after us and the operating rule is the
+        # same as a dead bridge today: restart CARLA before the next run; in
+        # async mode the world just keeps free-running.
+        preserve_world = (
+            getattr(self.args, "passive_tick", False)
+            or self.tick_master
+            or self.tick_async
+        )
         if not preserve_world:
             # Configuring carla simulation in async mode.
             settings = self.world.get_settings()
