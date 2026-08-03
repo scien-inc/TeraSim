@@ -40,6 +40,10 @@ class AgentStateSimplified(BaseModel):
     # Orientation in the SUMO coordinate system
     sumo_angle: float = 0.0
 
+    # Road-relative pitch reported by SUMO (degrees). Keep the native unit
+    # because this value is passed directly to carla.Rotation.pitch.
+    sumo_slope: float = 0.0
+
     # Size (https://www.autoscout24.de/auto/technische-daten/mercedes-benz/vito/vito-111-cdi-kompakt-2003-2014-transporter-diesel/)
     ## length of the agent (meters)
     length: float = 5.0

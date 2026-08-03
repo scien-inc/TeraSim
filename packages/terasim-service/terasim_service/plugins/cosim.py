@@ -1158,6 +1158,7 @@ class TeraSimCoSimPlugin(BasePlugin):
             traci.constants.VAR_POSITION,
             traci.constants.VAR_POSITION3D,
             traci.constants.VAR_ANGLE,
+            traci.constants.VAR_SLOPE,
             traci.constants.VAR_SPEED,
             traci.constants.VAR_SPEED_LAT,
             traci.constants.VAR_ACCELERATION,
@@ -1782,6 +1783,13 @@ class TeraSimCoSimPlugin(BasePlugin):
             if sumo_angle is None:
                 sumo_angle = traci.vehicle.getAngle(vid)
             vehicle_state.sumo_angle = sumo_angle
+            sumo_slope = context_values.get(traci.constants.VAR_SLOPE)
+            if sumo_slope is None:
+                try:
+                    sumo_slope = traci.vehicle.getSlope(vid)
+                except Exception:
+                    sumo_slope = 0.0
+            vehicle_state.sumo_slope = sumo_slope
             vehicle_state.orientation = math.radians(
                 (90 - vehicle_state.sumo_angle) % 360
             )
