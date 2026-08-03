@@ -87,6 +87,40 @@ def install_fake_carla():
     )
 
 
+def test_create_simulator_step_length_override_reaches_sumo(monkeypatch):
+    from terasim_service.utils import base as base_module
+
+    created = []
+
+    class FakeSimulator:
+        def __init__(self, **kwargs):
+            created.append(kwargs)
+
+    monkeypatch.setattr(base_module, "Simulator", FakeSimulator)
+    config = {
+        "input": {
+            "sumo_net_file": "network.net.xml",
+            "sumo_config_file": "scenario.sumocfg",
+        },
+        "simulator": {
+            "parameters": {
+                "num_tries": 1,
+                "gui_flag": False,
+                "realtime_flag": False,
+                "sumo_output_file_types": [],
+                "traffic_scale": 1.0,
+                "step_length": 0.1,
+            }
+        },
+    }
+
+    base_module.create_simulator(config, "/tmp/output", step_length=0.05)
+    base_module.create_simulator(config, "/tmp/output")
+
+    assert created[0]["step_length"] == pytest.approx(0.05)
+    assert created[1]["step_length"] == pytest.approx(0.1)
+
+
 def test_lane_lookahead_crosses_internal_and_destination_lanes():
     from terasim_service.utils.sumo_lane_geometry import (
         extract_next_link_lane_ids,
@@ -487,6 +521,49 @@ def test_feedback_apply_enables_physics_only_for_selected_actors():
     assert cosim._uses_ackermann_physics("AV") is False
 
 
+def test_vehicle_transform_uses_sumo_slope_as_carla_pitch(monkeypatch):
+    install_fake_carla()
+    from terasim_service.utils.carla import cosim as cosim_module
+
+    rotations = []
+
+    def convert_transform(location, rotation, shape, offset):
+        rotations.append(rotation)
+        return FakeTransform(rotation=FakeRotation(pitch=rotation[0]))
+
+    monkeypatch.setattr(cosim_module, "sumo_to_carla", convert_transform)
+
+    transforms = []
+    actor = types.SimpleNamespace(id=123, set_transform=transforms.append)
+    cosim = cosim_module.CarlaCosim.__new__(cosim_module.CarlaCosim)
+    cosim.use_lane_relative_position = False
+    cosim.batch_transform_enabled = False
+    cosim._resolve_sumo_location = lambda *_args, **_kwargs: [1.0, 2.0, 3.0]
+    cosim._resolve_sumo_angle = lambda *_args, **_kwargs: 90.0
+    cosim._uses_ackermann_physics = lambda _actor_id: False
+    cosim._get_carla_offset = lambda _location, _clearance: [0.0, 0.0, 0.0]
+    cosim._ensure_actor_teleport_mode = lambda *_args, **_kwargs: None
+
+    cosim._process_vehicle(
+        "BV",
+        {
+            "x": 1.0,
+            "y": 2.0,
+            "z": 3.0,
+            "sumo_angle": 90.0,
+            "sumo_slope": -2.2,
+            "length": 5.0,
+            "width": 1.8,
+            "height": 1.5,
+        },
+        set(),
+        carla_actor=actor,
+    )
+
+    assert rotations == [[-2.2, 90.0, 0.0]]
+    assert transforms[0].rotation.pitch == pytest.approx(-2.2)
+
+
 def test_ackermann_controller_settings_are_applied_once(capsys):
     install_fake_carla()
     from terasim_service.utils.carla.ackermann_control import AckermannControllerTuning
@@ -650,6 +727,7 @@ def _state_subscription_constants():
         VAR_POSITION=2,
         VAR_POSITION3D=3,
         VAR_ANGLE=4,
+        VAR_SLOPE=15,
         VAR_SPEED=5,
         VAR_SPEED_LAT=14,
         VAR_ACCELERATION=6,
@@ -730,6 +808,7 @@ def test_state_filter_uses_context_subscription_without_per_vehicle_position_que
                 constants.VAR_POSITION,
                 constants.VAR_POSITION3D,
                 constants.VAR_ANGLE,
+                constants.VAR_SLOPE,
                 constants.VAR_SPEED,
                 constants.VAR_SPEED_LAT,
                 constants.VAR_ACCELERATION,

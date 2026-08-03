@@ -131,12 +131,14 @@ def create_environment(config, base_dir):
     )
 
 
-def create_simulator(config, base_dir):
+def create_simulator(config, base_dir, step_length=None):
     """Create the simulator based on the configuration.
 
     Args:
         config (dict): The configuration dictionary with resolved paths.
         base_dir (str): Base directory for the simulator.
+        step_length (float, optional): Override SUMO's configured step length.
+            Defaults to the scenario parameter, then the SUMO config value.
 
     Returns:
         Simulator: The simulator object.
@@ -156,7 +158,13 @@ def create_simulator(config, base_dir):
         seed=config["simulator"]["parameters"].get("sumo_seed", None),
         additional_sumo_args=["--start", "--quit-on-end"],
         traffic_scale=config["simulator"]["parameters"].get("traffic_scale", 1),
+        step_length=(
+            step_length
+            if step_length is not None
+            else config["simulator"]["parameters"].get("step_length")
+        ),
     )
+
 
 def set_random_seed(seed):
     """Set the random seed for the simulation.

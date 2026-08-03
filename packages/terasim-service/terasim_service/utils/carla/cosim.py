@@ -2591,7 +2591,8 @@ class CarlaCosim(object):
         sumo_angle = self._resolve_sumo_angle("vehicle", veh_id, veh_info, carla_actor)
         if sumo_angle is None:
             return
-        sumo_rotation = [0.0, sumo_angle, 0.0]
+        sumo_slope = self._as_finite_float(veh_info.get("sumo_slope")) or 0.0
+        sumo_rotation = [sumo_slope, sumo_angle, 0.0]
         shape = [veh_info["length"], veh_info["width"], veh_info["height"]]
         uses_ackermann_physics = self._uses_ackermann_physics(veh_id)
 

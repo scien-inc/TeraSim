@@ -6,7 +6,7 @@ CARLA_PORT=${CARLA_PORT:-2000}
 GRPC_PORT=${GRPC_PORT:-8200}
 COSIM_TRANSPORT=${COSIM_TRANSPORT:-grpc}
 TERASIM_CONFIG=${TERASIM_CONFIG:-/app/examples/scenarios/cosim_odaiba_tlmappings_0708.yaml}
-CARLA_COSIM_STEP_LENGTH=${CARLA_COSIM_STEP_LENGTH:-0.1}
+CARLA_COSIM_STEP_LENGTH=${CARLA_COSIM_STEP_LENGTH:-0.05}
 CARLA_COSIM_MAP_NAME=${CARLA_COSIM_MAP_NAME:-}
 CARLA_COSIM_VEHICLE_CONTROL_MODE=${CARLA_COSIM_VEHICLE_CONTROL_MODE:-ackermann_physics}
 ENABLE_SUMO_GUI=${ENABLE_SUMO_GUI:-1}
@@ -140,6 +140,7 @@ else
     echo "Starting TeraSim direct gRPC runner on 127.0.0.1:${GRPC_PORT}..."
     python3 -m terasim_service.run_direct \
         --config "${TERASIM_CONFIG}" \
+        --step_length "${CARLA_COSIM_STEP_LENGTH}" \
         --grpc_port "${GRPC_PORT}" >"${DIRECT_LOG}" 2>&1 &
     DIRECT_PID=$!
 

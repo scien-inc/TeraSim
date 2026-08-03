@@ -35,6 +35,7 @@ def main():
     parser.add_argument("--config", required=True, help="scenario YAML path")
     parser.add_argument("--grpc_host", default="127.0.0.1")
     parser.add_argument("--grpc_port", type=int, default=8200)
+    parser.add_argument("--step_length", type=float, default=None)
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -53,7 +54,7 @@ def main():
     set_random_seed(config["seed"])
 
     env = create_environment(config, base_dir)
-    sim = create_simulator(config, base_dir)
+    sim = create_simulator(config, base_dir, step_length=args.step_length)
     sim.bind_env(env)
 
     plugin_config = dict(DEFAULT_COSIM_PLUGIN_CONFIG)

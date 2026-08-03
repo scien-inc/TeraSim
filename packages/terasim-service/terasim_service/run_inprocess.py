@@ -86,7 +86,7 @@ def main():
 
     set_random_seed(config["seed"])
     env = create_environment(config, base_dir)
-    simulator = create_simulator(config, base_dir)
+    simulator = create_simulator(config, base_dir, step_length=args.step_length)
     simulator.bind_env(env)
 
     plugin_config = dict(DEFAULT_COSIM_PLUGIN_CONFIG)
