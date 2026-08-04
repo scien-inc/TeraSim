@@ -7,6 +7,7 @@ class AckermannTuning:
     wheel_base: float = 2.8
     max_steer_rad: float = 0.6
     max_steer_rate_rad_s: float = 0.6
+    position_speed_gain: float = 1.0
     kp_speed: float = 0.8
     kp_position: float = 0.15
     max_accel: float = 3.0
@@ -17,12 +18,15 @@ class AckermannTuning:
 class AckermannControllerTuning:
     """CARLA's internal cascaded speed/acceleration PID settings."""
 
-    speed_kp: float = 0.15
+    # CARLA accumulates the speed PID output into its acceleration target on
+    # every tick.  Keep Kp moderate and avoid derivative terms, which made
+    # throttle and brake alternate on consecutive 0.05-second ticks.
+    speed_kp: float = 1.0
     speed_ki: float = 0.0
-    speed_kd: float = 0.25
-    accel_kp: float = 0.01
+    speed_kd: float = 0.0
+    accel_kp: float = 0.05
     accel_ki: float = 0.0
-    accel_kd: float = 0.01
+    accel_kd: float = 0.0
 
 
 @dataclass(frozen=True)

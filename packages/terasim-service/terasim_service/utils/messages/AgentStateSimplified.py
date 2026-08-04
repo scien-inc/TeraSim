@@ -60,6 +60,7 @@ class AgentStateSimplified(BaseModel):
     sumo_emergency_decel: float | None = None
     feedback_observed_speed: float | None = None
     feedback_source_carla_frame: int | None = None
+    feedback_longitudinal_error: float | None = None
 
     # Orientation
     orientation: float = 0.0
