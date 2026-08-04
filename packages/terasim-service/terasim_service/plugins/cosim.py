@@ -219,6 +219,13 @@ class TeraSimCoSimPlugin(BasePlugin):
                 "CARLA_COSIM_ACKERMANN_FEEDBACK_MOVE_TO_LANE_HYSTERESIS", 0.35
             ),
         )
+        self.ackermann_feedback_signal_stop_line_clamp_offset = max(
+            0.0,
+            self._parse_float_env(
+                "CARLA_COSIM_ACKERMANN_FEEDBACK_SIGNAL_STOP_LINE_CLAMP_OFFSET",
+                1.01,
+            ),
+        )
         self.feedback_lane_states = {}
         self.feedback_edge_lane_ids_cache = {}
         self.feedback_lane_geometry_cache = {}
@@ -587,30 +594,8 @@ class TeraSimCoSimPlugin(BasePlugin):
         for lane_id in edge_lane_ids:
             self._append_unique_lane_id(lane_ids, seen_lane_ids, lane_id)
 
-    def _get_ackermann_feedback_lane_candidates(self, actor_id):
-        """Return route-compatible lanes near an Ackermann feedback actor."""
-        lane_ids = []
-        seen_lane_ids = set()
-        current_lane_id = traci.vehicle.getLaneID(actor_id)
-        current_road_id = traci.vehicle.getRoadID(actor_id)
-        route = traci.vehicle.getRoute(actor_id)
-        route_index = traci.vehicle.getRouteIndex(actor_id)
-
-        self._append_unique_lane_id(lane_ids, seen_lane_ids, current_lane_id)
-        self._append_edge_lane_ids(lane_ids, seen_lane_ids, current_road_id)
-
-        try:
-            next_links = traci.vehicle.getNextLinks(actor_id)
-        except Exception:
-            next_links = []
-        for lane_id in extract_next_link_lane_ids(next_links[:1]):
-            self._append_unique_lane_id(lane_ids, seen_lane_ids, lane_id)
-
-        if route:
-            route_start = max(0, route_index)
-            for edge_id in route[route_start : route_start + 2]:
-                self._append_edge_lane_ids(lane_ids, seen_lane_ids, edge_id)
-
+    def _get_ackermann_feedback_lane_geometries(self, lane_ids, profile_ctx=None):
+        """Return cached lane geometry in the provided route order."""
         lane_geometry_cache = getattr(self, "feedback_lane_geometry_cache", None)
         if lane_geometry_cache is None:
             lane_geometry_cache = {}
@@ -622,14 +607,117 @@ class TeraSimCoSimPlugin(BasePlugin):
                 try:
                     geometry = {
                         "lane_id": lane_id,
-                        "shape": traci.lane.getShape(lane_id),
-                        "length": traci.lane.getLength(lane_id),
+                        "shape": self._profile_feedback_command_call(
+                            profile_ctx,
+                            "traci",
+                            "lane_get_shape",
+                            traci.lane.getShape,
+                            lane_id,
+                        ),
+                        "length": self._profile_feedback_command_call(
+                            profile_ctx,
+                            "traci",
+                            "lane_get_length",
+                            traci.lane.getLength,
+                            lane_id,
+                        ),
                     }
                 except Exception:
                     continue
                 lane_geometry_cache[lane_id] = geometry
             candidates.append(geometry)
-        return current_lane_id, candidates
+        return candidates
+
+    @staticmethod
+    def _next_link_is_signal_controlled(next_links):
+        """Return whether the immediate route connection is traffic-light controlled."""
+        if not next_links or len(next_links[0]) <= 5:
+            return False
+        link_state = next_links[0][5]
+        # SUMO traffic-light link states. M/m/s/= are unsignalized priority,
+        # stop, and equal-priority connections and deliberately excluded.
+        return isinstance(link_state, str) and link_state in "GgRrYyuUoO"
+
+    def _get_ackermann_feedback_successor_lane_candidates(
+        self,
+        actor_id,
+        current_lane_id,
+        profile_ctx=None,
+    ):
+        """Return immediate route successors and whether they cross a signal."""
+        try:
+            next_links = self._profile_feedback_command_call(
+                profile_ctx,
+                "traci",
+                "vehicle_get_next_links",
+                traci.vehicle.getNextLinks,
+                actor_id,
+            )
+        except Exception:
+            next_links = []
+
+        lane_ids = []
+        seen_lane_ids = {current_lane_id}
+        for lane_id in self._profile_feedback_command_call(
+            profile_ctx,
+            "python",
+            "extract_next_link_lane_ids",
+            extract_next_link_lane_ids,
+            next_links[:1],
+        ):
+            self._append_unique_lane_id(lane_ids, seen_lane_ids, lane_id)
+
+        # getNextLinks normally supplies both the internal and destination
+        # lanes. Fall back to the next route edge for backends that omit them.
+        if not lane_ids:
+            try:
+                route = self._profile_feedback_command_call(
+                    profile_ctx,
+                    "traci",
+                    "vehicle_get_route",
+                    traci.vehicle.getRoute,
+                    actor_id,
+                )
+                route_index = self._profile_feedback_command_call(
+                    profile_ctx,
+                    "traci",
+                    "vehicle_get_route_index",
+                    traci.vehicle.getRouteIndex,
+                    actor_id,
+                )
+            except Exception:
+                route = ()
+                route_index = -1
+            next_route_index = route_index + 1
+            if 0 <= next_route_index < len(route):
+                self._append_edge_lane_ids(
+                    lane_ids,
+                    seen_lane_ids,
+                    route[next_route_index],
+                )
+
+        candidates = self._get_ackermann_feedback_lane_geometries(
+            lane_ids,
+            profile_ctx,
+        )
+        route_offset = 0.0
+        route_candidates = []
+        for candidate in candidates:
+            route_candidate = dict(candidate)
+            route_candidate["route_offset"] = route_offset
+            route_candidates.append(route_candidate)
+            try:
+                points = candidate["shape"]
+                route_offset += sum(
+                    math.hypot(end[0] - start[0], end[1] - start[1])
+                    for start, end in zip(points, points[1:])
+                )
+            except (TypeError, ValueError, IndexError):
+                pass
+        return (
+            route_candidates,
+            self._next_link_is_signal_controlled(next_links),
+        )
 
     @staticmethod
     def _profile_feedback_command_call(
@@ -722,7 +810,10 @@ class TeraSimCoSimPlugin(BasePlugin):
             if background_max_distance is not None:
                 max_distance = background_max_distance
 
-        projection = self._profile_feedback_command_call(
+        mapping_candidate_lane_ids = [
+            candidate["lane_id"] for candidate in current_lane_candidates
+        ]
+        current_projection = self._profile_feedback_command_call(
             profile_ctx,
             "python",
             "current_lane_projection",
@@ -736,13 +827,89 @@ class TeraSimCoSimPlugin(BasePlugin):
                 "ackermann_feedback_move_to_lane_hysteresis",
                 0.35,
             ),
-            max_distance=max_distance,
+            max_distance=None,
             prefer_current_lane=True,
         )
+        projection = None
+        if (
+            current_projection is not None
+            and current_projection["distance"] <= max_distance
+        ):
+            projection = current_projection
+
+        # Query route successors only after CARLA reaches the current lane
+        # endpoint. Mid-lane feedback therefore cannot jump to an adjacent lane
+        # because of lateral physics drift.
+        current_at_lane_end = bool(
+            current_projection is not None
+            and current_projection.get("shape_length", 0.0) > 0.0
+            and math.isclose(
+                current_projection.get("shape_position", 0.0),
+                current_projection["shape_length"],
+                rel_tol=0.0,
+                abs_tol=1e-6,
+            )
+        )
+        if current_at_lane_end:
+            successor_candidates, signal_controlled = (
+                self._get_ackermann_feedback_successor_lane_candidates(
+                    actor_id,
+                    current_lane_id,
+                    profile_ctx,
+                )
+            )
+            mapping_candidate_lane_ids.extend(
+                candidate["lane_id"] for candidate in successor_candidates
+            )
+            successor_projection = self._profile_feedback_command_call(
+                profile_ctx,
+                "python",
+                "successor_lane_projection",
+                select_route_aware_lane_projection,
+                position,
+                sumo_angle,
+                successor_candidates,
+                current_lane_id=current_lane_id,
+                lane_switch_hysteresis=0.0,
+                max_distance=max_distance,
+                prefer_current_lane=False,
+            )
+            successor_is_closer = bool(
+                successor_projection is not None
+                and (
+                    current_projection is None
+                    or successor_projection["distance"] + 1e-6
+                    < current_projection["distance"]
+                )
+            )
+            if successor_is_closer:
+                successor_route_position = (
+                    successor_projection.get("route_offset", 0.0)
+                    + successor_projection["shape_position"]
+                )
+                signal_clamp_offset = getattr(
+                    self,
+                    "ackermann_feedback_signal_stop_line_clamp_offset",
+                    1.01,
+                )
+                clamp_at_signal_stop_line = bool(
+                    signal_controlled
+                    and successor_route_position <= signal_clamp_offset + 1e-6
+                )
+                if clamp_at_signal_stop_line:
+                    self.logger.debug(
+                        "Ackermann feedback signal stop-line clamp actor=%s "
+                        "lane=%s overrun=%.3f limit=%.3f",
+                        actor_id,
+                        current_lane_id,
+                        successor_route_position,
+                        signal_clamp_offset,
+                    )
+                else:
+                    projection = successor_projection
+
         if projection is None:
-            candidate_lane_ids = [
-                candidate["lane_id"] for candidate in current_lane_candidates
-            ]
+            candidate_lane_ids = mapping_candidate_lane_ids
             self.logger.error(
                 "Ackermann feedback moveTo mapping failed actor=%s "
                 "position=(%.3f, %.3f) angle=%.3f currentLane=%s candidates=%s",
@@ -775,12 +942,13 @@ class TeraSimCoSimPlugin(BasePlugin):
         )
         self.logger.debug(
             "Ackermann feedback moveTo actor=%s lane=%s lanePos=%.3f "
-            "distance=%.3f headingError=%.3f",
+            "distance=%.3f headingError=%.3f%s",
             actor_id,
             projection["lane_id"],
             projection["lane_position"],
             projection["distance"],
             projection["heading_error"],
+            " routeTransition" if projection["lane_id"] != current_lane_id else "",
         )
         return projection
 
