@@ -204,10 +204,6 @@ class CarlaCosim(object):
         self._initial_terasim_state_pending = True
         self._last_completed_terasim_tick_count = None
         self.terasim_states = {}
-        self.ackermann_feedback_speed_horizon = max(
-            self.step_length,
-            _env_float("CARLA_COSIM_ACKERMANN_FEEDBACK_SPEED_HORIZON", 1.0),
-        )
         self.ackermann_feedback_ack_max_frame_lag = max(
             0, _env_int("CARLA_COSIM_ACKERMANN_FEEDBACK_ACK_MAX_FRAME_LAG", 2)
         )
@@ -220,6 +216,10 @@ class CarlaCosim(object):
             max_steer_rate_rad_s=max(
                 0.0, _env_float("CARLA_COSIM_ACKERMANN_MAX_STEER_RATE_RAD_S", 0.6)
             ),
+            position_speed_gain=max(
+                0.0,
+                _env_float("CARLA_COSIM_ACKERMANN_POSITION_SPEED_GAIN", 1.0),
+            ),
             kp_speed=_env_float("CARLA_COSIM_ACKERMANN_KP_SPEED", 0.8),
             kp_position=_env_float("CARLA_COSIM_ACKERMANN_KP_POSITION", 0.15),
             max_accel=max(0.0, _env_float("CARLA_COSIM_ACKERMANN_MAX_ACCEL", 3.0)),
@@ -227,22 +227,22 @@ class CarlaCosim(object):
         )
         self.ackermann_controller_tuning = AckermannControllerTuning(
             speed_kp=max(
-                0.0, _env_float("CARLA_COSIM_ACKERMANN_CONTROLLER_SPEED_KP", 0.15)
+                0.0, _env_float("CARLA_COSIM_ACKERMANN_CONTROLLER_SPEED_KP", 1.0)
             ),
             speed_ki=max(
                 0.0, _env_float("CARLA_COSIM_ACKERMANN_CONTROLLER_SPEED_KI", 0.0)
             ),
             speed_kd=max(
-                0.0, _env_float("CARLA_COSIM_ACKERMANN_CONTROLLER_SPEED_KD", 0.25)
+                0.0, _env_float("CARLA_COSIM_ACKERMANN_CONTROLLER_SPEED_KD", 0.0)
             ),
             accel_kp=max(
-                0.0, _env_float("CARLA_COSIM_ACKERMANN_CONTROLLER_ACCEL_KP", 0.01)
+                0.0, _env_float("CARLA_COSIM_ACKERMANN_CONTROLLER_ACCEL_KP", 0.05)
             ),
             accel_ki=max(
                 0.0, _env_float("CARLA_COSIM_ACKERMANN_CONTROLLER_ACCEL_KI", 0.0)
             ),
             accel_kd=max(
-                0.0, _env_float("CARLA_COSIM_ACKERMANN_CONTROLLER_ACCEL_KD", 0.01)
+                0.0, _env_float("CARLA_COSIM_ACKERMANN_CONTROLLER_ACCEL_KD", 0.0)
             ),
         )
         self.ackermann_warn_error_m = max(
@@ -971,7 +971,7 @@ class CarlaCosim(object):
         speed = (velocity.x**2 + velocity.y**2 + velocity.z**2) ** 0.5
 
         # Reverse transform: CARLA -> SUMO
-        if self._coord_transformer is not None:
+        if getattr(self, "_coord_transformer", None) is not None:
             # Direct reverse: CARLA location -> xodr coords -> UTM -> SUMO CRS
             # CARLA: x = xodr_x, y = -xodr_y
             xodr_x = transform.location.x
@@ -1023,7 +1023,13 @@ class CarlaCosim(object):
             return None
         return shape
 
-    def _carla_transform_to_sumo_feedback_state(self, transform, shape):
+    def _carla_transform_to_sumo_feedback_state(
+        self,
+        transform,
+        shape,
+        front_bumper_local_x=None,
+        rear_axle_local_x=None,
+    ):
         location = transform.location
         rotation = transform.rotation
         values = [
@@ -1035,30 +1041,43 @@ class CarlaCosim(object):
         if any(value is None for value in values):
             return None
 
-        carla_x, carla_y, carla_z, carla_yaw = values
-        if self._coord_transformer is not None:
-            yaw = math.radians(carla_yaw)
-            front_xodr_x = carla_x + math.cos(yaw) * shape[0] / 2.0
-            front_xodr_y = -carla_y - math.sin(yaw) * shape[0] / 2.0
-            sumo_x, sumo_y = self._transform_xodr_to_sumo(front_xodr_x, front_xodr_y)
-            sumo_location = [sumo_x, sumo_y, carla_z]
-            sumo_rotation = [rotation.pitch, carla_yaw + 90.0, rotation.roll]
-        else:
-            offset = [self.sumo_carla_offset[0], self.sumo_carla_offset[1], 0.0]
-            sumo_location, sumo_rotation = carla_to_sumo(
-                location, rotation, shape, offset
+        _, _, carla_z, carla_yaw = values
+        if front_bumper_local_x is None:
+            front_bumper_local_x = shape[0] / 2.0
+        if rear_axle_local_x is None:
+            rear_axle_local_x = -0.5 * getattr(
+                getattr(self, "ackermann_tuning", AckermannTuning()),
+                "wheel_base",
+                2.8,
             )
+
+        front_point = self._transform_local_x_point(
+            transform, front_bumper_local_x
+        )
+        rear_axle_point = self._transform_local_x_point(
+            transform, rear_axle_local_x
+        )
+        sumo_location = self._carla_point_to_sumo_position(*front_point)
+        rear_axle_location = self._carla_point_to_sumo_position(*rear_axle_point)
+        sumo_rotation = [rotation.pitch, carla_yaw + 90.0, rotation.roll]
 
         sumo_values = [
             self._as_finite_float(sumo_location[0]),
             self._as_finite_float(sumo_location[1]),
+            self._as_finite_float(sumo_location[2]),
             self._as_finite_float(sumo_rotation[1]),
+            self._as_finite_float(rear_axle_location[0]),
+            self._as_finite_float(rear_axle_location[1]),
         ]
         if any(value is None for value in sumo_values):
             return None
         return {
             "position": [sumo_values[0], sumo_values[1]],
-            "sumo_angle": sumo_values[2] % 360.0,
+            # moveToXY only accepts x/y, so carry the physical front elevation
+            # separately for route-candidate validation in the SUMO plugin.
+            "position_z": sumo_values[2],
+            "sumo_angle": sumo_values[3] % 360.0,
+            "rear_axle_position": [sumo_values[4], sumo_values[5]],
         }
 
     def _is_ackermann_feedback_selected_actor(self, actor_id):
@@ -1084,6 +1103,13 @@ class CarlaCosim(object):
             feedback["feedback_reason"] = "carla_actor_missing"
             return None, feedback
 
+        if not hasattr(self, "_ackermann_actor_state"):
+            self._ackermann_actor_state = {}
+        actor_state = self._ackermann_actor_state.setdefault(actor_id, {})
+        if actor_state.get("physics_initialization_pending"):
+            feedback["feedback_reason"] = "carla_spawn_transform_pending"
+            return None, feedback
+
         try:
             transform = actor.get_transform()
             velocity = actor.get_velocity()
@@ -1098,7 +1124,19 @@ class CarlaCosim(object):
             feedback["feedback_reason"] = "stale_or_duplicate_carla_frame"
             return None, feedback
 
-        sumo_state = self._carla_transform_to_sumo_feedback_state(transform, shape)
+        self._initialize_ackermann_actor_geometry(actor, actor_id, actor_state)
+        fallback_tuning = getattr(self, "ackermann_tuning", AckermannTuning())
+        sumo_state = self._carla_transform_to_sumo_feedback_state(
+            transform,
+            shape,
+            front_bumper_local_x=actor_state.get(
+                "front_bumper_local_x_m", shape[0] / 2.0
+            ),
+            rear_axle_local_x=actor_state.get(
+                "rear_axle_local_x_m",
+                -0.5 * fallback_tuning.wheel_base,
+            ),
+        )
         speed = self._as_finite_float(horizontal_speed(velocity))
         if sumo_state is None or speed is None:
             feedback["source_carla_frame"] = carla_frame
@@ -1111,8 +1149,10 @@ class CarlaCosim(object):
             "command_type": "set_state",
             "data": {
                 "position": sumo_state["position"],
+                "position_z": sumo_state["position_z"],
                 "speed": speed,
                 "sumo_angle": sumo_state["sumo_angle"],
+                "rear_axle_position": sumo_state["rear_axle_position"],
                 "source_carla_frame": carla_frame,
             },
         }
@@ -1122,6 +1162,9 @@ class CarlaCosim(object):
                 "carla_speed": speed,
                 "feedback_sumo_x": sumo_state["position"][0],
                 "feedback_sumo_y": sumo_state["position"][1],
+                "feedback_sumo_z": sumo_state["position_z"],
+                "feedback_rear_axle_sumo_x": sumo_state["rear_axle_position"][0],
+                "feedback_rear_axle_sumo_y": sumo_state["rear_axle_position"][1],
                 "feedback_sumo_angle": sumo_state["sumo_angle"],
             }
         )
@@ -1572,6 +1615,104 @@ class CarlaCosim(object):
             sumo_location, self._get_carla_offset(sumo_location, z_offset)
         )
 
+    def _carla_point_to_sumo_position(self, carla_x, carla_y, carla_z=0.0):
+        """Convert a physical CARLA point to SUMO coordinates without shape correction."""
+        if getattr(self, "_coord_transformer", None) is not None:
+            sumo_x, sumo_y = self._transform_xodr_to_sumo(carla_x, -carla_y)
+        else:
+            sumo_x = carla_x - self.sumo_carla_offset[0]
+            sumo_y = -carla_y + self.sumo_carla_offset[1]
+        return [sumo_x, sumo_y, carla_z]
+
+    @staticmethod
+    def _transform_local_x_point(transform, local_x):
+        yaw = math.radians(transform.rotation.yaw)
+        return (
+            transform.location.x + math.cos(yaw) * local_x,
+            transform.location.y + math.sin(yaw) * local_x,
+            transform.location.z,
+        )
+
+    @staticmethod
+    def _phase_aligned_longitudinal_error(
+        current_rear_axle,
+        desired_rear_axle,
+        current_velocity,
+        desired_heading,
+        step_length,
+    ):
+        """Compare both rear-axle positions at the SUMO target time t + dt."""
+        predicted_x = current_rear_axle[0] + float(
+            getattr(current_velocity, "x", 0.0)
+        ) * max(0.0, step_length)
+        predicted_y = current_rear_axle[1] + float(
+            getattr(current_velocity, "y", 0.0)
+        ) * max(0.0, step_length)
+        return (
+            (desired_rear_axle[0] - predicted_x) * math.cos(desired_heading)
+            + (desired_rear_axle[1] - predicted_y) * math.sin(desired_heading)
+        )
+
+    @classmethod
+    def _phase_aligned_front_progress_error(
+        cls,
+        current_transform,
+        desired_transform,
+        front_bumper_local_x,
+        current_velocity,
+        desired_heading,
+        step_length,
+    ):
+        """Return rear-axle progress error without mixing yaw/lateral error into it.
+
+        SUMO and CARLA physical front positions are symmetric. Translating both
+        front positions by the same rigid front-to-rear-axle offset cancels in
+        their signed path-progress difference, while rotating the desired offset
+        with SUMO lane yaw would incorrectly turn heading error into longitudinal
+        error on curves.
+        """
+        current_front = cls._transform_local_x_point(
+            current_transform, front_bumper_local_x
+        )
+        desired_front = cls._transform_local_x_point(
+            desired_transform, front_bumper_local_x
+        )
+        return cls._phase_aligned_longitudinal_error(
+            current_front,
+            desired_front,
+            current_velocity,
+            desired_heading,
+            step_length,
+        )
+
+    def _sumo_front_to_carla_transform(
+        self,
+        sumo_location,
+        sumo_rotation,
+        shape,
+        offset,
+        front_bumper_local_x=None,
+    ):
+        """Map SUMO's front-center reference point to a CARLA actor origin."""
+        if front_bumper_local_x is None:
+            front_bumper_local_x = shape[0] / 2.0
+        front_location = sumo_point_to_carla(sumo_location, offset)
+        carla_yaw = sumo_rotation[1] - 90.0
+        heading = math.radians(carla_yaw)
+        actor_location = carla.Location(
+            x=front_location.x - math.cos(heading) * front_bumper_local_x,
+            y=front_location.y - math.sin(heading) * front_bumper_local_x,
+            z=front_location.z,
+        )
+        return carla.Transform(
+            actor_location,
+            carla.Rotation(
+                pitch=sumo_rotation[0],
+                yaw=carla_yaw,
+                roll=sumo_rotation[2],
+            ),
+        )
+
     def _resolve_sumo_lookahead_location(self, veh_id, veh_info, sumo_location, sumo_angle):
         if bool(veh_info.get("lookahead_position_valid", False)):
             lookahead = [
@@ -1600,6 +1741,151 @@ class CarlaCosim(object):
         except Exception:
             pass
 
+    @staticmethod
+    def _ackermann_actor_footprint(actor, transform):
+        """Return an oriented 2-D physical footprint for a CARLA vehicle."""
+        try:
+            bounding_box = actor.bounding_box
+            box_location = bounding_box.location
+            extent = bounding_box.extent
+            actor_yaw = math.radians(float(transform.rotation.yaw))
+            box_yaw = math.radians(float(getattr(bounding_box.rotation, "yaw", 0.0)))
+            center_x = (
+                float(transform.location.x)
+                + math.cos(actor_yaw) * float(box_location.x)
+                - math.sin(actor_yaw) * float(box_location.y)
+            )
+            center_y = (
+                float(transform.location.y)
+                + math.sin(actor_yaw) * float(box_location.x)
+                + math.cos(actor_yaw) * float(box_location.y)
+            )
+            yaw = actor_yaw + box_yaw
+            forward = (math.cos(yaw), math.sin(yaw))
+            left = (-math.sin(yaw), math.cos(yaw))
+            center_z = float(transform.location.z) + float(box_location.z)
+            return {
+                "center": (center_x, center_y),
+                "axes": (forward, left),
+                "half_extents": (float(extent.x), float(extent.y)),
+                "center_z": center_z,
+                "half_z": float(extent.z),
+            }
+        except Exception:
+            return None
+
+    @staticmethod
+    def _ackermann_footprints_overlap(first, second, clearance=0.05):
+        if abs(first["center_z"] - second["center_z"]) > (
+            first["half_z"] + second["half_z"] + clearance
+        ):
+            return False
+
+        delta = (
+            second["center"][0] - first["center"][0],
+            second["center"][1] - first["center"][1],
+        )
+        for axis in first["axes"] + second["axes"]:
+            center_distance = abs(delta[0] * axis[0] + delta[1] * axis[1])
+            first_radius = sum(
+                half_extent
+                * abs(local_axis[0] * axis[0] + local_axis[1] * axis[1])
+                for half_extent, local_axis in zip(
+                    first["half_extents"], first["axes"]
+                )
+            )
+            second_radius = sum(
+                half_extent
+                * abs(local_axis[0] * axis[0] + local_axis[1] * axis[1])
+                for half_extent, local_axis in zip(
+                    second["half_extents"], second["axes"]
+                )
+            )
+            if center_distance > first_radius + second_radius + clearance:
+                return False
+        return True
+
+    def _ackermann_spawn_transform_is_clear(self, actor, veh_id, target_transform):
+        footprint = self._ackermann_actor_footprint(actor, target_transform)
+        if footprint is None:
+            return True, None
+
+        for other_id, other_actor in (getattr(self, "_vehicle_actor_index", None) or {}).items():
+            if other_id == veh_id or other_actor is actor:
+                continue
+            other_state = self._ackermann_actor_state.get(other_id, {})
+            if other_state.get("physics_ground_transform_reserved"):
+                other_transform = other_state.get("physics_initialization_transform")
+            elif other_state.get("physics_initialization_pending"):
+                # Elevated, non-physical actors do not reserve road space until
+                # one of them has been admitted to the physical scene.
+                continue
+            else:
+                try:
+                    other_transform = other_actor.get_transform()
+                except Exception:
+                    continue
+            if other_transform is None:
+                continue
+            other_footprint = self._ackermann_actor_footprint(
+                other_actor, other_transform
+            )
+            if other_footprint is not None and self._ackermann_footprints_overlap(
+                footprint, other_footprint
+            ):
+                return False, other_id
+        return True, None
+
+    @staticmethod
+    def _transform_with_z_offset(transform, z_offset):
+        return carla.Transform(
+            carla.Location(
+                x=transform.location.x,
+                y=transform.location.y,
+                z=transform.location.z + z_offset,
+            ),
+            carla.Rotation(
+                pitch=transform.rotation.pitch,
+                yaw=transform.rotation.yaw,
+                roll=transform.rotation.roll,
+            ),
+        )
+
+    def _prepare_ackermann_actor_physics(
+        self,
+        actor,
+        veh_id,
+        initial_speed,
+        ground_transform,
+        elevated_transform,
+    ):
+        state = self._ackermann_actor_state.setdefault(veh_id, {})
+        state["physics_initialization_transform"] = ground_transform
+        state["physics_initialization_pending"] = True
+        is_clear, blocking_actor_id = self._ackermann_spawn_transform_is_clear(
+            actor, veh_id, ground_transform
+        )
+        if not is_clear:
+            state["physics_overlap_deferred"] = True
+            state["physics_overlap_blocking_actor"] = blocking_actor_id
+            state["physics_ground_transform_reserved"] = False
+            actor.set_transform(elevated_transform)
+            print(
+                f"CARLA physics spawn deferred for {veh_id!r}: physical footprint "
+                f"overlaps {blocking_actor_id!r}.",
+                flush=True,
+            )
+            return False
+
+        state["physics_ground_transform_reserved"] = True
+        actor.set_transform(ground_transform)
+        return self._ensure_ackermann_actor_physics(
+            actor,
+            veh_id,
+            initial_speed,
+            ground_transform,
+        )
+
     def _initialize_ackermann_actor_velocity(self, actor, veh_id, speed, transform):
         initial_speed = self._as_finite_float(speed)
         if initial_speed is None:
@@ -1627,8 +1913,15 @@ class CarlaCosim(object):
         return True
 
     def _initialize_ackermann_actor_geometry(self, actor, veh_id, state):
-        if state.get("geometry_attempted"):
+        if state.get("geometry_from_physics"):
             return
+        # Immediately after spawning, CARLA 0.9.16 may temporarily report the
+        # actor transform as (0, 0) while wheel positions already contain
+        # world-space centimetres. Retry on subsequent feedback frames.
+        geometry_attempts = int(state.get("geometry_attempts", 0))
+        if geometry_attempts >= 10:
+            return
+        state["geometry_attempts"] = geometry_attempts + 1
         state["geometry_attempted"] = True
         fallback_tuning = getattr(self, "ackermann_tuning", AckermannTuning())
         fallback_wheel_base = float(fallback_tuning.wheel_base)
@@ -1636,33 +1929,83 @@ class CarlaCosim(object):
         state["rear_axle_local_x_m"] = -0.5 * fallback_wheel_base
 
         try:
+            bounding_box = actor.bounding_box
+            front_bumper_local_x = float(
+                bounding_box.location.x + bounding_box.extent.x
+            )
+            if 0.1 <= front_bumper_local_x <= 10.0:
+                state["front_bumper_local_x_m"] = front_bumper_local_x
+                state["front_bumper_from_bounding_box"] = True
+        except Exception:
+            pass
+
+        try:
             physics_control = actor.get_physics_control()
             wheels = list(getattr(physics_control, "wheels", ()) or ())
-            wheel_x_values = [
-                float(wheel.position.x)
+            wheel_positions = [
+                (float(wheel.position.x), float(wheel.position.y))
                 for wheel in wheels
                 if getattr(wheel, "position", None) is not None
             ]
         except Exception:
             return
-        if len(wheel_x_values) < 2:
+        if len(wheel_positions) < 2:
             return
 
-        # CARLA reports wheel positions in centimetres in current releases.
-        if max(abs(value) for value in wheel_x_values) > 20.0:
-            wheel_x_values = [value / 100.0 for value in wheel_x_values]
-        wheel_x_values.sort()
-        split = max(1, len(wheel_x_values) // 2)
-        rear_axle_x = sum(wheel_x_values[:split]) / split
-        front_values = wheel_x_values[split:]
-        if not front_values:
+        # CARLA 0.9.16 can expose wheel positions as world coordinates in
+        # centimetres, while test doubles and other releases use actor-local
+        # coordinates. Validate both interpretations and prefer the geometry
+        # whose axle midpoint is closest to the actor origin.
+        scale = (
+            0.01
+            if max(abs(value) for point in wheel_positions for value in point) > 20.0
+            else 1.0
+        )
+        scaled_positions = [(x * scale, y * scale) for x, y in wheel_positions]
+
+        def resolve_geometry(local_x_values):
+            local_x_values = sorted(local_x_values)
+            split = max(1, len(local_x_values) // 2)
+            rear_axle_x = sum(local_x_values[:split]) / split
+            front_values = local_x_values[split:]
+            if not front_values:
+                return None
+            front_axle_x = sum(front_values) / len(front_values)
+            wheel_base = front_axle_x - rear_axle_x
+            if not (0.5 <= wheel_base <= 6.0 and -5.0 <= rear_axle_x <= 2.0):
+                return None
+            return rear_axle_x, front_axle_x, wheel_base
+
+        candidates = []
+        direct_geometry = resolve_geometry([x for x, _ in scaled_positions])
+        if direct_geometry is not None:
+            candidates.append(direct_geometry)
+
+        try:
+            transform = actor.get_transform()
+            yaw = math.radians(float(transform.rotation.yaw))
+            cos_yaw = math.cos(yaw)
+            sin_yaw = math.sin(yaw)
+            world_local_x = [
+                cos_yaw * (x - float(transform.location.x))
+                + sin_yaw * (y - float(transform.location.y))
+                for x, y in scaled_positions
+            ]
+            world_geometry = resolve_geometry(world_local_x)
+            if world_geometry is not None:
+                candidates.append(world_geometry)
+        except Exception:
+            pass
+
+        if not candidates:
             return
-        front_axle_x = sum(front_values) / len(front_values)
-        wheel_base = front_axle_x - rear_axle_x
-        if 0.5 <= wheel_base <= 6.0 and -5.0 <= rear_axle_x <= 2.0:
-            state["wheel_base_m"] = wheel_base
-            state["rear_axle_local_x_m"] = rear_axle_x
-            state["geometry_from_physics"] = True
+        rear_axle_x, front_axle_x, wheel_base = min(
+            candidates,
+            key=lambda geometry: abs(0.5 * (geometry[0] + geometry[1])),
+        )
+        state["wheel_base_m"] = wheel_base
+        state["rear_axle_local_x_m"] = rear_axle_x
+        state["geometry_from_physics"] = True
 
     def _ensure_ackermann_actor_physics(
         self,
@@ -1673,18 +2016,72 @@ class CarlaCosim(object):
     ):
         state = self._ackermann_actor_state.setdefault(veh_id, {})
         if not state.get("physics_enabled"):
+            if state.get("physics_overlap_deferred"):
+                if initial_transform is None:
+                    return False
+                state["physics_initialization_transform"] = initial_transform
+                state["physics_initialization_pending"] = True
+                is_clear, blocking_actor_id = self._ackermann_spawn_transform_is_clear(
+                    actor, veh_id, initial_transform
+                )
+                if not is_clear:
+                    state["physics_overlap_blocking_actor"] = blocking_actor_id
+                    actor.set_transform(
+                        self._transform_with_z_offset(
+                            initial_transform, self.spawn_z_clearance
+                        )
+                    )
+                    return False
+                state["physics_overlap_deferred"] = False
+                state.pop("physics_overlap_blocking_actor", None)
+                state["physics_ground_transform_reserved"] = True
+                actor.set_transform(initial_transform)
+                return False
+
+            pending_transform = state.get("physics_initialization_transform")
+            if pending_transform is None and initial_transform is not None:
+                pending_transform = initial_transform
+                state["physics_initialization_transform"] = initial_transform
+                state["physics_initialization_pending"] = True
+
+            if pending_transform is not None:
+                try:
+                    actual_transform = actor.get_transform()
+                    dx = actual_transform.location.x - pending_transform.location.x
+                    dy = actual_transform.location.y - pending_transform.location.y
+                    yaw_error = abs(
+                        (
+                            actual_transform.rotation.yaw
+                            - pending_transform.rotation.yaw
+                            + 180.0
+                        )
+                        % 360.0
+                        - 180.0
+                    )
+                    transform_ready = math.hypot(dx, dy) <= 1.0 and yaw_error <= 5.0
+                except Exception:
+                    transform_ready = False
+                    actual_transform = None
+                if not transform_ready:
+                    return False
+            else:
+                actual_transform = initial_transform
+
             self._set_actor_simulate_physics(actor, True)
             state["physics_enabled"] = True
+            state["physics_initialization_pending"] = False
+            state.pop("physics_ground_transform_reserved", None)
+            state.pop("physics_initialization_transform", None)
             if initial_speed is not None and initial_transform is not None:
                 state["initial_velocity_applied"] = self._initialize_ackermann_actor_velocity(
                     actor,
                     veh_id,
                     initial_speed,
-                    initial_transform,
+                    actual_transform or initial_transform,
                 )
         self._initialize_ackermann_actor_geometry(actor, veh_id, state)
         if state.get("controller_settings_attempted"):
-            return
+            return True
 
         state["controller_settings_attempted"] = True
         tuning = self.ackermann_controller_tuning
@@ -1714,6 +2111,7 @@ class CarlaCosim(object):
             f"accel=({tuning.accel_kp:.4g},{tuning.accel_ki:.4g},{tuning.accel_kd:.4g})",
             flush=True,
         )
+        return True
 
     def _ensure_actor_teleport_mode(self, actor, veh_id):
         state = self._ackermann_actor_state.setdefault(veh_id, {})
@@ -1817,7 +2215,13 @@ class CarlaCosim(object):
             return emergency_decel
         return self.ackermann_tuning.max_decel
 
-    def _resolve_ackermann_longitudinal_target(self, veh_id, veh_info, current_speed):
+    def _resolve_ackermann_longitudinal_target(
+        self,
+        veh_id,
+        veh_info,
+        current_speed,
+        longitudinal_error=0.0,
+    ):
         state = self._ackermann_actor_state.setdefault(veh_id, {})
         max_decel = self._resolve_ackermann_max_decel(veh_info)
         state["sumo_emergency_decel"] = max_decel
@@ -1827,22 +2231,40 @@ class CarlaCosim(object):
 
         sumo_next_speed = self._as_finite_float(veh_info.get("sumo_desired_speed"))
         observed_speed = self._as_finite_float(veh_info.get("feedback_observed_speed"))
+        longitudinal_error = self._as_finite_float(longitudinal_error) or 0.0
         state["sumo_desired_speed"] = sumo_next_speed
         state["feedback_observed_speed"] = observed_speed
-        if sumo_next_speed is None or observed_speed is None or self.step_length <= 0.0:
+        state["longitudinal_position_error"] = longitudinal_error
+        if sumo_next_speed is None or self.step_length <= 0.0:
             state["sumo_requested_acceleration"] = None
             state["applied_desired_acceleration"] = None
             return desired_speed, None
-        requested_acceleration = (sumo_next_speed - observed_speed) / self.step_length
+
+        requested_acceleration = self._as_finite_float(veh_info.get("acceleration"))
+        if requested_acceleration is None:
+            acceleration_origin_speed = (
+                observed_speed if observed_speed is not None else current_speed
+            )
+            requested_acceleration = (
+                sumo_next_speed - acceleration_origin_speed
+            ) / self.step_length
+        velocity_error = sumo_next_speed - current_speed
         desired_acceleration = min(
             self.ackermann_tuning.max_accel,
-            max(-max_decel, requested_acceleration),
+            max(
+                -max_decel,
+                requested_acceleration
+                + self.ackermann_tuning.kp_position * longitudinal_error
+                + self.ackermann_tuning.kp_speed * velocity_error,
+            ),
         )
         state["sumo_requested_acceleration"] = requested_acceleration
+        state["longitudinal_velocity_error"] = velocity_error
         state["applied_desired_acceleration"] = desired_acceleration
         speed_target = max(
             0.0,
-            current_speed + desired_acceleration * self.ackermann_feedback_speed_horizon,
+            sumo_next_speed
+            + self.ackermann_tuning.position_speed_gain * longitudinal_error,
         )
         return speed_target, desired_acceleration
 
@@ -1867,7 +2289,7 @@ class CarlaCosim(object):
         return carla.VehicleAckermannControl(
             steer=steer,
             speed=0.0,
-            acceleration=-max_decel,
+            acceleration=max_decel,
             jerk=0.0,
         )
 
@@ -1914,9 +2336,19 @@ class CarlaCosim(object):
 
         desired_location = desired_transform.location
         current_location = current_transform.location
+        rear_axle_local_x = state.get(
+            "rear_axle_local_x_m",
+            -0.5 * self.ackermann_tuning.wheel_base,
+        )
+        current_rear_axle = self._transform_local_x_point(
+            current_transform, rear_axle_local_x
+        )
+        desired_rear_axle = self._transform_local_x_point(
+            desired_transform, rear_axle_local_x
+        )
         position_error = math.hypot(
-            current_location.x - desired_location.x,
-            current_location.y - desired_location.y,
+            current_rear_axle[0] - desired_rear_axle[0],
+            current_rear_axle[1] - desired_rear_axle[1],
         )
         self._warn_ackermann_position_error(veh_id, position_error)
 
@@ -1946,8 +2378,29 @@ class CarlaCosim(object):
             return self._make_brake_ackermann_control(veh_id)
 
         current_speed = horizontal_speed(current_velocity)
+        desired_heading = math.radians(desired_transform.rotation.yaw)
+        longitudinal_error = self._as_finite_float(
+            veh_info.get("feedback_longitudinal_error")
+        )
+        if longitudinal_error is None:
+            longitudinal_error = self._phase_aligned_front_progress_error(
+                current_transform,
+                desired_transform,
+                state.get(
+                    "front_bumper_local_x_m",
+                    0.5 * float(veh_info.get("length", 5.0)),
+                ),
+                current_velocity,
+                desired_heading,
+                self.step_length,
+            )
         desired_speed, feedback_desired_acceleration = (
-            self._resolve_ackermann_longitudinal_target(veh_id, veh_info, current_speed)
+            self._resolve_ackermann_longitudinal_target(
+                veh_id,
+                veh_info,
+                current_speed,
+                longitudinal_error=longitudinal_error,
+            )
         )
         values = compute_ackermann_control_values(
             current_x=current_location.x,
@@ -2000,17 +2453,19 @@ class CarlaCosim(object):
             current_speed=current_speed,
             target_speed=final_speed,
             target_acceleration=final_acceleration,
-            position_error=values.position_error,
+            position_error=position_error,
             feedback_unhealthy=bool(feedback_unhealthy),
             target_behind=bool(target_behind),
             control_values=values,
         )
         state["steer"] = final_steer
-        state["last_position_error"] = values.position_error
+        state["last_position_error"] = position_error
         return carla.VehicleAckermannControl(
             steer=final_steer,
             speed=final_speed,
-            acceleration=final_acceleration,
+            # CARLA 0.9.16 takes Abs(acceleration) and uses it as the symmetric
+            # acceleration/deceleration limit. Target speed determines direction.
+            acceleration=abs(final_acceleration),
             jerk=values.jerk,
         )
 
@@ -2106,6 +2561,12 @@ class CarlaCosim(object):
             "feedback_observed_speed": self._as_finite_float(veh_info.get("feedback_observed_speed")),
             "sumo_requested_acceleration": state.get("sumo_requested_acceleration"),
             "sumo_emergency_decel": state.get("sumo_emergency_decel"),
+            "longitudinal_position_error": state.get(
+                "longitudinal_position_error"
+            ),
+            "longitudinal_velocity_error": state.get(
+                "longitudinal_velocity_error"
+            ),
             "ackermann_target_speed": target_speed,
             "ackermann_target_acceleration": target_acceleration,
             "carla_speed": current_speed,
@@ -2133,6 +2594,12 @@ class CarlaCosim(object):
             "wheel_base_m": self._as_finite_float(state.get("wheel_base_m")),
             "rear_axle_local_x_m": self._as_finite_float(
                 state.get("rear_axle_local_x_m")
+            ),
+            "front_bumper_local_x_m": self._as_finite_float(
+                state.get("front_bumper_local_x_m")
+            ),
+            "front_bumper_from_bounding_box": bool(
+                state.get("front_bumper_from_bounding_box", False)
             ),
             "geometry_from_physics": bool(state.get("geometry_from_physics", False)),
             "pure_pursuit_raw_steer": self._as_finite_float(
@@ -2325,12 +2792,23 @@ class CarlaCosim(object):
                 actor_index[actor_id] = actor
             if request.get("enable_physics_after_spawn", False):
                 self._ackermann_actor_state.pop(actor_id, None)
-                actor.set_transform(request["post_spawn_transform"])
-                self._ensure_ackermann_actor_physics(
+                actor_state = self._ackermann_actor_state.setdefault(actor_id, {})
+                self._initialize_ackermann_actor_geometry(
+                    actor, actor_id, actor_state
+                )
+                post_spawn_transform = self._sumo_front_to_carla_transform(
+                    request["sumo_location"],
+                    request["sumo_rotation"],
+                    request["shape"],
+                    request["post_spawn_offset"],
+                    actor_state.get("front_bumper_local_x_m"),
+                )
+                self._prepare_ackermann_actor_physics(
                     actor,
                     actor_id,
                     request["actor_info"].get("speed"),
-                    request["post_spawn_transform"],
+                    post_spawn_transform,
+                    request["spawn_transform"],
                 )
             else:
                 self._queue_actor_transform(actor, request["post_spawn_transform"], transform_batch)
@@ -2605,9 +3083,23 @@ class CarlaCosim(object):
             blueprint = self._select_vehicle_blueprint(veh_id, veh_info)
             # Spawn elevated to avoid collision with road geometry, then set correct transform
             sumo_offset = self._get_carla_offset(sumo_location, self.spawn_z_clearance)
-            spawn_transform = sumo_to_carla(sumo_location, sumo_rotation, shape, sumo_offset)
+            spawn_transform = (
+                self._sumo_front_to_carla_transform(
+                    sumo_location, sumo_rotation, shape, sumo_offset
+                )
+                if uses_ackermann_physics
+                else sumo_to_carla(sumo_location, sumo_rotation, shape, sumo_offset)
+            )
             sumo_offset_correct = self._get_carla_offset(sumo_location, 0.0)
-            carla_trasform = sumo_to_carla(sumo_location, sumo_rotation, shape, sumo_offset_correct)
+            carla_trasform = (
+                self._sumo_front_to_carla_transform(
+                    sumo_location, sumo_rotation, shape, sumo_offset_correct
+                )
+                if uses_ackermann_physics
+                else sumo_to_carla(
+                    sumo_location, sumo_rotation, shape, sumo_offset_correct
+                )
+            )
             if self._queue_actor_spawn(
                 spawn_requests,
                 {
@@ -2618,6 +3110,9 @@ class CarlaCosim(object):
                     "spawn_transform": spawn_transform,
                     "post_spawn_transform": carla_trasform,
                     "sumo_location": sumo_location,
+                    "sumo_rotation": sumo_rotation,
+                    "shape": shape,
+                    "post_spawn_offset": sumo_offset_correct,
                     "current_frame": current_frame,
                     "actor_index": actor_index,
                     "sumo_angle": sumo_angle,
@@ -2640,27 +3135,56 @@ class CarlaCosim(object):
                     return
                 if actor_index is not None:
                     actor_index[veh_id] = vehicle
-                # Immediately set the correct road-level transform
-                vehicle.set_transform(carla_trasform)
                 if uses_ackermann_physics:
                     self._ackermann_actor_state.pop(veh_id, None)
-                    self._ensure_ackermann_actor_physics(
+                    actor_state = self._ackermann_actor_state.setdefault(veh_id, {})
+                    self._initialize_ackermann_actor_geometry(
+                        vehicle, veh_id, actor_state
+                    )
+                    carla_trasform = self._sumo_front_to_carla_transform(
+                        sumo_location,
+                        sumo_rotation,
+                        shape,
+                        sumo_offset_correct,
+                        actor_state.get("front_bumper_local_x_m"),
+                    )
+                    self._prepare_ackermann_actor_physics(
                         vehicle,
                         veh_id,
                         veh_info.get("speed"),
                         carla_trasform,
+                        spawn_transform,
                     )
+                else:
+                    # Immediately set the correct road-level transform.
+                    vehicle.set_transform(carla_trasform)
             else:
                 self._record_spawn_failure("vehicle", veh_id, sumo_location, current_frame)
         else:
             sumo_offset = self._get_carla_offset(sumo_location, 0.0)
-            carla_trasform = sumo_to_carla(sumo_location, sumo_rotation, shape, sumo_offset)
+            carla_trasform = (
+                self._sumo_front_to_carla_transform(
+                    sumo_location, sumo_rotation, shape, sumo_offset
+                )
+                if uses_ackermann_physics
+                else sumo_to_carla(sumo_location, sumo_rotation, shape, sumo_offset)
+            )
             if uses_ackermann_physics:
-                self._ensure_ackermann_actor_physics(
+                physics_ready = self._ensure_ackermann_actor_physics(
                     vehicle,
                     veh_id,
                     veh_info.get("speed"),
                     carla_trasform,
+                )
+                if not physics_ready:
+                    return
+                actor_state = self._ackermann_actor_state.setdefault(veh_id, {})
+                carla_trasform = self._sumo_front_to_carla_transform(
+                    sumo_location,
+                    sumo_rotation,
+                    shape,
+                    sumo_offset,
+                    actor_state.get("front_bumper_local_x_m"),
                 )
                 control = self._build_ackermann_control(
                     veh_id,

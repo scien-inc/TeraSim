@@ -26,6 +26,49 @@ def _as_2d_points(shape):
     return points
 
 
+def _as_3d_points(shape):
+    try:
+        points = [
+            (float(point[0]), float(point[1]), float(point[2]))
+            for point in shape
+        ]
+    except (TypeError, ValueError, IndexError):
+        return []
+    return points
+
+
+def project_elevation_to_lane_shape(lane_shape_3d, position):
+    """Interpolate lane elevation at the closest x/y point on a 3D shape."""
+    points = _as_3d_points(lane_shape_3d)
+    if len(points) < 2:
+        return None
+
+    try:
+        pos_x = float(position[0])
+        pos_y = float(position[1])
+    except (TypeError, ValueError, IndexError):
+        return None
+
+    best = None
+    for start, end in zip(points, points[1:]):
+        dx = end[0] - start[0]
+        dy = end[1] - start[1]
+        segment_length_sq = dx * dx + dy * dy
+        if segment_length_sq <= 0.0:
+            continue
+        t = ((pos_x - start[0]) * dx + (pos_y - start[1]) * dy) / segment_length_sq
+        t = min(1.0, max(0.0, t))
+        proj_x = start[0] + dx * t
+        proj_y = start[1] + dy * t
+        distance_sq = (pos_x - proj_x) ** 2 + (pos_y - proj_y) ** 2
+        if best is None or distance_sq < best["distance_sq"]:
+            best = {
+                "distance_sq": distance_sq,
+                "projected_z": start[2] + (end[2] - start[2]) * t,
+            }
+    return None if best is None else best["projected_z"]
+
+
 def flatten_lane_shapes(lane_shapes):
     """Flatten lane shape polylines while dropping repeated junction points."""
     points = []
@@ -143,10 +186,12 @@ def select_route_aware_lane_projection(
     position,
     sumo_angle,
     lane_candidates,
+    position_z=None,
     current_lane_id="",
     lane_switch_hysteresis=0.35,
     heading_weight=0.02,
     max_distance=None,
+    max_elevation_error=None,
     max_heading_error=90.0,
     prefer_current_lane=False,
 ):
@@ -163,6 +208,10 @@ def select_route_aware_lane_projection(
         max_heading_error = max(0.0, float(max_heading_error))
         if max_distance is not None:
             max_distance = max(0.0, float(max_distance))
+        if position_z is not None:
+            position_z = float(position_z)
+        if max_elevation_error is not None:
+            max_elevation_error = max(0.0, float(max_elevation_error))
     except (TypeError, ValueError):
         return None
 
@@ -187,14 +236,30 @@ def select_route_aware_lane_projection(
             continue
         if max_distance is not None and projection["distance"] > max_distance:
             continue
+        projected_z = project_elevation_to_lane_shape(
+            candidate.get("shape3d"),
+            position,
+        )
+        elevation_error = None
+        if projected_z is not None and position_z is not None:
+            elevation_error = abs(position_z - projected_z)
+            if (
+                max_elevation_error is not None
+                and elevation_error > max_elevation_error
+            ):
+                continue
 
         continuity_penalty = 0.0 if lane_id == current_lane_id else lane_switch_hysteresis
         score = projection["distance"] + heading_weight * heading_error + continuity_penalty
         result = {
             **projection,
             "lane_id": lane_id,
+            "edge_id": candidate.get("edge_id", ""),
+            "lane_index": candidate.get("lane_index", -1),
             "route_offset": candidate.get("route_offset", 0.0),
             "heading_error": heading_error,
+            "projected_z": projected_z,
+            "elevation_error": elevation_error,
             "score": score,
         }
         if lane_id == current_lane_id:

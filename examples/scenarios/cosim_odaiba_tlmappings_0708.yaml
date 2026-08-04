@@ -83,7 +83,8 @@ simulator:
     num_tries: 10
     gui_flag: false
     realtime_flag: false
-    traffic_scale: 1.0
+    # Source routes use period=0.2; scale 0.5 is approximately period=0.4.
+    traffic_scale: 0.5
     sumo_output_file_types:
       - fcd_all
       - collision
