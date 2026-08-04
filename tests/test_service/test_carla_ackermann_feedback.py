@@ -131,6 +131,13 @@ def test_lane_lookahead_crosses_internal_and_destination_lanes():
         ("outgoing_0", ":junction_0_0", True, True, False, "G", "s", 12.5),
     ]
     assert extract_next_link_lane_ids(next_links) == [":junction_0_0", "outgoing_0"]
+    sumo_123_links = [
+        ("outgoing_0", True, True, False, ":junction_0_0", "G", "s", 12.5),
+    ]
+    assert extract_next_link_lane_ids(sumo_123_links) == [
+        ":junction_0_0",
+        "outgoing_0",
+    ]
     point = find_lookahead_position_from_lane_shapes(
         [[(0.0, 0.0), (10.0, 0.0)], [(10.0, 0.0), (20.0, 0.0)]],
         (8.0, 0.0),
@@ -1287,6 +1294,73 @@ def test_feedback_move_to_is_immediate_and_preserves_current_sumo_lane(monkeypat
     assert calls[0][0] == "move"
     assert calls[0][1][0:2] == ("BV", "edge_0_0")
     assert calls[0][1][2] == pytest.approx(25.0)
+
+
+def test_feedback_move_to_signal_stop_line_clamps_1_01_meter_then_uses_successor(
+    monkeypatch,
+):
+    from terasim_service.plugins import cosim as plugin_module
+
+    lane_shapes = {
+        "edge_0_0": [(0.0, 0.0), (10.0, 0.0)],
+        ":junction_0_0": [(10.0, 0.0), (15.0, 0.0)],
+        "edge_1_0": [(15.0, 0.0), (25.0, 0.0)],
+    }
+    lane_lengths = {
+        "edge_0_0": 10.0,
+        ":junction_0_0": 2.5,
+        "edge_1_0": 10.0,
+    }
+    moves = []
+    link_state = {"value": "r"}
+    fake_vehicle = types.SimpleNamespace(
+        getLaneID=lambda _actor_id: "edge_0_0",
+        getNextLinks=lambda _actor_id: [
+            (
+                "edge_1_0",
+                ":junction_0_0",
+                True,
+                True,
+                False,
+                link_state["value"],
+                "s",
+                5.0,
+            )
+        ],
+        moveTo=lambda *args: moves.append(args),
+    )
+    fake_lane = types.SimpleNamespace(
+        getShape=lambda lane_id: lane_shapes[lane_id],
+        getLength=lambda lane_id: lane_lengths[lane_id],
+    )
+    monkeypatch.setattr(
+        plugin_module,
+        "traci",
+        types.SimpleNamespace(vehicle=fake_vehicle, lane=fake_lane),
+    )
+
+    plugin = plugin_module.TeraSimCoSimPlugin.__new__(plugin_module.TeraSimCoSimPlugin)
+    plugin.feedback_lane_geometry_cache = {}
+    plugin.ackermann_feedback_move_to_max_distance = 8.0
+    plugin.ackermann_feedback_background_move_to_max_distance = None
+    plugin.ackermann_feedback_move_to_lane_hysteresis = 0.35
+    plugin.ackermann_feedback_signal_stop_line_clamp_offset = 1.01
+    plugin.logger = types.SimpleNamespace(
+        debug=lambda *args, **kwargs: None,
+        error=lambda *args, **kwargs: None,
+    )
+
+    plugin._move_ackermann_feedback_actor("BV", (11.0, 0.0), 90.0)
+    plugin._move_ackermann_feedback_actor("BV", (11.01, 0.0), 90.0)
+    plugin._move_ackermann_feedback_actor("BV", (11.02, 0.0), 90.0)
+
+    assert moves[0] == ("BV", "edge_0_0", pytest.approx(10.0))
+    assert moves[1] == ("BV", "edge_0_0", pytest.approx(10.0))
+    assert moves[2] == ("BV", ":junction_0_0", pytest.approx(0.51))
+
+    link_state["value"] = "M"
+    plugin._move_ackermann_feedback_actor("BV", (10.05, 0.0), 90.0)
+    assert moves[3] == ("BV", ":junction_0_0", pytest.approx(0.025))
 
 
 def test_feedback_move_to_uses_only_current_lane_and_profiles_calls(monkeypatch):

@@ -7,8 +7,9 @@ def extract_next_link_lane_ids(next_links):
     """Return internal and destination lane IDs from TraCI ``getNextLinks`` data."""
     lane_ids = []
     for link in next_links or []:
-        # getNextLinks: (lane, via, priority, opened, foe, state, direction, length)
-        for index in (1, 0):
+        # SUMO 1.23: (lane, priority, opened, foe, via, state, direction, length).
+        # Some older wrappers expose via at index 1, so accept both layouts.
+        for index in (4, 1, 0):
             if index >= len(link):
                 continue
             lane_id = link[index]
@@ -130,6 +131,7 @@ def project_position_to_lane_shape(lane_shape, position, lane_length=None):
         sumo_lane_length,
         max(0.0, best["shape_position"] / total_length * sumo_lane_length),
     )
+    best["shape_length"] = total_length
     return best
 
 
@@ -191,6 +193,7 @@ def select_route_aware_lane_projection(
         result = {
             **projection,
             "lane_id": lane_id,
+            "route_offset": candidate.get("route_offset", 0.0),
             "heading_error": heading_error,
             "score": score,
         }
