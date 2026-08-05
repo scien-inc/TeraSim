@@ -1002,6 +1002,108 @@ def test_ackermann_spawn_instability_disables_physics_and_restarts_initializatio
     assert actor_transform[0].location.z == pytest.approx(9.0)
 
 
+def test_ackermann_spawn_abandons_after_three_overlap_failures_without_raising():
+    install_fake_carla()
+    from terasim_service.utils.carla.ackermann_control import (
+        AckermannControllerTuning,
+        AckermannTuning,
+    )
+    from terasim_service.utils.carla.cosim import CarlaCosim
+
+    bounding_box = types.SimpleNamespace(
+        location=FakeLocation(),
+        rotation=FakeRotation(),
+        extent=FakeLocation(x=2.4, y=0.9, z=0.75),
+    )
+    ground_transform = FakeTransform(location=FakeLocation())
+    elevated_transform = FakeTransform(location=FakeLocation(z=5.0))
+    actor_transform = [elevated_transform]
+    physics_enabled = []
+    actor = types.SimpleNamespace(
+        id=10,
+        bounding_box=bounding_box,
+        get_transform=lambda: actor_transform[0],
+        set_transform=lambda transform: actor_transform.__setitem__(0, transform),
+        get_velocity=lambda: FakeVector3D(),
+        set_simulate_physics=physics_enabled.append,
+        set_target_velocity=lambda _velocity: None,
+        set_target_angular_velocity=lambda _velocity: None,
+        get_physics_control=lambda: types.SimpleNamespace(wheels=[]),
+        apply_ackermann_controller_settings=lambda _settings: None,
+    )
+    blocker = types.SimpleNamespace(
+        id=20,
+        bounding_box=bounding_box,
+        get_transform=lambda: FakeTransform(location=FakeLocation(x=3.0)),
+    )
+    destroyed = []
+    cosim = CarlaCosim.__new__(CarlaCosim)
+    cosim.world = types.SimpleNamespace(
+        get_snapshot=lambda: types.SimpleNamespace(frame=10)
+    )
+    cosim.client = types.SimpleNamespace(
+        apply_batch_sync=lambda commands, _due_tick: destroyed.extend(commands)
+    )
+    cosim._ackermann_actor_state = {"BLOCK": {"physics_enabled": True}}
+    cosim._vehicle_actor_index = {"NEW": actor, "BLOCK": blocker}
+    cosim._pending_actor_index_entries = {}
+    cosim._spawn_failures = {}
+    cosim._collision_sensors = {}
+    cosim.spawn_max_attempts = 3
+    cosim.spawn_z_clearance = 5.0
+    cosim.initialization_diagnostics_enabled = False
+    cosim.ackermann_tuning = AckermannTuning()
+    cosim.ackermann_controller_tuning = AckermannControllerTuning()
+
+    assert (
+        cosim._prepare_ackermann_actor_physics(
+            actor, "NEW", 0.0, ground_transform, elevated_transform
+        )
+        is False
+    )
+    assert (
+        cosim._ensure_ackermann_actor_physics(
+            actor, "NEW", initial_speed=0.0, initial_transform=ground_transform
+        )
+        is False
+    )
+    assert (
+        cosim._ensure_ackermann_actor_physics(
+            actor, "NEW", initial_speed=0.0, initial_transform=ground_transform
+        )
+        is False
+    )
+
+    assert cosim._spawn_failures[("vehicle", "NEW")]["abandoned"] is True
+    assert cosim._ackermann_actor_state["NEW"]["physics_reinitialization_count"] == 3
+    assert "NEW" not in cosim._vehicle_actor_index
+    assert destroyed == [("destroy", 10)]
+    assert cosim._should_retry_spawn(
+        "vehicle", "NEW", [0.0, 0.0, 0.0], 11
+    ) is False
+
+
+def test_carla_actor_spawn_failure_is_abandoned_after_three_attempts():
+    install_fake_carla()
+    from terasim_service.utils.carla.cosim import CarlaCosim
+
+    cosim = CarlaCosim.__new__(CarlaCosim)
+    cosim._spawn_failures = {}
+    cosim.spawn_max_attempts = 3
+    cosim.spawn_failure_backoff_seconds = 0.0
+    cosim.spawn_failure_backoff_max_seconds = 0.0
+
+    for frame in range(3):
+        cosim._record_spawn_failure("vehicle", "BV", [1.0, 2.0, 0.0], frame)
+
+    failure = cosim._spawn_failures[("vehicle", "BV")]
+    assert failure["failures"] == 3
+    assert failure["abandoned"] is True
+    assert cosim._should_retry_spawn(
+        "vehicle", "BV", [1.0, 2.0, 0.0], 100
+    ) is False
+
+
 def test_ackermann_spawn_footprints_allow_separated_adjacent_lane():
     install_fake_carla()
     from terasim_service.utils.carla.cosim import CarlaCosim

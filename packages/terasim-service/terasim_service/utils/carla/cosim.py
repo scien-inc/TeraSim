@@ -321,6 +321,14 @@ class CarlaCosim(object):
             self.spawn_failure_backoff_seconds,
             _env_float("CARLA_COSIM_SPAWN_FAILURE_BACKOFF_MAX_SECONDS", 30.0),
         )
+        self.spawn_max_attempts = max(
+            1,
+            _env_int("CARLA_COSIM_SPAWN_MAX_ATTEMPTS", 3),
+        )
+        print(
+            f"CARLA co-sim spawn attempt limit: {self.spawn_max_attempts}.",
+            flush=True,
+        )
         self.batch_transform_enabled = _env_bool("CARLA_COSIM_BATCH_TRANSFORM", False)
         if self.batch_transform_enabled:
             print("CARLA co-sim ApplyTransform batching enabled.", flush=True)
@@ -1923,6 +1931,15 @@ class CarlaCosim(object):
             actor, veh_id, ground_transform
         )
         if not is_clear:
+            reason = f"overlap={blocking_actor_id}"
+            if self._register_ackermann_initialization_failure(
+                actor,
+                veh_id,
+                initial_speed,
+                ground_transform,
+                reason,
+            ):
+                return False
             state["physics_overlap_deferred"] = True
             state["physics_overlap_blocking_actor"] = blocking_actor_id
             state["physics_ground_transform_reserved"] = False
@@ -2280,16 +2297,15 @@ class CarlaCosim(object):
         reason,
     ):
         state = self._ackermann_actor_state.setdefault(veh_id, {})
-        retry_count = int(state.get("physics_reinitialization_count", 0)) + 1
-        self._record_initialization_diagnostic(
-            "failure",
+        if self._register_ackermann_initialization_failure(
             actor,
             veh_id,
-            expected_transform=ground_transform,
-            expected_speed=initial_speed,
-            reason=reason,
-            attempt=retry_count,
-        )
+            initial_speed,
+            ground_transform,
+            reason,
+        ):
+            return False
+        retry_count = int(state.get("physics_reinitialization_count", 0))
         self._set_actor_simulate_physics(actor, False)
         self._zero_ackermann_actor_motion(actor)
         state["physics_enabled"] = False
@@ -2304,7 +2320,6 @@ class CarlaCosim(object):
         state.pop("physics_last_stability_frame", None)
         state.pop("physics_ground_transform_applied_frame", None)
         state.pop("physics_ground_transform_wait_pending", None)
-        state["physics_reinitialization_count"] = retry_count
         elevated_transform = self._transform_with_z_offset(
             ground_transform, self.spawn_z_clearance
         )
@@ -2318,6 +2333,73 @@ class CarlaCosim(object):
             flush=True,
         )
         return False
+
+    def _register_ackermann_initialization_failure(
+        self,
+        actor,
+        veh_id,
+        initial_speed,
+        ground_transform,
+        reason,
+    ):
+        """Count one failed initialization attempt and abandon at the limit."""
+        state = self._ackermann_actor_state.setdefault(veh_id, {})
+        failure_count = int(state.get("physics_reinitialization_count", 0)) + 1
+        state["physics_reinitialization_count"] = failure_count
+        self._record_initialization_diagnostic(
+            "failure",
+            actor,
+            veh_id,
+            expected_transform=ground_transform,
+            expected_speed=initial_speed,
+            reason=reason,
+            attempt=failure_count,
+        )
+        max_attempts = max(1, int(getattr(self, "spawn_max_attempts", 3)))
+        if failure_count < max_attempts:
+            return False
+
+        state["physics_initialization_abandoned"] = True
+        state["physics_initialization_pending"] = True
+        state["physics_enabled"] = False
+        self._set_actor_simulate_physics(actor, False)
+        self._zero_ackermann_actor_motion(actor)
+        self._record_initialization_diagnostic(
+            "abandoned",
+            actor,
+            veh_id,
+            expected_transform=ground_transform,
+            expected_speed=initial_speed,
+            reason=reason,
+            attempt=failure_count,
+        )
+        self._mark_spawn_abandoned("vehicle", veh_id, failure_count, reason)
+        self._remove_collision_sensor(veh_id)
+
+        actor_index = getattr(self, "_vehicle_actor_index", None)
+        if actor_index is not None and actor_index.get(veh_id) is actor:
+            actor_index.pop(veh_id, None)
+        pending_entries = getattr(self, "_pending_actor_index_entries", None)
+        if pending_entries is not None:
+            pending_entries.pop(veh_id, None)
+
+        try:
+            self.client.apply_batch_sync(
+                [carla.command.DestroyActor(actor.id)],
+                False,
+            )
+        except Exception:
+            try:
+                actor.destroy()
+            except Exception:
+                pass
+        print(
+            f"Warning: abandoning CARLA spawn for {veh_id!r} after "
+            f"{failure_count} failed initialization attempts: {reason}. "
+            "SUMO simulation will continue without this CARLA actor.",
+            flush=True,
+        )
+        return True
 
     def _monitor_ackermann_actor_physics_stability(
         self,
@@ -2535,6 +2617,15 @@ class CarlaCosim(object):
                     actor, veh_id, initial_transform
                 )
                 if not is_clear:
+                    reason = f"overlap={blocking_actor_id}"
+                    if self._register_ackermann_initialization_failure(
+                        actor,
+                        veh_id,
+                        initial_speed,
+                        initial_transform,
+                        reason,
+                    ):
+                        return False
                     state["physics_overlap_blocking_actor"] = blocking_actor_id
                     actor.set_transform(
                         self._transform_with_z_offset(
@@ -2590,11 +2681,26 @@ class CarlaCosim(object):
                     transform_ready = False
                     actual_transform = None
                 if not transform_ready:
-                    return False
+                    return self._restart_ackermann_actor_physics_initialization(
+                        actor,
+                        veh_id,
+                        initial_speed,
+                        pending_transform,
+                        "ground_transform_not_ready",
+                    )
                 is_clear, blocking_actor_id = self._ackermann_spawn_transform_is_clear(
                     actor, veh_id, pending_transform
                 )
                 if not is_clear:
+                    reason = f"overlap={blocking_actor_id}"
+                    if self._register_ackermann_initialization_failure(
+                        actor,
+                        veh_id,
+                        initial_speed,
+                        pending_transform,
+                        reason,
+                    ):
+                        return False
                     state["physics_overlap_deferred"] = True
                     state["physics_overlap_blocking_actor"] = blocking_actor_id
                     state["physics_ground_transform_reserved"] = False
@@ -3467,11 +3573,12 @@ class CarlaCosim(object):
         return "BIKE" in vru_info["type"] or "MOTOR" in vru_info["type"]
 
     def _should_retry_spawn(self, actor_type, actor_id, sumo_location, current_frame):
-        if actor_id == AV_SUMO_ID:
-            return True
-
         failure = self._spawn_failures.get(self._spawn_failure_key(actor_type, actor_id))
         if failure is None:
+            return True
+        if failure.get("abandoned"):
+            return False
+        if actor_id == AV_SUMO_ID:
             return True
 
         dx = sumo_location[0] - failure["x"]
@@ -3493,13 +3600,32 @@ class CarlaCosim(object):
             self.spawn_failure_backoff_max_seconds,
             self.spawn_failure_backoff_seconds * (2 ** exponent),
         )
+        abandoned = failures >= max(1, int(getattr(self, "spawn_max_attempts", 3)))
         self._spawn_failures[key] = {
             "failures": failures,
+            "abandoned": abandoned,
             "next_retry_frame": current_frame + self.SPAWN_RETRY_FRAMES,
             "next_retry_time": time.monotonic() + delay,
             "x": sumo_location[0],
             "y": sumo_location[1],
         }
+        if abandoned:
+            print(
+                f"Warning: abandoning CARLA {actor_type} spawn for {actor_id!r} "
+                f"after {failures} failed attempts. SUMO simulation will continue.",
+                flush=True,
+            )
+
+    def _mark_spawn_abandoned(self, actor_type, actor_id, failures, reason):
+        self._spawn_failures[self._spawn_failure_key(actor_type, actor_id)] = {
+            "failures": int(failures),
+            "abandoned": True,
+            "reason": str(reason),
+        }
+
+    def _is_spawn_abandoned(self, actor_type, actor_id):
+        failure = self._spawn_failures.get(self._spawn_failure_key(actor_type, actor_id))
+        return bool(failure and failure.get("abandoned"))
 
     def _clear_spawn_failure(self, actor_type, actor_id):
         self._spawn_failures.pop(self._spawn_failure_key(actor_type, actor_id), None)
@@ -3616,6 +3742,8 @@ class CarlaCosim(object):
         spawn_requests=None,
     ):
         """Process a vehicle actor."""
+        if self._is_spawn_abandoned("vehicle", veh_id):
+            return
         cosim_id_record.add(veh_id)
 
         sumo_location = self._resolve_sumo_location(
