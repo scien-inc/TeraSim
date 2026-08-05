@@ -9,6 +9,7 @@ import random
 import xml.etree.ElementTree as ET
 import yaml
 import statistics
+import threading
 
 from .ackermann_control import (
     AckermannControllerTuning,
@@ -140,6 +141,48 @@ class CarlaCosim(object):
         self._vehicle_actor_index = None
         self._pedestrian_actor_index = None
         self._pending_actor_index_entries = {}
+        self.collision_sensor_enabled = _env_bool(
+            "CARLA_COSIM_COLLISION_SENSOR_ENABLED", False
+        )
+        self.collision_log_path = os.environ.get(
+            "CARLA_COSIM_COLLISION_LOG", "/app/outputs/carla_collision_events.jsonl"
+        ).strip()
+        self.collision_summary_path = os.environ.get(
+            "CARLA_COSIM_COLLISION_SUMMARY", "/app/outputs/carla_collision_summary.json"
+        ).strip()
+        self.collision_episode_gap_frames = max(
+            1, _env_int("CARLA_COSIM_COLLISION_EPISODE_GAP_FRAMES", 10)
+        )
+        self.initialization_diagnostics_enabled = _env_bool(
+            "CARLA_COSIM_INITIALIZATION_DIAGNOSTICS_ENABLED", False
+        )
+        self.initialization_log_path = os.environ.get(
+            "CARLA_COSIM_INITIALIZATION_LOG",
+            "/app/outputs/carla_physics_initialization.jsonl",
+        ).strip()
+        self._diagnostic_lock = threading.Lock()
+        self._collision_sensors = {}
+        self._collision_seen_frame_pairs = set()
+        self._collision_last_pair_frame = {}
+        self._collision_raw_event_count = 0
+        self._collision_unique_frame_count = 0
+        self._collision_episode_count = 0
+        self._collision_episode_counts_by_pair = {}
+        self._initialization_failure_counts = {}
+        if self.collision_sensor_enabled:
+            self._reset_diagnostic_path(self.collision_log_path)
+            self._reset_diagnostic_path(self.collision_summary_path)
+            print(
+                "CARLA collision sensors enabled: "
+                f"events={self.collision_log_path} summary={self.collision_summary_path}.",
+                flush=True,
+            )
+        if self.initialization_diagnostics_enabled:
+            self._reset_diagnostic_path(self.initialization_log_path)
+            print(
+                f"CARLA physics initialization diagnostics: {self.initialization_log_path}.",
+                flush=True,
+            )
         requested_vehicle_control_mode = (
             getattr(args, "vehicle_control_mode", None)
             or os.environ.get("CARLA_COSIM_VEHICLE_CONTROL_MODE")
@@ -1488,6 +1531,7 @@ class CarlaCosim(object):
         self._prune_spawn_failures(vehicles.keys(), vrus.keys())
         self._prune_ackermann_actor_state(vehicles.keys())
         self._prune_ackermann_feedback_state(feedback_candidate_actor_ids)
+        self._prune_collision_sensors(vehicles.keys())
 
         # self.sync_cosim_tls_to_carla()
 
@@ -1866,6 +1910,15 @@ class CarlaCosim(object):
         state["physics_initialization_transform"] = ground_transform
         state["physics_initialization_speed"] = initial_speed
         state["physics_initialization_pending"] = True
+        attempt = int(state.get("physics_reinitialization_count", 0)) + 1
+        self._record_initialization_diagnostic(
+            "prepared",
+            actor,
+            veh_id,
+            expected_transform=ground_transform,
+            expected_speed=initial_speed,
+            attempt=attempt,
+        )
         is_clear, blocking_actor_id = self._ackermann_spawn_transform_is_clear(
             actor, veh_id, ground_transform
         )
@@ -1874,6 +1927,15 @@ class CarlaCosim(object):
             state["physics_overlap_blocking_actor"] = blocking_actor_id
             state["physics_ground_transform_reserved"] = False
             actor.set_transform(elevated_transform)
+            self._record_initialization_diagnostic(
+                "overlap_deferred",
+                actor,
+                veh_id,
+                expected_transform=ground_transform,
+                expected_speed=initial_speed,
+                attempt=attempt,
+                extra={"blocking_vehicle_id": blocking_actor_id},
+            )
             print(
                 f"CARLA physics spawn deferred for {veh_id!r}: physical footprint "
                 f"overlaps {blocking_actor_id!r}.",
@@ -1889,6 +1951,263 @@ class CarlaCosim(object):
         # needs one completed world tick to update the body, wheels, and road
         # contacts at the requested ground transform.
         return False
+
+    @staticmethod
+    def _reset_diagnostic_path(path):
+        if not path:
+            return
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(path, "w", encoding="utf-8"):
+            pass
+
+    def _append_diagnostic_jsonl(self, path, payload):
+        if not path:
+            return
+        line = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        lock = getattr(self, "_diagnostic_lock", None)
+        if lock is None:
+            with open(path, "a", encoding="utf-8") as output:
+                output.write(line + "\n")
+            return
+        with lock:
+            with open(path, "a", encoding="utf-8") as output:
+                output.write(line + "\n")
+
+    @staticmethod
+    def _diagnostic_vector(vector):
+        if vector is None:
+            return None
+        return {
+            axis: float(getattr(vector, axis, 0.0))
+            for axis in ("x", "y", "z")
+        }
+
+    @classmethod
+    def _diagnostic_transform(cls, transform):
+        if transform is None:
+            return None
+        return {
+            "location": cls._diagnostic_vector(transform.location),
+            "rotation": {
+                axis: float(getattr(transform.rotation, axis, 0.0))
+                for axis in ("pitch", "yaw", "roll")
+            },
+        }
+
+    @classmethod
+    def _diagnostic_actor_snapshot(cls, actor):
+        snapshot = {
+            "actor_id": int(getattr(actor, "id", -1)),
+            "type_id": str(getattr(actor, "type_id", "")),
+        }
+        try:
+            snapshot["role_name"] = actor.attributes.get("role_name", "")
+        except Exception:
+            snapshot["role_name"] = ""
+        for name, getter in (
+            ("transform", "get_transform"),
+            ("velocity", "get_velocity"),
+            ("acceleration", "get_acceleration"),
+            ("angular_velocity", "get_angular_velocity"),
+        ):
+            try:
+                value = getattr(actor, getter)()
+            except Exception:
+                value = None
+            snapshot[name] = (
+                cls._diagnostic_transform(value)
+                if name == "transform"
+                else cls._diagnostic_vector(value)
+            )
+        try:
+            control = actor.get_control()
+            snapshot["control"] = {
+                name: getattr(control, name, None)
+                for name in (
+                    "throttle", "steer", "brake", "hand_brake", "reverse", "gear"
+                )
+            }
+        except Exception:
+            snapshot["control"] = None
+        return snapshot
+
+    def _record_initialization_diagnostic(
+        self,
+        event_type,
+        actor,
+        veh_id,
+        expected_transform=None,
+        expected_speed=None,
+        reason=None,
+        attempt=None,
+        extra=None,
+    ):
+        if not getattr(self, "initialization_diagnostics_enabled", False):
+            return
+        frame = self._current_carla_frame()
+        payload = {
+            "event": event_type,
+            "wall_time": time.time(),
+            "carla_frame": frame,
+            "vehicle_id": veh_id,
+            "attempt": attempt,
+            "reason": reason,
+            "expected_speed": self._as_finite_float(expected_speed),
+            "expected_transform": self._diagnostic_transform(expected_transform),
+            "actual": self._diagnostic_actor_snapshot(actor),
+        }
+        if extra:
+            payload["extra"] = extra
+        if event_type == "failure":
+            category = str(reason or "unknown").split("=", 1)[0].split(":", 1)[0]
+            counts = getattr(self, "_initialization_failure_counts", None)
+            if counts is not None:
+                counts[category] = int(counts.get(category, 0)) + 1
+        self._append_diagnostic_jsonl(self.initialization_log_path, payload)
+
+    def _ensure_collision_sensor(self, actor, veh_id):
+        if not getattr(self, "collision_sensor_enabled", False) or actor is None:
+            return None
+        sensors = getattr(self, "_collision_sensors", None)
+        if sensors is None:
+            return None
+        existing = sensors.get(veh_id)
+        try:
+            if existing is not None and existing.is_alive:
+                return existing
+        except Exception:
+            pass
+        sensors.pop(veh_id, None)
+        try:
+            blueprint = self.world.get_blueprint_library().find("sensor.other.collision")
+            sensor = self.world.spawn_actor(
+                blueprint,
+                carla.Transform(),
+                attach_to=actor,
+            )
+            sensor.listen(
+                lambda event, vehicle_id=veh_id, vehicle_actor=actor: self._on_collision_event(
+                    vehicle_id, vehicle_actor, event
+                )
+            )
+        except Exception as exc:
+            print(
+                f"Warning: failed to attach CARLA collision sensor to {veh_id!r}: {exc}",
+                flush=True,
+            )
+            return None
+        sensors[veh_id] = sensor
+        return sensor
+
+    def _on_collision_event(self, veh_id, actor, event):
+        frame = int(getattr(event, "frame", self._current_carla_frame() or -1))
+        other = getattr(event, "other_actor", None)
+        actor_id = int(getattr(actor, "id", -1))
+        other_id = int(getattr(other, "id", -1))
+        pair_ids = tuple(sorted((actor_id, other_id)))
+        pair_key = f"{pair_ids[0]}:{pair_ids[1]}"
+        frame_pair = (frame, pair_ids)
+        lock = getattr(self, "_diagnostic_lock", None) or threading.Lock()
+        with lock:
+            self._collision_raw_event_count += 1
+            duplicate_frame_pair = frame_pair in self._collision_seen_frame_pairs
+            if not duplicate_frame_pair:
+                self._collision_seen_frame_pairs.add(frame_pair)
+                self._collision_unique_frame_count += 1
+            previous_frame = self._collision_last_pair_frame.get(pair_ids)
+            is_new_episode = (
+                not duplicate_frame_pair
+                and (
+                    previous_frame is None
+                    or frame - previous_frame > self.collision_episode_gap_frames
+                )
+            )
+            if not duplicate_frame_pair:
+                self._collision_last_pair_frame[pair_ids] = frame
+            if is_new_episode:
+                self._collision_episode_count += 1
+                self._collision_episode_counts_by_pair[pair_key] = (
+                    int(self._collision_episode_counts_by_pair.get(pair_key, 0)) + 1
+                )
+            episode_count = self._collision_episode_count
+        payload = {
+            "event": "carla_collision",
+            "wall_time": time.time(),
+            "carla_frame": frame,
+            "carla_timestamp": self._as_finite_float(getattr(event, "timestamp", None)),
+            "sensor_vehicle_id": veh_id,
+            "pair_actor_ids": list(pair_ids),
+            "pair_key": pair_key,
+            "duplicate_frame_pair": duplicate_frame_pair,
+            "new_episode": is_new_episode,
+            "episode_count": episode_count,
+            "normal_impulse": self._diagnostic_vector(
+                getattr(event, "normal_impulse", None)
+            ),
+            "vehicle": self._diagnostic_actor_snapshot(actor),
+            "other_actor": self._diagnostic_actor_snapshot(other) if other is not None else None,
+        }
+        self._append_diagnostic_jsonl(self.collision_log_path, payload)
+        if not duplicate_frame_pair:
+            other_role = ""
+            try:
+                other_role = other.attributes.get("role_name", "")
+            except Exception:
+                pass
+            print(
+                "CARLACollision "
+                f"frame={frame} vehicle={veh_id!r} other={other_role or other_id!r} "
+                f"new_episode={is_new_episode} pair={pair_key}",
+                flush=True,
+            )
+
+    def _remove_collision_sensor(self, veh_id):
+        sensor = (getattr(self, "_collision_sensors", None) or {}).pop(veh_id, None)
+        if sensor is None:
+            return
+        try:
+            sensor.stop()
+        except Exception:
+            pass
+        try:
+            sensor.destroy()
+        except Exception:
+            pass
+
+    def _prune_collision_sensors(self, active_vehicle_ids):
+        active = set(active_vehicle_ids)
+        for veh_id in list(getattr(self, "_collision_sensors", {}) or {}):
+            if veh_id not in active:
+                self._remove_collision_sensor(veh_id)
+
+    def _write_collision_summary(self):
+        if not getattr(self, "collision_sensor_enabled", False):
+            return
+        summary = {
+            "raw_sensor_events": int(getattr(self, "_collision_raw_event_count", 0)),
+            "unique_frame_pairs": int(getattr(self, "_collision_unique_frame_count", 0)),
+            "contact_episodes": int(getattr(self, "_collision_episode_count", 0)),
+            "episode_gap_frames": int(getattr(self, "collision_episode_gap_frames", 10)),
+            "episodes_by_pair": dict(
+                sorted((getattr(self, "_collision_episode_counts_by_pair", {}) or {}).items())
+            ),
+            "initialization_failures_by_reason": dict(
+                sorted((getattr(self, "_initialization_failure_counts", {}) or {}).items())
+            ),
+        }
+        path = getattr(self, "collision_summary_path", "")
+        if path:
+            with open(path, "w", encoding="utf-8") as output:
+                json.dump(summary, output, indent=2, sort_keys=True)
+                output.write("\n")
+        print("CARLA collision summary " + json.dumps(summary, sort_keys=True), flush=True)
+
+    def _shutdown_collision_sensors(self):
+        for veh_id in list(getattr(self, "_collision_sensors", {}) or {}):
+            self._remove_collision_sensor(veh_id)
+        self._write_collision_summary()
 
     def _current_carla_frame(self):
         try:
@@ -1961,6 +2280,16 @@ class CarlaCosim(object):
         reason,
     ):
         state = self._ackermann_actor_state.setdefault(veh_id, {})
+        retry_count = int(state.get("physics_reinitialization_count", 0)) + 1
+        self._record_initialization_diagnostic(
+            "failure",
+            actor,
+            veh_id,
+            expected_transform=ground_transform,
+            expected_speed=initial_speed,
+            reason=reason,
+            attempt=retry_count,
+        )
         self._set_actor_simulate_physics(actor, False)
         self._zero_ackermann_actor_motion(actor)
         state["physics_enabled"] = False
@@ -1975,7 +2304,6 @@ class CarlaCosim(object):
         state.pop("physics_last_stability_frame", None)
         state.pop("physics_ground_transform_applied_frame", None)
         state.pop("physics_ground_transform_wait_pending", None)
-        retry_count = int(state.get("physics_reinitialization_count", 0)) + 1
         state["physics_reinitialization_count"] = retry_count
         elevated_transform = self._transform_with_z_offset(
             ground_transform, self.spawn_z_clearance
@@ -2033,6 +2361,15 @@ class CarlaCosim(object):
         state.pop("physics_ground_transform_reserved", None)
         state.pop("physics_initialization_transform", None)
         state.pop("physics_initialization_speed", None)
+        self._record_initialization_diagnostic(
+            "stable",
+            actor,
+            veh_id,
+            expected_transform=initial_transform,
+            expected_speed=initial_speed,
+            attempt=int(state.get("physics_reinitialization_count", 0)) + 1,
+            extra={"stable_ticks": stable_ticks},
+        )
         print(
             f"CARLA physics initialization stable for {veh_id!r} after "
             f"{stable_ticks} tick(s).",
@@ -2273,6 +2610,14 @@ class CarlaCosim(object):
             self._zero_ackermann_actor_motion(actor)
             self._set_actor_simulate_physics(actor, True)
             state["physics_enabled"] = True
+            self._record_initialization_diagnostic(
+                "physics_enabled",
+                actor,
+                veh_id,
+                expected_transform=pending_transform or initial_transform,
+                expected_speed=initial_speed,
+                attempt=int(state.get("physics_reinitialization_count", 0)) + 1,
+            )
             if initial_speed is not None and initial_transform is not None:
                 state["initial_velocity_applied"] = self._initialize_ackermann_actor_velocity(
                     actor,
@@ -3003,6 +3348,8 @@ class CarlaCosim(object):
             actor_index = request.get("actor_index")
             if actor_index is not None:
                 actor_index[actor_id] = actor
+            if actor_type == "vehicle":
+                self._ensure_collision_sensor(actor, actor_id)
             if request.get("enable_physics_after_spawn", False):
                 self._ackermann_actor_state.pop(actor_id, None)
                 actor_state = self._ackermann_actor_state.setdefault(actor_id, {})
@@ -3288,6 +3635,8 @@ class CarlaCosim(object):
         uses_ackermann_physics = self._uses_ackermann_physics(veh_id)
 
         vehicle = carla_actor
+        if vehicle is not None:
+            self._ensure_collision_sensor(vehicle, veh_id)
         if vehicle is None:
             if current_frame is None:
                 current_frame = self.world.get_snapshot().frame
@@ -3348,6 +3697,7 @@ class CarlaCosim(object):
                     return
                 if actor_index is not None:
                     actor_index[veh_id] = vehicle
+                self._ensure_collision_sensor(vehicle, veh_id)
                 if uses_ackermann_physics:
                     self._ackermann_actor_state.pop(veh_id, None)
                     actor_state = self._ackermann_actor_state.setdefault(veh_id, {})
@@ -3523,6 +3873,9 @@ class CarlaCosim(object):
             self._pending_actor_index_entries[role_name][1]
             for role_name in stale_pending_roles
         ]
+        if actor_type == "vehicle":
+            for role_name in stale_roles:
+                self._remove_collision_sensor(role_name)
         if stale_actors or stale_pending_ids:
             destroy_commands = [
                 carla.command.DestroyActor(actor.id) for actor in stale_actors
@@ -3567,6 +3920,8 @@ class CarlaCosim(object):
             self.world.apply_settings(settings)
             wait_for_cleanup_tick("sync-to-async transition")
         
+        self._shutdown_collision_sensors()
+
         # Destroy actors. In 3-cosim passive mode, keep ego (protected_roles) and clear only the
         # SUMO-spawned background vehicles/pedestrians; otherwise destroy everything.
         if getattr(self.args, "passive_tick", False):
