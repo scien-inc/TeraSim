@@ -724,7 +724,7 @@ def test_ackermann_controller_settings_are_applied_once(capsys):
     assert "CARLA Ackermann controller settings applied" in capsys.readouterr().out
 
 
-def test_ackermann_spawn_waits_until_transform_is_visible_before_enabling_physics():
+def test_ackermann_spawn_waits_one_carla_tick_then_requires_three_stable_ticks():
     install_fake_carla()
     from terasim_service.utils.carla.ackermann_control import (
         AckermannControllerTuning,
@@ -732,44 +732,100 @@ def test_ackermann_spawn_waits_until_transform_is_visible_before_enabling_physic
     )
     from terasim_service.utils.carla.cosim import CarlaCosim
 
-    desired_transform = FakeTransform(
+    ground_transform = FakeTransform(
         location=FakeLocation(x=100.0, y=200.0, z=4.0),
         rotation=FakeRotation(yaw=90.0),
     )
-    reported_transforms = iter([FakeTransform(), desired_transform])
+    elevated_transform = FakeTransform(
+        location=FakeLocation(x=100.0, y=200.0, z=9.0),
+        rotation=FakeRotation(yaw=90.0),
+    )
+    frame = [100]
+    actor_transform = [elevated_transform]
+    actor_velocity = [FakeVector3D()]
     physics_enabled = []
     target_velocities = []
+    target_angular_velocities = []
+
+    def set_target_velocity(velocity):
+        target_velocities.append(velocity)
+        actor_velocity[0] = velocity
+
     actor = types.SimpleNamespace(
-        get_transform=lambda: next(reported_transforms),
+        id=1,
+        bounding_box=types.SimpleNamespace(
+            location=FakeLocation(),
+            rotation=FakeRotation(),
+            extent=FakeLocation(x=2.4, y=0.9, z=0.75),
+        ),
+        get_transform=lambda: actor_transform[0],
+        set_transform=lambda transform: actor_transform.__setitem__(0, transform),
+        get_velocity=lambda: actor_velocity[0],
         get_physics_control=lambda: types.SimpleNamespace(wheels=[]),
-        set_simulate_physics=lambda enabled: physics_enabled.append(enabled),
-        set_target_velocity=lambda velocity: target_velocities.append(velocity),
+        set_simulate_physics=physics_enabled.append,
+        set_target_velocity=set_target_velocity,
+        set_target_angular_velocity=target_angular_velocities.append,
         apply_ackermann_controller_settings=lambda _settings: None,
     )
     cosim = CarlaCosim.__new__(CarlaCosim)
+    cosim.world = types.SimpleNamespace(
+        get_snapshot=lambda: types.SimpleNamespace(frame=frame[0])
+    )
     cosim._ackermann_actor_state = {}
+    cosim._vehicle_actor_index = {"AV": actor}
+    cosim.spawn_z_clearance = 5.0
     cosim.ackermann_tuning = AckermannTuning()
     cosim.ackermann_controller_tuning = AckermannControllerTuning()
 
-    ready = cosim._ensure_ackermann_actor_physics(
-        actor, "AV", initial_speed=8.0, initial_transform=desired_transform
+    ready = cosim._prepare_ackermann_actor_physics(
+        actor,
+        "AV",
+        8.0,
+        ground_transform,
+        elevated_transform,
     )
-
     assert ready is False
-    assert physics_enabled == []
-    assert target_velocities == []
-    assert cosim._ackermann_actor_state["AV"]["physics_initialization_pending"] is True
+    assert actor_transform[0] is ground_transform
+    assert physics_enabled == [False]
 
+    # The same CARLA frame must never enable physics after set_transform.
     ready = cosim._ensure_ackermann_actor_physics(
-        actor, "AV", initial_speed=8.0, initial_transform=desired_transform
+        actor, "AV", initial_speed=8.0, initial_transform=ground_transform
     )
+    assert ready is False
+    assert physics_enabled == [False]
 
-    assert ready is True
-    assert physics_enabled == [True]
-    assert target_velocities[0].x == pytest.approx(0.0, abs=1e-9)
-    assert target_velocities[0].y == pytest.approx(8.0)
-    assert cosim._ackermann_actor_state["AV"]["physics_initialization_pending"] is False
+    # The next frame enables physics, but the actor remains initialization-pending.
+    frame[0] = 101
+    ready = cosim._ensure_ackermann_actor_physics(
+        actor, "AV", initial_speed=8.0, initial_transform=ground_transform
+    )
+    assert ready is False
+    assert physics_enabled == [False, True]
+    assert target_velocities[-1].x == pytest.approx(0.0, abs=1e-9)
+    assert target_velocities[-1].y == pytest.approx(8.0)
 
+    for expected_frame in (102, 103):
+        frame[0] = expected_frame
+        assert (
+            cosim._ensure_ackermann_actor_physics(
+                actor, "AV", initial_speed=8.0, initial_transform=ground_transform
+            )
+            is False
+        )
+
+    frame[0] = 104
+    assert (
+        cosim._ensure_ackermann_actor_physics(
+            actor, "AV", initial_speed=8.0, initial_transform=ground_transform
+        )
+        is True
+    )
+    state = cosim._ackermann_actor_state["AV"]
+    assert state["physics_initialization_pending"] is False
+    assert state["physics_stabilization_pending"] is False
+    assert state["physics_stable_ticks"] == 3
+    assert len(target_angular_velocities) == 2
 
 def test_ackermann_spawn_defers_physics_while_physical_footprint_overlaps():
     install_fake_carla()
@@ -788,6 +844,7 @@ def test_ackermann_spawn_defers_physics_while_physical_footprint_overlaps():
     elevated_transform = FakeTransform(location=FakeLocation(x=0.0, y=0.0, z=5.0))
     actor_transform = [elevated_transform]
     blocker_transform = [FakeTransform(location=FakeLocation(x=3.0, y=0.0, z=0.0))]
+    frame = [10]
     physics_enabled = []
 
     actor = types.SimpleNamespace(
@@ -795,8 +852,10 @@ def test_ackermann_spawn_defers_physics_while_physical_footprint_overlaps():
         bounding_box=bounding_box,
         get_transform=lambda: actor_transform[0],
         set_transform=lambda transform: actor_transform.__setitem__(0, transform),
+        get_velocity=lambda: FakeVector3D(),
         set_simulate_physics=physics_enabled.append,
         set_target_velocity=lambda _velocity: None,
+        set_target_angular_velocity=lambda _velocity: None,
         get_physics_control=lambda: types.SimpleNamespace(wheels=[]),
         apply_ackermann_controller_settings=lambda _settings: None,
     )
@@ -806,6 +865,9 @@ def test_ackermann_spawn_defers_physics_while_physical_footprint_overlaps():
         get_transform=lambda: blocker_transform[0],
     )
     cosim = CarlaCosim.__new__(CarlaCosim)
+    cosim.world = types.SimpleNamespace(
+        get_snapshot=lambda: types.SimpleNamespace(frame=frame[0])
+    )
     cosim._ackermann_actor_state = {"BLOCK": {"physics_enabled": True}}
     cosim._vehicle_actor_index = {"NEW": actor, "BLOCK": blocker}
     cosim.spawn_z_clearance = 5.0
@@ -821,7 +883,7 @@ def test_ackermann_spawn_defers_physics_while_physical_footprint_overlaps():
     )
 
     assert ready is False
-    assert physics_enabled == []
+    assert physics_enabled == [False]
     assert actor_transform[0].location.z == pytest.approx(5.0)
     assert cosim._ackermann_actor_state["NEW"]["physics_overlap_deferred"] is True
     assert cosim._ackermann_actor_state["NEW"]["physics_overlap_blocking_actor"] == "BLOCK"
@@ -833,21 +895,111 @@ def test_ackermann_spawn_defers_physics_while_physical_footprint_overlaps():
         initial_speed=0.0,
         initial_transform=ground_transform,
     )
-
     assert ready is False
     assert actor_transform[0].location.z == pytest.approx(0.0)
-    assert cosim._ackermann_actor_state["NEW"]["physics_ground_transform_reserved"] is True
 
-    ready = cosim._ensure_ackermann_actor_physics(
-        actor,
-        "NEW",
-        initial_speed=0.0,
-        initial_transform=ground_transform,
+    # It still cannot enable physics until a completed frame follows placement.
+    assert (
+        cosim._ensure_ackermann_actor_physics(
+            actor, "NEW", initial_speed=0.0, initial_transform=ground_transform
+        )
+        is False
+    )
+    assert physics_enabled == [False]
+
+    frame[0] = 11
+    assert (
+        cosim._ensure_ackermann_actor_physics(
+            actor, "NEW", initial_speed=0.0, initial_transform=ground_transform
+        )
+        is False
+    )
+    assert physics_enabled == [False, True]
+
+    for stable_frame in (12, 13, 14):
+        frame[0] = stable_frame
+        ready = cosim._ensure_ackermann_actor_physics(
+            actor, "NEW", initial_speed=0.0, initial_transform=ground_transform
+        )
+    assert ready is True
+    assert cosim._ackermann_actor_state["NEW"]["physics_initialization_pending"] is False
+
+def test_ackermann_spawn_instability_disables_physics_and_restarts_initialization():
+    install_fake_carla()
+    from terasim_service.utils.carla.ackermann_control import (
+        AckermannControllerTuning,
+        AckermannTuning,
+    )
+    from terasim_service.utils.carla.cosim import CarlaCosim
+
+    ground_transform = FakeTransform(location=FakeLocation(x=10.0, y=20.0, z=4.0))
+    elevated_transform = FakeTransform(location=FakeLocation(x=10.0, y=20.0, z=9.0))
+    actor_transform = [elevated_transform]
+    actor_velocity = [FakeVector3D()]
+    frame = [20]
+    physics_enabled = []
+    actor = types.SimpleNamespace(
+        id=1,
+        bounding_box=types.SimpleNamespace(
+            location=FakeLocation(),
+            rotation=FakeRotation(),
+            extent=FakeLocation(x=2.4, y=0.9, z=0.75),
+        ),
+        get_transform=lambda: actor_transform[0],
+        set_transform=lambda transform: actor_transform.__setitem__(0, transform),
+        get_velocity=lambda: actor_velocity[0],
+        get_physics_control=lambda: types.SimpleNamespace(wheels=[]),
+        set_simulate_physics=physics_enabled.append,
+        set_target_velocity=lambda velocity: actor_velocity.__setitem__(0, velocity),
+        set_target_angular_velocity=lambda _velocity: None,
+        apply_ackermann_controller_settings=lambda _settings: None,
+    )
+    cosim = CarlaCosim.__new__(CarlaCosim)
+    cosim.world = types.SimpleNamespace(
+        get_snapshot=lambda: types.SimpleNamespace(frame=frame[0])
+    )
+    cosim._ackermann_actor_state = {}
+    cosim._vehicle_actor_index = {"BV": actor}
+    cosim.spawn_z_clearance = 5.0
+    cosim.ackermann_tuning = AckermannTuning()
+    cosim.ackermann_controller_tuning = AckermannControllerTuning()
+
+    assert (
+        cosim._prepare_ackermann_actor_physics(
+            actor, "BV", 0.0, ground_transform, elevated_transform
+        )
+        is False
+    )
+    frame[0] = 21
+    assert (
+        cosim._ensure_ackermann_actor_physics(
+            actor, "BV", initial_speed=0.0, initial_transform=ground_transform
+        )
+        is False
+    )
+    assert physics_enabled == [False, True]
+
+    # Reproduce vehicle2322: the actor is launched upward and gains speed.
+    actor_transform[0] = FakeTransform(
+        location=FakeLocation(x=10.0, y=20.0, z=5.0),
+        rotation=FakeRotation(),
+    )
+    actor_velocity[0] = FakeVector3D(x=10.0, z=3.0)
+    frame[0] = 22
+    assert (
+        cosim._ensure_ackermann_actor_physics(
+            actor, "BV", initial_speed=0.0, initial_transform=ground_transform
+        )
+        is False
     )
 
-    assert ready is True
-    assert physics_enabled == [True]
-    assert cosim._ackermann_actor_state["NEW"]["physics_initialization_pending"] is False
+    state = cosim._ackermann_actor_state["BV"]
+    assert physics_enabled == [False, True, False]
+    assert state["physics_enabled"] is False
+    assert state["physics_initialization_pending"] is True
+    assert state["physics_overlap_deferred"] is True
+    assert state["physics_reinitialization_count"] == 1
+    assert actor_transform[0].location.z == pytest.approx(9.0)
 
 
 def test_ackermann_spawn_footprints_allow_separated_adjacent_lane():
@@ -1039,10 +1191,18 @@ def test_ackermann_physics_initializes_velocity_from_sumo_state():
 
     velocities = []
     transform = FakeTransform(rotation=FakeRotation(yaw=30.0))
+    current_velocity = [FakeVector3D()]
+
+    def set_target_velocity(velocity):
+        velocities.append(velocity)
+        current_velocity[0] = velocity
+
     actor = types.SimpleNamespace(
         get_transform=lambda: transform,
+        get_velocity=lambda: current_velocity[0],
         set_simulate_physics=lambda enabled: None,
-        set_target_velocity=velocities.append,
+        set_target_velocity=set_target_velocity,
+        set_target_angular_velocity=lambda _velocity: None,
         apply_ackermann_controller_settings=lambda settings: None,
     )
     cosim = CarlaCosim.__new__(CarlaCosim)
@@ -1050,14 +1210,17 @@ def test_ackermann_physics_initializes_velocity_from_sumo_state():
     cosim.ackermann_controller_tuning = AckermannControllerTuning()
 
     cosim._ensure_ackermann_actor_physics(actor, "BV", 4.0, transform)
-    cosim._ensure_ackermann_actor_physics(actor, "BV", 9.0, transform)
+    for _ in range(3):
+        cosim._ensure_ackermann_actor_physics(actor, "BV", 4.0, transform)
 
-    assert len(velocities) == 1
-    assert velocities[0].x == pytest.approx(4.0 * 3**0.5 / 2.0)
-    assert velocities[0].y == pytest.approx(2.0)
-    assert velocities[0].z == pytest.approx(0.0)
+    nonzero_velocities = [
+        velocity for velocity in velocities if math.hypot(velocity.x, velocity.y) > 0.0
+    ]
+    assert len(nonzero_velocities) == 1
+    assert nonzero_velocities[0].x == pytest.approx(4.0 * 3**0.5 / 2.0)
+    assert nonzero_velocities[0].y == pytest.approx(2.0)
+    assert nonzero_velocities[0].z == pytest.approx(0.0)
     assert cosim._ackermann_actor_state["BV"]["initial_velocity_applied"] is True
-
 
 def test_actor_radius_filter_uses_exit_hysteresis():
     install_fake_carla()

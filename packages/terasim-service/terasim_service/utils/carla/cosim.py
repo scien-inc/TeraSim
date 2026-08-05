@@ -1860,7 +1860,11 @@ class CarlaCosim(object):
         elevated_transform,
     ):
         state = self._ackermann_actor_state.setdefault(veh_id, {})
+        self._set_actor_simulate_physics(actor, False)
+        self._zero_ackermann_actor_motion(actor)
+        state["physics_enabled"] = False
         state["physics_initialization_transform"] = ground_transform
+        state["physics_initialization_speed"] = initial_speed
         state["physics_initialization_pending"] = True
         is_clear, blocking_actor_id = self._ackermann_spawn_transform_is_clear(
             actor, veh_id, ground_transform
@@ -1879,12 +1883,162 @@ class CarlaCosim(object):
 
         state["physics_ground_transform_reserved"] = True
         actor.set_transform(ground_transform)
-        return self._ensure_ackermann_actor_physics(
-            actor,
-            veh_id,
-            initial_speed,
-            ground_transform,
+        state["physics_ground_transform_applied_frame"] = self._current_carla_frame()
+        state["physics_ground_transform_wait_pending"] = True
+        # Never enable physics in the same CARLA frame as set_transform. CARLA
+        # needs one completed world tick to update the body, wheels, and road
+        # contacts at the requested ground transform.
+        return False
+
+    def _current_carla_frame(self):
+        try:
+            return int(self.world.get_snapshot().frame)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _zero_ackermann_actor_motion(actor):
+        zero_velocity = carla.Vector3D(0.0, 0.0, 0.0)
+        try:
+            actor.set_target_velocity(zero_velocity)
+        except Exception:
+            pass
+        try:
+            actor.set_target_angular_velocity(zero_velocity)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _rotation_error_degrees(actual, expected, attribute):
+        actual_value = float(getattr(actual, attribute, 0.0))
+        expected_value = float(getattr(expected, attribute, 0.0))
+        return abs((actual_value - expected_value + 180.0) % 360.0 - 180.0)
+
+    def _ackermann_spawn_stability_failure(
+        self,
+        actor,
+        expected_transform,
+        expected_speed,
+    ):
+        try:
+            actual_transform = actor.get_transform()
+            velocity = actor.get_velocity()
+        except Exception as exc:
+            return f"state_error:{type(exc).__name__}"
+
+        z_error = abs(
+            float(actual_transform.location.z) - float(expected_transform.location.z)
         )
+        horizontal_velocity = horizontal_speed(velocity)
+        vertical_speed = abs(float(getattr(velocity, "z", 0.0)))
+        speed_error = abs(horizontal_velocity - max(0.0, float(expected_speed or 0.0)))
+        pitch_error = self._rotation_error_degrees(
+            actual_transform.rotation, expected_transform.rotation, "pitch"
+        )
+        roll_error = self._rotation_error_degrees(
+            actual_transform.rotation, expected_transform.rotation, "roll"
+        )
+
+        if z_error > self.ACKERMANN_SPAWN_MAX_Z_ERROR:
+            return f"z_error={z_error:.3f}m"
+        if speed_error > self.ACKERMANN_SPAWN_MAX_SPEED_ERROR:
+            return f"speed_error={speed_error:.3f}m/s"
+        if vertical_speed > self.ACKERMANN_SPAWN_MAX_VERTICAL_SPEED:
+            return f"vertical_speed={vertical_speed:.3f}m/s"
+        if (
+            pitch_error > self.ACKERMANN_SPAWN_MAX_TILT_ERROR
+            or roll_error > self.ACKERMANN_SPAWN_MAX_TILT_ERROR
+        ):
+            return f"tilt_error=pitch:{pitch_error:.3f},roll:{roll_error:.3f}deg"
+        return None
+
+    def _restart_ackermann_actor_physics_initialization(
+        self,
+        actor,
+        veh_id,
+        initial_speed,
+        ground_transform,
+        reason,
+    ):
+        state = self._ackermann_actor_state.setdefault(veh_id, {})
+        self._set_actor_simulate_physics(actor, False)
+        self._zero_ackermann_actor_motion(actor)
+        state["physics_enabled"] = False
+        state["physics_initialization_pending"] = True
+        state["physics_initialization_transform"] = ground_transform
+        state["physics_initialization_speed"] = initial_speed
+        state["physics_overlap_deferred"] = True
+        state["physics_ground_transform_reserved"] = False
+        state["physics_stabilization_pending"] = False
+        state["physics_stable_ticks"] = 0
+        state.pop("physics_enabled_frame", None)
+        state.pop("physics_last_stability_frame", None)
+        state.pop("physics_ground_transform_applied_frame", None)
+        state.pop("physics_ground_transform_wait_pending", None)
+        retry_count = int(state.get("physics_reinitialization_count", 0)) + 1
+        state["physics_reinitialization_count"] = retry_count
+        elevated_transform = self._transform_with_z_offset(
+            ground_transform, self.spawn_z_clearance
+        )
+        try:
+            actor.set_transform(elevated_transform)
+        except Exception:
+            pass
+        print(
+            f"Warning: restarting CARLA physics initialization for {veh_id!r}: "
+            f"{reason} (attempt={retry_count}).",
+            flush=True,
+        )
+        return False
+
+    def _monitor_ackermann_actor_physics_stability(
+        self,
+        actor,
+        veh_id,
+        initial_speed,
+        initial_transform,
+    ):
+        state = self._ackermann_actor_state.setdefault(veh_id, {})
+        current_frame = self._current_carla_frame()
+        enabled_frame = state.get("physics_enabled_frame")
+        last_frame = state.get("physics_last_stability_frame")
+        if current_frame is not None:
+            if enabled_frame is not None and current_frame <= enabled_frame:
+                return False
+            if last_frame is not None and current_frame <= last_frame:
+                return False
+
+        failure = self._ackermann_spawn_stability_failure(
+            actor,
+            initial_transform,
+            initial_speed,
+        )
+        if failure is not None:
+            return self._restart_ackermann_actor_physics_initialization(
+                actor,
+                veh_id,
+                initial_speed,
+                initial_transform,
+                failure,
+            )
+
+        state["physics_last_stability_frame"] = current_frame
+        stable_ticks = int(state.get("physics_stable_ticks", 0)) + 1
+        state["physics_stable_ticks"] = stable_ticks
+        if stable_ticks < self.ACKERMANN_SPAWN_STABILITY_TICKS:
+            return False
+
+        state["physics_stabilization_pending"] = False
+        state["physics_initialization_pending"] = False
+        state.pop("physics_ground_transform_reserved", None)
+        state.pop("physics_initialization_transform", None)
+        state.pop("physics_initialization_speed", None)
+        print(
+            f"CARLA physics initialization stable for {veh_id!r} after "
+            f"{stable_ticks} tick(s).",
+            flush=True,
+        )
+        return True
 
     def _initialize_ackermann_actor_velocity(self, actor, veh_id, speed, transform):
         initial_speed = self._as_finite_float(speed)
@@ -2015,11 +2169,30 @@ class CarlaCosim(object):
         initial_transform=None,
     ):
         state = self._ackermann_actor_state.setdefault(veh_id, {})
+        if state.get("physics_stabilization_pending"):
+            expected_transform = initial_transform or state.get(
+                "physics_initialization_transform"
+            )
+            expected_speed = (
+                initial_speed
+                if initial_speed is not None
+                else state.get("physics_initialization_speed", 0.0)
+            )
+            if expected_transform is None:
+                return False
+            return self._monitor_ackermann_actor_physics_stability(
+                actor,
+                veh_id,
+                expected_speed,
+                expected_transform,
+            )
+
         if not state.get("physics_enabled"):
             if state.get("physics_overlap_deferred"):
                 if initial_transform is None:
                     return False
                 state["physics_initialization_transform"] = initial_transform
+                state["physics_initialization_speed"] = initial_speed
                 state["physics_initialization_pending"] = True
                 is_clear, blocking_actor_id = self._ackermann_spawn_transform_is_clear(
                     actor, veh_id, initial_transform
@@ -2036,42 +2209,70 @@ class CarlaCosim(object):
                 state.pop("physics_overlap_blocking_actor", None)
                 state["physics_ground_transform_reserved"] = True
                 actor.set_transform(initial_transform)
+                state["physics_ground_transform_applied_frame"] = (
+                    self._current_carla_frame()
+                )
+                state["physics_ground_transform_wait_pending"] = True
                 return False
 
             pending_transform = state.get("physics_initialization_transform")
             if pending_transform is None and initial_transform is not None:
                 pending_transform = initial_transform
                 state["physics_initialization_transform"] = initial_transform
+                state["physics_initialization_speed"] = initial_speed
                 state["physics_initialization_pending"] = True
 
             if pending_transform is not None:
+                if state.get("physics_ground_transform_wait_pending"):
+                    applied_frame = state.get("physics_ground_transform_applied_frame")
+                    current_frame = self._current_carla_frame()
+                    if (
+                        applied_frame is not None
+                        and current_frame is not None
+                        and current_frame <= applied_frame
+                    ):
+                        return False
+                    if applied_frame is None or current_frame is None:
+                        state["physics_ground_transform_wait_pending"] = False
+                        return False
+                    state["physics_ground_transform_wait_pending"] = False
                 try:
                     actual_transform = actor.get_transform()
                     dx = actual_transform.location.x - pending_transform.location.x
                     dy = actual_transform.location.y - pending_transform.location.y
-                    yaw_error = abs(
-                        (
-                            actual_transform.rotation.yaw
-                            - pending_transform.rotation.yaw
-                            + 180.0
-                        )
-                        % 360.0
-                        - 180.0
+                    dz = actual_transform.location.z - pending_transform.location.z
+                    yaw_error = self._rotation_error_degrees(
+                        actual_transform.rotation, pending_transform.rotation, "yaw"
                     )
-                    transform_ready = math.hypot(dx, dy) <= 1.0 and yaw_error <= 5.0
+                    transform_ready = (
+                        math.hypot(dx, dy) <= 1.0
+                        and abs(dz) <= self.ACKERMANN_SPAWN_MAX_Z_ERROR
+                        and yaw_error <= 5.0
+                    )
                 except Exception:
                     transform_ready = False
                     actual_transform = None
                 if not transform_ready:
                     return False
+                is_clear, blocking_actor_id = self._ackermann_spawn_transform_is_clear(
+                    actor, veh_id, pending_transform
+                )
+                if not is_clear:
+                    state["physics_overlap_deferred"] = True
+                    state["physics_overlap_blocking_actor"] = blocking_actor_id
+                    state["physics_ground_transform_reserved"] = False
+                    actor.set_transform(
+                        self._transform_with_z_offset(
+                            pending_transform, self.spawn_z_clearance
+                        )
+                    )
+                    return False
             else:
                 actual_transform = initial_transform
 
+            self._zero_ackermann_actor_motion(actor)
             self._set_actor_simulate_physics(actor, True)
             state["physics_enabled"] = True
-            state["physics_initialization_pending"] = False
-            state.pop("physics_ground_transform_reserved", None)
-            state.pop("physics_initialization_transform", None)
             if initial_speed is not None and initial_transform is not None:
                 state["initial_velocity_applied"] = self._initialize_ackermann_actor_velocity(
                     actor,
@@ -2079,39 +2280,46 @@ class CarlaCosim(object):
                     initial_speed,
                     actual_transform or initial_transform,
                 )
+                state["physics_initialization_speed"] = initial_speed
+            if pending_transform is not None:
+                state["physics_stabilization_pending"] = True
+                state["physics_stable_ticks"] = 0
+                state["physics_enabled_frame"] = self._current_carla_frame()
+                state.pop("physics_last_stability_frame", None)
+            else:
+                state["physics_initialization_pending"] = False
+
         self._initialize_ackermann_actor_geometry(actor, veh_id, state)
-        if state.get("controller_settings_attempted"):
-            return True
+        if not state.get("controller_settings_attempted"):
+            state["controller_settings_attempted"] = True
+            tuning = self.ackermann_controller_tuning
+            try:
+                settings = carla.AckermannControllerSettings(
+                    tuning.speed_kp,
+                    tuning.speed_ki,
+                    tuning.speed_kd,
+                    tuning.accel_kp,
+                    tuning.accel_ki,
+                    tuning.accel_kd,
+                )
+                actor.apply_ackermann_controller_settings(settings)
+            except Exception as exc:
+                state["controller_settings_applied"] = False
+                print(
+                    f"Warning: failed to apply CARLA Ackermann controller settings "
+                    f"for {veh_id!r}: {exc}",
+                    flush=True,
+                )
+            else:
+                state["controller_settings_applied"] = True
+                print(
+                    f"CARLA Ackermann controller settings applied to {veh_id!r}: "
+                    f"speed=({tuning.speed_kp:.4g},{tuning.speed_ki:.4g},{tuning.speed_kd:.4g}) "
+                    f"accel=({tuning.accel_kp:.4g},{tuning.accel_ki:.4g},{tuning.accel_kd:.4g})",
+                    flush=True,
+                )
 
-        state["controller_settings_attempted"] = True
-        tuning = self.ackermann_controller_tuning
-        try:
-            settings = carla.AckermannControllerSettings(
-                tuning.speed_kp,
-                tuning.speed_ki,
-                tuning.speed_kd,
-                tuning.accel_kp,
-                tuning.accel_ki,
-                tuning.accel_kd,
-            )
-            actor.apply_ackermann_controller_settings(settings)
-        except Exception as exc:
-            state["controller_settings_applied"] = False
-            print(
-                f"Warning: failed to apply CARLA Ackermann controller settings "
-                f"for {veh_id!r}: {exc}",
-                flush=True,
-            )
-            return
-
-        state["controller_settings_applied"] = True
-        print(
-            f"CARLA Ackermann controller settings applied to {veh_id!r}: "
-            f"speed=({tuning.speed_kp:.4g},{tuning.speed_ki:.4g},{tuning.speed_kd:.4g}) "
-            f"accel=({tuning.accel_kp:.4g},{tuning.accel_ki:.4g},{tuning.accel_kd:.4g})",
-            flush=True,
-        )
-        return True
+        return not state.get("physics_initialization_pending", False)
 
     def _ensure_actor_teleport_mode(self, actor, veh_id):
         state = self._ackermann_actor_state.setdefault(veh_id, {})
@@ -2655,6 +2863,11 @@ class CarlaCosim(object):
     # Elevated spawn height to avoid collision with OpenDRIVE-generated road geometry
     # (guardrails, curbs, barriers). After spawn, correct transform is set immediately.
     SPAWN_Z_CLEARANCE = 5.0
+    ACKERMANN_SPAWN_STABILITY_TICKS = 3
+    ACKERMANN_SPAWN_MAX_Z_ERROR = 0.5
+    ACKERMANN_SPAWN_MAX_SPEED_ERROR = 3.0
+    ACKERMANN_SPAWN_MAX_VERTICAL_SPEED = 1.0
+    ACKERMANN_SPAWN_MAX_TILT_ERROR = 10.0
     SPAWN_RETRY_FRAMES = 10
     SPAWN_RETRY_DISTANCE = 5.0
 
