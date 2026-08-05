@@ -26,7 +26,7 @@ environment:
 
     MOBIL_lc_flag: true
     stochastic_acc_flag: false
-    sumo_net_file_path: /app/examples/maps/odaiba_ll2/tlmappings_0708/network.fixed_geometry.net.xml
+    sumo_net_file_path: /app/examples/maps/odaiba_ll2/tlmappings_0708/network.repaired_geometry.net.xml
     sumo_cfg_file_path: /app/examples/scenarios/odaiba_tlmappings_0708.cosim.sumocfg
     drive_rule: lefthand
     av_debug_control: true
@@ -91,7 +91,7 @@ simulator:
       - tripinfo
 
 input:
-  sumo_net_file: /app/examples/maps/odaiba_ll2/tlmappings_0708/network.fixed_geometry.net.xml
+  sumo_net_file: /app/examples/maps/odaiba_ll2/tlmappings_0708/network.repaired_geometry.net.xml
   sumo_config_file: /app/examples/scenarios/odaiba_tlmappings_0708.cosim.sumocfg
 
 logging:

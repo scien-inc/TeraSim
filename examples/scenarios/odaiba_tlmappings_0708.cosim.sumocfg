@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <configuration>
   <input>
-    <net-file value="/app/examples/maps/odaiba_ll2/tlmappings_0708/network.fixed_geometry.net.xml"/>
+    <net-file value="/app/examples/maps/odaiba_ll2/tlmappings_0708/network.repaired_geometry.net.xml"/>
     <route-files value="/app/examples/maps/odaiba_ll2/tlmappings_0708/period_0p2_filter_check/vehicles.filtered_r300.rou.xml"/>
     <step-length value="0.1"/>
   </input>

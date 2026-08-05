@@ -43,7 +43,7 @@ if ! docker network inspect "${PERF_NETWORK}" >/dev/null 2>&1; then docker netwo
 echo "Building TeraSim benchmark image once..."
 TERASIM_GUI_IMAGE="${PERF_TERASIM_IMAGE}" docker compose -f docker-compose.ackermann-odaiba-feedback-gui.yml build terasim_ackermann_odaiba_feedback_gui
 BASE_CONFIG=/app/examples/scenarios/cosim_odaiba_tlmappings_0708.yaml
-NET_FILE=/app/examples/maps/odaiba_ll2/tlmappings_0708/network.fixed_geometry.net.xml
+NET_FILE=/app/examples/maps/odaiba_ll2/tlmappings_0708/network.repaired_geometry.net.xml
 ROUTE_FILE=/app/examples/maps/odaiba_ll2/tlmappings_0708/period_0p2_filter_check/vehicles.filtered_r300.rou.xml
 
 docker run --rm --entrypoint python -u "$(id -u):$(id -g)" -e HOME=/tmp \
