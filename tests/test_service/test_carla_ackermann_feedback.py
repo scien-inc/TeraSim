@@ -2777,3 +2777,132 @@ def test_inprocess_state_conversion_returns_nested_plain_dicts():
     assert plain["agent_details"]["vehicle"]["AV"]["speed"] == pytest.approx(2.0)
     assert type(plain["traffic_light_details"]["tls"]) is dict
     assert plain["traffic_light_details"]["tls"]["tls"] == "Gr"
+
+
+class FakeDiagnosticActor:
+    def __init__(self, actor_id, role_name, x=0.0, speed=0.0):
+        self.id = actor_id
+        self.type_id = "vehicle.test"
+        self.attributes = {"role_name": role_name}
+        self._transform = FakeTransform(FakeLocation(x=x), FakeRotation())
+        self._velocity = FakeVector3D(x=speed)
+
+    def get_transform(self):
+        return self._transform
+
+    def get_velocity(self):
+        return self._velocity
+
+    def get_acceleration(self):
+        return FakeVector3D()
+
+    def get_angular_velocity(self):
+        return FakeVector3D()
+
+    def get_control(self):
+        return types.SimpleNamespace(
+            throttle=0.0,
+            steer=0.0,
+            brake=0.0,
+            hand_brake=False,
+            reverse=False,
+            gear=1,
+        )
+
+
+def test_carla_collision_diagnostics_deduplicates_sensor_sides_and_counts_episodes(
+    tmp_path,
+):
+    install_fake_carla()
+    from terasim_service.utils.carla.cosim import CarlaCosim
+
+    cosim = CarlaCosim.__new__(CarlaCosim)
+    cosim._diagnostic_lock = __import__("threading").Lock()
+    cosim.collision_sensor_enabled = True
+    cosim.collision_log_path = str(tmp_path / "collisions.jsonl")
+    cosim.collision_summary_path = str(tmp_path / "collision_summary.json")
+    cosim.collision_episode_gap_frames = 10
+    cosim._collision_seen_frame_pairs = set()
+    cosim._collision_last_pair_frame = {}
+    cosim._collision_raw_event_count = 0
+    cosim._collision_unique_frame_count = 0
+    cosim._collision_episode_count = 0
+    cosim._collision_episode_counts_by_pair = {}
+    cosim._initialization_failure_counts = {}
+
+    first = FakeDiagnosticActor(11, "vehicle11", speed=4.0)
+    second = FakeDiagnosticActor(22, "vehicle22", speed=3.0)
+    event_from_first = types.SimpleNamespace(
+        frame=100,
+        timestamp=5.0,
+        other_actor=second,
+        normal_impulse=FakeVector3D(x=10.0),
+    )
+    event_from_second = types.SimpleNamespace(
+        frame=100,
+        timestamp=5.0,
+        other_actor=first,
+        normal_impulse=FakeVector3D(x=-10.0),
+    )
+    repeated_contact = types.SimpleNamespace(
+        frame=105,
+        timestamp=5.25,
+        other_actor=second,
+        normal_impulse=FakeVector3D(x=1.0),
+    )
+    new_contact = types.SimpleNamespace(
+        frame=116,
+        timestamp=5.8,
+        other_actor=second,
+        normal_impulse=FakeVector3D(x=2.0),
+    )
+
+    cosim._on_collision_event("vehicle11", first, event_from_first)
+    cosim._on_collision_event("vehicle22", second, event_from_second)
+    cosim._on_collision_event("vehicle11", first, repeated_contact)
+    cosim._on_collision_event("vehicle11", first, new_contact)
+    cosim._write_collision_summary()
+
+    summary = json.loads((tmp_path / "collision_summary.json").read_text())
+    assert summary["raw_sensor_events"] == 4
+    assert summary["unique_frame_pairs"] == 3
+    assert summary["contact_episodes"] == 2
+    assert summary["episodes_by_pair"] == {"11:22": 2}
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "collisions.jsonl").read_text().splitlines()
+    ]
+    assert records[1]["duplicate_frame_pair"] is True
+    assert records[3]["new_episode"] is True
+
+
+def test_carla_initialization_failure_diagnostic_captures_actual_state(tmp_path):
+    install_fake_carla()
+    from terasim_service.utils.carla.cosim import CarlaCosim
+
+    cosim = CarlaCosim.__new__(CarlaCosim)
+    cosim._diagnostic_lock = __import__("threading").Lock()
+    cosim.initialization_diagnostics_enabled = True
+    cosim.initialization_log_path = str(tmp_path / "initialization.jsonl")
+    cosim._initialization_failure_counts = {}
+    cosim.world = types.SimpleNamespace(
+        get_snapshot=lambda: types.SimpleNamespace(frame=123)
+    )
+    actor = FakeDiagnosticActor(31, "vehicle31", x=8.0, speed=19.0)
+
+    cosim._record_initialization_diagnostic(
+        "failure",
+        actor,
+        "vehicle31",
+        expected_transform=FakeTransform(FakeLocation(x=7.0)),
+        expected_speed=4.0,
+        reason="speed_error=15.000m/s",
+        attempt=2,
+    )
+
+    record = json.loads((tmp_path / "initialization.jsonl").read_text())
+    assert record["carla_frame"] == 123
+    assert record["reason"] == "speed_error=15.000m/s"
+    assert record["actual"]["velocity"]["x"] == pytest.approx(19.0)
+    assert record["expected_speed"] == pytest.approx(4.0)
+    assert cosim._initialization_failure_counts == {"speed_error": 1}
