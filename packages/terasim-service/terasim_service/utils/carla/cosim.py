@@ -786,8 +786,13 @@ class CarlaCosim(object):
             xodr_x = transform.location.x
             xodr_y = -transform.location.y
             sumo_x, sumo_y = self._transform_xodr_to_sumo(xodr_x, xodr_y)
-            # Apply vehicle shape correction (SUMO position is front bumper)
-            yaw = math.radians(90.0 - (-1 * transform.rotation.yaw + 90))
+            # Apply vehicle shape correction (SUMO position is front bumper).
+            # Heading in the SUMO/ENU frame (y north) is -yaw: CARLA yaw lives in a
+            # y-south frame, so the rotation sense is mirrored (same convention as
+            # carla_to_sumo in tools.py). Using +yaw flips the correction's north
+            # component: up to a full car length backward on N/S roads and half a
+            # car sideways on diagonals -- enough to map the AV onto the wrong lane.
+            yaw = math.radians(-transform.rotation.yaw)
             sumo_x += math.cos(yaw) * self.av_shape[0] / 2.0
             sumo_y += math.sin(yaw) * self.av_shape[0] / 2.0
             av_sumo_location = [sumo_x, sumo_y, transform.location.z]
