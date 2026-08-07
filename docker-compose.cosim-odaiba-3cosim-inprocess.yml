@@ -23,6 +23,8 @@ services:
       # tick モード(stage 3a): follow(既定)= psim bridge が号令役(現行動作)/
       # master = TeraSim が時計マスター(bridge は tick_follower:=true で受け身)
       - COSIM_TICK_MODE=${COSIM_TICK_MODE:-follow}
+      # CARLA client RPC タイムアウト(秒)。初回温まりの長ブロック対策は 3600 に引き上げ
+      - CARLA_TIMEOUT=${CARLA_TIMEOUT:-600}
       # CARLA への変換適用・spawn を1リクエストに束ねる(既定 OFF の opt-in 高速化。
       # 背景車両数百台では per-actor RPC が支配的なので常時 ON にする)
       - CARLA_COSIM_BATCH_TRANSFORM=1

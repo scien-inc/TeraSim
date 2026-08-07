@@ -18,6 +18,10 @@ SCENARIO="${SCENARIO:-/app/examples/scenarios/cosim_odaiba_osmlike.yaml}"
 # tick モード(stage 3a): follow(既定)= psim bridge が world.tick() を打ち当方は追従 /
 # master = 当方が時計マスター(50ms 定刻で号令、bridge は tick_follower:=true で受け身)
 TICK_MODE="${COSIM_TICK_MODE:-follow}"
+# CARLA client RPC タイムアウト(秒)。既定 600 = run_cosim.py の既定と同じ。
+# 初回起動のストリーミング温まりでは world.tick() のブロックが 600 秒を超えることが
+# あり(2026-08-07 実測 10 分超)、その場合は 3600 などへ引き上げて温まりを待ち切る。
+CARLA_TIMEOUT="${CARLA_TIMEOUT:-600}"
 
 echo "=========================================="
 echo " TeraSim 3-cosim (in-process)"
@@ -58,4 +62,5 @@ exec python -m terasim_service.run_cosim \
   --config "${SCENARIO}" \
   --carla_host "${CARLA_HOST}" \
   --carla_port "${CARLA_PORT}" \
+  --carla_timeout "${CARLA_TIMEOUT}" \
   --tick_mode "${TICK_MODE}"
