@@ -13,8 +13,10 @@ import threading
 
 from .ackermann_control import (
     AckermannControllerTuning,
+    AckermannEmergencyBrakeTuning,
     AckermannTuning,
     compute_ackermann_control_values,
+    compute_direct_brake_value,
     horizontal_speed,
 )
 from .tools import (
@@ -241,6 +243,14 @@ class CarlaCosim(object):
         self.ackermann_control_log_records = _env_bool(
             "CARLA_COSIM_ACKERMANN_CONTROL_LOG_RECORDS", False
         )
+        control_log_actor_value = os.environ.get(
+            "CARLA_COSIM_ACKERMANN_CONTROL_LOG_ACTORS", ""
+        )
+        self.ackermann_control_log_actor_ids = {
+            actor_id.strip()
+            for actor_id in control_log_actor_value.split(",")
+            if actor_id.strip()
+        }
         self._ackermann_feedback_actor_index = {}
         self._ackermann_feedback_candidate_actor_ids = set()
         self._ackermann_actor_state = {}
@@ -288,6 +298,47 @@ class CarlaCosim(object):
                 0.0, _env_float("CARLA_COSIM_ACKERMANN_CONTROLLER_ACCEL_KD", 0.0)
             ),
         )
+        emergency_brake_engage_decel = max(
+            0.0,
+            _env_float("CARLA_COSIM_ACKERMANN_EMERGENCY_BRAKE_ENGAGE_DECEL", 4.0),
+        )
+        self.ackermann_emergency_brake_tuning = AckermannEmergencyBrakeTuning(
+            enabled=_env_bool(
+                "CARLA_COSIM_ACKERMANN_EMERGENCY_BRAKE_ENABLED", True
+            ),
+            engage_decel=emergency_brake_engage_decel,
+            release_decel=min(
+                emergency_brake_engage_decel,
+                max(
+                    0.0,
+                    _env_float(
+                        "CARLA_COSIM_ACKERMANN_EMERGENCY_BRAKE_RELEASE_DECEL",
+                        1.0,
+                    ),
+                ),
+            ),
+            release_ticks=max(
+                1,
+                _env_int(
+                    "CARLA_COSIM_ACKERMANN_EMERGENCY_BRAKE_RELEASE_TICKS", 3
+                ),
+            ),
+            stop_speed=max(
+                0.0,
+                _env_float(
+                    "CARLA_COSIM_ACKERMANN_EMERGENCY_BRAKE_STOP_SPEED", 0.2
+                ),
+            ),
+            min_brake=min(
+                1.0,
+                max(
+                    0.0,
+                    _env_float(
+                        "CARLA_COSIM_ACKERMANN_EMERGENCY_BRAKE_MIN_BRAKE", 0.5
+                    ),
+                ),
+            ),
+        )
         self.ackermann_warn_error_m = max(
             0.0, _env_float("CARLA_COSIM_ACKERMANN_WARN_ERROR_M", 3.0)
         )
@@ -307,6 +358,17 @@ class CarlaCosim(object):
             )
         if self.ackermann_physics_enabled:
             print("CARLA co-sim Ackermann physics vehicle control enabled.", flush=True)
+            emergency_tuning = self.ackermann_emergency_brake_tuning
+            print(
+                "CARLA co-sim direct emergency brake "
+                f"enabled={emergency_tuning.enabled} "
+                f"engage=-{emergency_tuning.engage_decel:.3g}m/s^2 "
+                f"release=-{emergency_tuning.release_decel:.3g}m/s^2 "
+                f"releaseTicks={emergency_tuning.release_ticks} "
+                f"stopSpeed={emergency_tuning.stop_speed:.3g}m/s "
+                f"minBrake={emergency_tuning.min_brake:.3g}.",
+                flush=True,
+            )
         self.use_lane_relative_position = _env_bool(
             "CARLA_COSIM_USE_LANE_RELATIVE_POSITION",
             bool(getattr(args, "use_lane_relative_position", False)),
@@ -2885,7 +2947,10 @@ class CarlaCosim(object):
         max_decel = self._resolve_ackermann_max_decel(veh_info)
         state["sumo_emergency_decel"] = max_decel
         desired_speed = self._resolve_ackermann_desired_speed(veh_id, veh_info)
+        requested_acceleration = self._as_finite_float(veh_info.get("acceleration"))
+        state["sumo_requested_acceleration"] = requested_acceleration
         if not self._is_ackermann_feedback_apply_actor(veh_id):
+            state["applied_desired_acceleration"] = None
             return desired_speed, None
 
         sumo_next_speed = self._as_finite_float(veh_info.get("sumo_desired_speed"))
@@ -2899,7 +2964,6 @@ class CarlaCosim(object):
             state["applied_desired_acceleration"] = None
             return desired_speed, None
 
-        requested_acceleration = self._as_finite_float(veh_info.get("acceleration"))
         if requested_acceleration is None:
             acceleration_origin_speed = (
                 observed_speed if observed_speed is not None else current_speed
@@ -2926,6 +2990,86 @@ class CarlaCosim(object):
             + self.ackermann_tuning.position_speed_gain * longitudinal_error,
         )
         return speed_target, desired_acceleration
+
+    def _current_direct_brake_steer(self, veh_id, vehicle):
+        try:
+            applied_steer = self._as_finite_float(vehicle.get_control().steer)
+        except Exception:
+            applied_steer = None
+        if applied_steer is not None:
+            return min(1.0, max(-1.0, applied_steer))
+
+        state = self._ackermann_actor_state.setdefault(veh_id, {})
+        ackermann_steer = self._as_finite_float(state.get("steer")) or 0.0
+        max_steer = self.ackermann_tuning.max_steer_rad
+        if max_steer <= 0.0:
+            return 0.0
+        return min(1.0, max(-1.0, ackermann_steer / max_steer))
+
+    def _make_direct_brake_control(self, veh_id, vehicle, brake=1.0):
+        return carla.VehicleControl(
+            throttle=0.0,
+            steer=self._current_direct_brake_steer(veh_id, vehicle),
+            brake=min(1.0, max(0.0, float(brake))),
+            hand_brake=False,
+            reverse=False,
+        )
+
+    def _update_ackermann_emergency_brake(self, veh_id, vehicle, current_speed):
+        state = self._ackermann_actor_state.setdefault(veh_id, {})
+        tuning = getattr(
+            self,
+            "ackermann_emergency_brake_tuning",
+            AckermannEmergencyBrakeTuning(),
+        )
+        requested_acceleration = self._as_finite_float(
+            state.get("sumo_requested_acceleration")
+        )
+        active = bool(state.get("emergency_brake_active", False))
+        release_ticks = int(state.get("emergency_brake_release_ticks", 0))
+
+        if not tuning.enabled:
+            active = False
+            release_ticks = 0
+        elif active:
+            if current_speed <= tuning.stop_speed:
+                active = False
+                release_ticks = 0
+            elif (
+                requested_acceleration is not None
+                and requested_acceleration >= -tuning.release_decel
+            ):
+                release_ticks += 1
+                if release_ticks >= tuning.release_ticks:
+                    active = False
+                    release_ticks = 0
+            else:
+                release_ticks = 0
+        elif (
+            current_speed > tuning.stop_speed
+            and requested_acceleration is not None
+            and requested_acceleration <= -tuning.engage_decel
+        ):
+            active = True
+            release_ticks = 0
+
+        state["emergency_brake_active"] = active
+        state["emergency_brake_release_ticks"] = release_ticks
+        state["control_mode"] = "emergency_brake" if active else "ackermann"
+        if not active:
+            state["emergency_brake_command"] = 0.0
+            return None
+
+        max_decel = self._as_finite_float(state.get("sumo_emergency_decel"))
+        if max_decel is None or max_decel <= 0.0:
+            max_decel = self.ackermann_tuning.max_decel
+        brake = compute_direct_brake_value(
+            requested_acceleration or 0.0,
+            max_decel,
+            tuning.min_brake,
+        )
+        state["emergency_brake_command"] = brake
+        return self._make_direct_brake_control(veh_id, vehicle, brake)
 
     def _neutralize_ackermann_steer(self, veh_id):
         state = self._ackermann_actor_state.setdefault(veh_id, {})
@@ -2959,7 +3103,9 @@ class CarlaCosim(object):
                 actors.append((actor_id, actor))
         for actor_id, actor in actors:
             try:
-                actor.apply_ackermann_control(self._make_brake_ackermann_control(actor_id))
+                actor.apply_control(
+                    self._make_direct_brake_control(actor_id, actor, brake=1.0)
+                )
             except Exception as exc:
                 print(
                     f"Warning: fail-closed brake failed for {actor_id}: {exc}",
@@ -2967,7 +3113,8 @@ class CarlaCosim(object):
                 )
         if actors:
             print(
-                f"Ackermann fail-closed brake applied to {len(actors)} actor(s): {reason}",
+                f"Ackermann fail-closed direct brake applied to "
+                f"{len(actors)} actor(s): {reason}",
                 flush=True,
             )
             if not getattr(self.args, "passive_tick", False):
@@ -2991,6 +3138,7 @@ class CarlaCosim(object):
             current_transform = vehicle.get_transform()
             current_velocity = vehicle.get_velocity()
         except Exception:
+            state["control_mode"] = "ackermann"
             return self._make_brake_ackermann_control(veh_id)
 
         desired_location = desired_transform.location
@@ -3034,6 +3182,7 @@ class CarlaCosim(object):
                 lookahead_sumo_location
             )
         except Exception:
+            state["control_mode"] = "ackermann"
             return self._make_brake_ackermann_control(veh_id)
 
         current_speed = horizontal_speed(current_velocity)
@@ -3104,6 +3253,20 @@ class CarlaCosim(object):
             final_speed = 0.0
             final_acceleration = -self._resolve_ackermann_max_decel(veh_info)
 
+        emergency_control = self._update_ackermann_emergency_brake(
+            veh_id, vehicle, current_speed
+        )
+        if emergency_control is None:
+            control_mode = "ackermann"
+            commanded_throttle = None
+            commanded_brake = None
+            commanded_steer = final_steer
+        else:
+            control_mode = "emergency_brake"
+            commanded_throttle = emergency_control.throttle
+            commanded_brake = emergency_control.brake
+            commanded_steer = emergency_control.steer
+
         self._record_ackermann_control_trace(
             veh_id=veh_id,
             veh_info=veh_info,
@@ -3116,9 +3279,15 @@ class CarlaCosim(object):
             feedback_unhealthy=bool(feedback_unhealthy),
             target_behind=bool(target_behind),
             control_values=values,
+            control_mode=control_mode,
+            commanded_throttle=commanded_throttle,
+            commanded_brake=commanded_brake,
+            commanded_steer=commanded_steer,
         )
         state["steer"] = final_steer
         state["last_position_error"] = position_error
+        if emergency_control is not None:
+            return emergency_control
         return carla.VehicleAckermannControl(
             steer=final_steer,
             speed=final_speed,
@@ -3142,8 +3311,22 @@ class CarlaCosim(object):
         feedback_unhealthy,
         target_behind,
         control_values=None,
+        control_mode="ackermann",
+        commanded_throttle=None,
+        commanded_brake=None,
+        commanded_steer=None,
     ):
         if not getattr(self, "ackermann_control_log_records", False):
+            return
+
+        control_log_actor_ids = getattr(
+            self, "ackermann_control_log_actor_ids", set()
+        )
+        if (
+            control_log_actor_ids
+            and "*" not in control_log_actor_ids
+            and veh_id not in control_log_actor_ids
+        ):
             return
 
         state = self._ackermann_actor_state.setdefault(veh_id, {})
@@ -3228,6 +3411,16 @@ class CarlaCosim(object):
             ),
             "ackermann_target_speed": target_speed,
             "ackermann_target_acceleration": target_acceleration,
+            "control_mode": control_mode,
+            "emergency_brake_active": bool(
+                state.get("emergency_brake_active", False)
+            ),
+            "emergency_brake_release_ticks": int(
+                state.get("emergency_brake_release_ticks", 0)
+            ),
+            "commanded_throttle": self._as_finite_float(commanded_throttle),
+            "commanded_brake": self._as_finite_float(commanded_brake),
+            "commanded_steer": self._as_finite_float(commanded_steer),
             "carla_speed": current_speed,
             "carla_speed_delta_acceleration": speed_delta_acceleration,
             "carla_longitudinal_acceleration": longitudinal_acceleration,
@@ -3287,12 +3480,22 @@ class CarlaCosim(object):
         }
         print("AckermannControlTrace " + json.dumps(trace, sort_keys=True), flush=True)
 
-    def _queue_actor_ackermann_control(self, actor, control, ackermann_batch=None):
-        apply_command = getattr(carla.command, "ApplyVehicleAckermannControl", None)
+    def _queue_actor_ackermann_control(
+        self, actor, control, ackermann_batch=None, direct_vehicle_control=False
+    ):
+        command_name = (
+            "ApplyVehicleControl"
+            if direct_vehicle_control
+            else "ApplyVehicleAckermannControl"
+        )
+        apply_command = getattr(carla.command, command_name, None)
         if ackermann_batch is not None and apply_command is not None:
             ackermann_batch.append(apply_command(actor.id, control))
             return
-        actor.apply_ackermann_control(control)
+        if direct_vehicle_control:
+            actor.apply_control(control)
+        else:
+            actor.apply_ackermann_control(control)
 
     def _flush_actor_ackermann_batch(self, ackermann_batch):
         if not ackermann_batch:
@@ -3885,7 +4088,14 @@ class CarlaCosim(object):
                     sumo_angle,
                     carla_trasform,
                 )
-                self._queue_actor_ackermann_control(vehicle, control, ackermann_batch)
+                self._queue_actor_ackermann_control(
+                    vehicle,
+                    control,
+                    ackermann_batch,
+                    direct_vehicle_control=(
+                        actor_state.get("control_mode") == "emergency_brake"
+                    ),
+                )
             else:
                 self._ensure_actor_teleport_mode(vehicle, veh_id)
                 self._queue_actor_transform(vehicle, carla_trasform, transform_batch)

@@ -30,6 +30,18 @@ class AckermannControllerTuning:
 
 
 @dataclass(frozen=True)
+class AckermannEmergencyBrakeTuning:
+    """Direct low-level brake override used for urgent SUMO deceleration."""
+
+    enabled: bool = True
+    engage_decel: float = 4.0
+    release_decel: float = 1.0
+    release_ticks: int = 3
+    stop_speed: float = 0.2
+    min_brake: float = 0.5
+
+
+@dataclass(frozen=True)
 class AckermannControlValues:
     steer: float
     raw_steer: float
@@ -48,6 +60,15 @@ class AckermannControlValues:
 
 def clamp(value, lower, upper):
     return min(upper, max(lower, value))
+
+
+def compute_direct_brake_value(requested_acceleration, max_decel, min_brake):
+    """Map a requested deceleration to CARLA's normalized brake command."""
+
+    requested_decel = max(0.0, -float(requested_acceleration))
+    max_decel = max(0.1, float(max_decel))
+    min_brake = clamp(float(min_brake), 0.0, 1.0)
+    return clamp(max(min_brake, requested_decel / max_decel), 0.0, 1.0)
 
 
 def horizontal_speed(velocity):
