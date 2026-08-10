@@ -45,6 +45,10 @@ class FakeCommand:
         return ("ackermann", actor_id, control)
 
     @staticmethod
+    def ApplyVehicleControl(actor_id, control):
+        return ("vehicle_control", actor_id, control)
+
+    @staticmethod
     def SpawnActor(blueprint, transform):
         return types.SimpleNamespace(then=lambda command: ("spawn", blueprint, transform, command))
 
@@ -65,6 +69,17 @@ class FakeVehicleAckermannControl:
         self.jerk = jerk
 
 
+class FakeVehicleControl:
+    def __init__(
+        self, throttle=0.0, steer=0.0, brake=0.0, hand_brake=False, reverse=False
+    ):
+        self.throttle = throttle
+        self.steer = steer
+        self.brake = brake
+        self.hand_brake = hand_brake
+        self.reverse = reverse
+
+
 class FakeAckermannControllerSettings:
     def __init__(self, speed_kp, speed_ki, speed_kd, accel_kp, accel_ki, accel_kd):
         self.speed_kp = speed_kp
@@ -76,15 +91,20 @@ class FakeAckermannControllerSettings:
 
 
 def install_fake_carla():
-    sys.modules["carla"] = types.SimpleNamespace(
+    fake_carla = types.SimpleNamespace(
         Location=FakeLocation,
         Rotation=FakeRotation,
         Transform=FakeTransform,
         Vector3D=FakeVector3D,
         VehicleAckermannControl=FakeVehicleAckermannControl,
+        VehicleControl=FakeVehicleControl,
         AckermannControllerSettings=FakeAckermannControllerSettings,
         command=FakeCommand,
     )
+    sys.modules["carla"] = fake_carla
+    imported_cosim = sys.modules.get("terasim_service.utils.carla.cosim")
+    if imported_cosim is not None:
+        imported_cosim.carla = fake_carla
 
 
 def test_create_simulator_step_length_override_reaches_sumo(monkeypatch):
@@ -677,6 +697,7 @@ def test_vehicle_transform_uses_sumo_slope_as_carla_pitch(monkeypatch):
     cosim._get_carla_offset = lambda _location, _clearance: [0.0, 0.0, 0.0]
     cosim._ensure_actor_teleport_mode = lambda *_args, **_kwargs: None
 
+    cosim._spawn_failures = {}
     cosim._process_vehicle(
         "BV",
         {
@@ -2545,6 +2566,116 @@ def test_ackermann_feedback_uses_sumo_emergency_decel():
     assert target == pytest.approx(0.0)
 
 
+def test_ackermann_non_feedback_actor_keeps_sumo_acceleration_for_emergency_brake():
+    install_fake_carla()
+    from terasim_service.utils.carla.ackermann_control import AckermannTuning
+    from terasim_service.utils.carla.cosim import CarlaCosim
+
+    cosim = CarlaCosim.__new__(CarlaCosim)
+    cosim.ackermann_feedback_apply_enabled = False
+    cosim.ackermann_feedback_actor_ids = set()
+    cosim.ackermann_feedback_all_background_actors = False
+    cosim.ackermann_tuning = AckermannTuning()
+    cosim._ackermann_actor_state = {}
+
+    target, acceleration = cosim._resolve_ackermann_longitudinal_target(
+        "AV",
+        {"speed": 8.0, "acceleration": -4.13, "sumo_emergency_decel": 9.0},
+        current_speed=8.2,
+    )
+
+    assert target == pytest.approx(8.0)
+    assert acceleration is None
+    assert cosim._ackermann_actor_state["AV"]["sumo_requested_acceleration"] == (
+        pytest.approx(-4.13)
+    )
+
+
+def test_direct_emergency_brake_engages_and_releases_with_hysteresis():
+    install_fake_carla()
+    from terasim_service.utils.carla.ackermann_control import (
+        AckermannEmergencyBrakeTuning,
+        AckermannTuning,
+    )
+    from terasim_service.utils.carla.cosim import CarlaCosim
+
+    cosim = CarlaCosim.__new__(CarlaCosim)
+    cosim.ackermann_emergency_brake_tuning = AckermannEmergencyBrakeTuning(
+        engage_decel=4.0,
+        release_decel=1.0,
+        release_ticks=3,
+        stop_speed=0.2,
+        min_brake=0.5,
+    )
+    cosim.ackermann_tuning = AckermannTuning(max_decel=6.0)
+    cosim._ackermann_actor_state = {
+        "vehicle2322": {
+            "steer": 0.3,
+            "sumo_requested_acceleration": -4.13,
+            "sumo_emergency_decel": 9.0,
+        }
+    }
+    vehicle = types.SimpleNamespace(
+        get_control=lambda: types.SimpleNamespace(steer=0.25)
+    )
+
+    control = cosim._update_ackermann_emergency_brake(
+        "vehicle2322", vehicle, current_speed=8.21
+    )
+    assert isinstance(control, FakeVehicleControl)
+    assert control.throttle == pytest.approx(0.0)
+    assert control.brake == pytest.approx(0.5)
+    assert control.steer == pytest.approx(0.25)
+
+    state = cosim._ackermann_actor_state["vehicle2322"]
+    state["sumo_requested_acceleration"] = -0.5
+    assert cosim._update_ackermann_emergency_brake(
+        "vehicle2322", vehicle, current_speed=7.0
+    )
+    assert state["emergency_brake_release_ticks"] == 1
+    assert cosim._update_ackermann_emergency_brake(
+        "vehicle2322", vehicle, current_speed=6.8
+    )
+    assert state["emergency_brake_release_ticks"] == 2
+    assert (
+        cosim._update_ackermann_emergency_brake(
+            "vehicle2322", vehicle, current_speed=6.5
+        )
+        is None
+    )
+    assert state["control_mode"] == "ackermann"
+
+
+def test_direct_emergency_brake_releases_at_stop_without_reengaging():
+    install_fake_carla()
+    from terasim_service.utils.carla.ackermann_control import (
+        AckermannEmergencyBrakeTuning,
+        AckermannTuning,
+    )
+    from terasim_service.utils.carla.cosim import CarlaCosim
+
+    cosim = CarlaCosim.__new__(CarlaCosim)
+    cosim.ackermann_emergency_brake_tuning = AckermannEmergencyBrakeTuning()
+    cosim.ackermann_tuning = AckermannTuning()
+    cosim._ackermann_actor_state = {
+        "AV": {
+            "emergency_brake_active": True,
+            "sumo_requested_acceleration": -9.0,
+            "sumo_emergency_decel": 9.0,
+        }
+    }
+    vehicle = types.SimpleNamespace(
+        get_control=lambda: types.SimpleNamespace(steer=0.0)
+    )
+
+    assert cosim._update_ackermann_emergency_brake(
+        "AV", vehicle, current_speed=0.1
+    ) is None
+    assert cosim._update_ackermann_emergency_brake(
+        "AV", vehicle, current_speed=0.1
+    ) is None
+
+
 def test_fail_closed_brake_uses_last_sumo_emergency_decel():
     install_fake_carla()
     from terasim_service.utils.carla.ackermann_control import AckermannTuning
@@ -2552,7 +2683,10 @@ def test_fail_closed_brake_uses_last_sumo_emergency_decel():
 
     controls = []
     ticks = []
-    actor = types.SimpleNamespace(apply_ackermann_control=controls.append)
+    actor = types.SimpleNamespace(
+        apply_control=controls.append,
+        get_control=lambda: types.SimpleNamespace(steer=0.2),
+    )
     cosim = CarlaCosim.__new__(CarlaCosim)
     cosim.ackermann_feedback_apply_enabled = True
     cosim.ackermann_feedback_actor_ids = {"AV"}
@@ -2566,9 +2700,29 @@ def test_fail_closed_brake_uses_last_sumo_emergency_decel():
 
     assert cosim._apply_ackermann_fail_closed_brake("test") == 1
     assert len(controls) == 1
-    assert controls[0].speed == 0.0
-    assert controls[0].acceleration == pytest.approx(7.06)
+    assert controls[0].throttle == pytest.approx(0.0)
+    assert controls[0].brake == pytest.approx(1.0)
+    assert controls[0].steer == pytest.approx(0.2)
     assert ticks == ["tick"]
+
+
+def test_direct_emergency_brake_can_be_batched_as_vehicle_control():
+    install_fake_carla()
+    from terasim_service.utils.carla.cosim import CarlaCosim
+
+    batch = []
+    actor = types.SimpleNamespace(id=42)
+    control = FakeVehicleControl(throttle=0.0, brake=0.75)
+
+    CarlaCosim._queue_actor_ackermann_control(
+        CarlaCosim.__new__(CarlaCosim),
+        actor,
+        control,
+        batch,
+        direct_vehicle_control=True,
+    )
+
+    assert batch == [("vehicle_control", 42, control)]
 
 
 def test_direct_command_failure_stops_before_sumo_step():
@@ -2652,6 +2806,7 @@ def test_ackermann_control_trace_records_sumo_command_and_carla_response(capsys)
             "sumo_emergency_decel": 7.06,
             "wheel_base_m": 2.85,
             "rear_axle_local_x_m": -1.4,
+            "emergency_brake_active": True,
         }
     }
     cosim.step_length = 0.1
@@ -2689,6 +2844,10 @@ def test_ackermann_control_trace_records_sumo_command_and_carla_response(capsys)
             control_point_x=10.0,
             control_point_y=20.0,
         ),
+        control_mode="emergency_brake",
+        commanded_throttle=0.0,
+        commanded_brake=0.78,
+        commanded_steer=0.1,
     )
 
     prefix, payload = capsys.readouterr().out.strip().split(" ", 1)
@@ -2696,6 +2855,11 @@ def test_ackermann_control_trace_records_sumo_command_and_carla_response(capsys)
     assert prefix == "AckermannControlTrace"
     assert record["sumo_requested_acceleration"] == pytest.approx(-7.06)
     assert record["ackermann_target_acceleration"] == pytest.approx(-7.06)
+    assert record["control_mode"] == "emergency_brake"
+    assert record["commanded_throttle"] == pytest.approx(0.0)
+    assert record["commanded_brake"] == pytest.approx(0.78)
+    assert record["commanded_steer"] == pytest.approx(0.1)
+    assert record["emergency_brake_active"] is True
     assert record["carla_speed"] == pytest.approx(6.19)
     assert record["carla_longitudinal_acceleration"] == pytest.approx(-6.5)
     assert record["carla_applied_throttle"] == pytest.approx(0.0)
