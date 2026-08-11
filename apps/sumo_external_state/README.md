@@ -34,6 +34,12 @@ TraCI `setSpeed` timeline before setting the assimilated speed and acceleration,
 so Phase B starts from the external state. TeraSim/NADE may install a new speed
 action after Phase A. Normal `moveToXY` behavior is unchanged.
 
+For left-hand networks, the dedicated completion path also normalizes the
+mapped lateral state before releasing the remote-control latch. It selects the
+internal lateral sign whose ordinary lane-geometry position is closest to the
+external x/y state. The service uses the raw SUMO x/y position to disambiguate
+the drive-side-dependent lateral sign when exporting lane-relative geometry.
+
 The intended cycle is:
 
 1. Phase A calls `setExternalState`; SUMO time does not change.
@@ -51,6 +57,9 @@ docker build \
   -t terasim-service:sumo-external-state-v1.23.1 \
   -f Dockerfile.sumo-external-state .
 ```
+The dedicated Dockerfile copies the matching `terasim_service` source into the
+final image. The image therefore contains both the SUMO-side normalization and
+the service-side lane geometry disambiguation without a working-tree mount.
 
 The Dockerfile checks the upstream commit before applying the patch. The final
 image contains patched `sumo`, `sumo-gui`, TraCI, and libsumo implementations.

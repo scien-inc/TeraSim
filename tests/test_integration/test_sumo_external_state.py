@@ -32,7 +32,16 @@ def _angle_difference(left: float, right: float) -> float:
     return abs((left - right + 180.0) % 360.0 - 180.0)
 
 
-def _write_straight_network(tmp_path: Path, netconvert: str) -> tuple[Path, Path]:
+def _signed_lateral_offset(position, lane_start, direction) -> float:
+    left_normal = (-direction[1], direction[0])
+    return (position[0] - lane_start[0]) * left_normal[0] + (
+        position[1] - lane_start[1]
+    ) * left_normal[1]
+
+
+def _write_straight_network(
+    tmp_path: Path, netconvert: str, *, lefthand: bool = False
+) -> tuple[Path, Path]:
     nodes_path = tmp_path / "straight.nod.xml"
     edges_path = tmp_path / "straight.edg.xml"
     network_path = tmp_path / "straight.net.xml"
@@ -82,6 +91,8 @@ def _write_straight_network(tmp_path: Path, netconvert: str) -> tuple[Path, Path
             str(edges_path),
             "--output-file",
             str(network_path),
+            "--lefthand",
+            str(lefthand).lower(),
             "--no-warnings",
             "true",
         ],
@@ -285,6 +296,103 @@ def test_external_state_releases_stale_traci_speed_latch(tmp_path: Path) -> None
         assert traci.simulation.getTime() == pytest.approx(phase_a_time + STEP_LENGTH)
         assert phase_b_displacement < 0.05
         assert traci.vehicle.getSpeed("ego") < 1.0
+    finally:
+        traci.close()
+
+
+@pytest.mark.integration
+@pytest.mark.requires_sumo
+def test_external_state_preserves_off_center_side_on_left_hand_network(
+    tmp_path: Path,
+) -> None:
+    """Releasing the remote latch must not mirror the lateral position."""
+    traci = pytest.importorskip("traci")
+    if not hasattr(traci.vehicle, "setExternalState"):
+        pytest.skip("requires the dedicated SUMO setExternalState build")
+
+    sumo = _find_binary("sumo")
+    netconvert = _find_binary("netconvert")
+    network_path, routes_path = _write_straight_network(
+        tmp_path, netconvert, lefthand=True
+    )
+    traci.start(
+        [
+            sumo,
+            "--net-file",
+            str(network_path),
+            "--route-files",
+            str(routes_path),
+            "--step-length",
+            str(STEP_LENGTH),
+            "--lateral-resolution",
+            "0.2",
+            "--no-step-log",
+            "true",
+            "--duration-log.disable",
+            "true",
+        ],
+        numRetries=5,
+    )
+    try:
+        traci.simulationStep()
+        lane_start, lane_end = traci.lane.getShape("road_0")
+        lane_length = math.dist(lane_start, lane_end)
+        direction = (
+            (lane_end[0] - lane_start[0]) / lane_length,
+            (lane_end[1] - lane_start[1]) / lane_length,
+        )
+        left_normal = (-direction[1], direction[0])
+        target = (
+            lane_start[0] + direction[0] * 40.0 + left_normal[0] * 0.4,
+            lane_start[1] + direction[1] * 40.0 + left_normal[1] * 0.4,
+        )
+        target_angle = traci.vehicle.getAngle("ego")
+        target_speed = 0.065
+        observed_lateral_offsets = []
+
+        for _cycle in range(6):
+            target_lateral = _signed_lateral_offset(target, lane_start, direction)
+            phase_a_time = traci.simulation.getTime()
+            traci.vehicle.setExternalState(
+                "ego",
+                "road",
+                0,
+                target[0],
+                target[1],
+                target_angle,
+                target_speed,
+                0.0,
+                keepRoute=1,
+                matchThreshold=10.0,
+            )
+            phase_a_position = traci.vehicle.getPosition("ego")
+            phase_a_lateral = _signed_lateral_offset(
+                phase_a_position, lane_start, direction
+            )
+            assert traci.simulation.getTime() == phase_a_time
+            assert math.dist(phase_a_position, target) < POSITION_TOLERANCE
+            assert phase_a_lateral == pytest.approx(target_lateral, abs=POSITION_TOLERANCE)
+            assert traci.vehicle.getLateralLanePosition("ego") < -0.3
+
+            traci.simulationStep()
+
+            phase_b_position = traci.vehicle.getPosition("ego")
+            phase_b_lateral = _signed_lateral_offset(
+                phase_b_position, lane_start, direction
+            )
+            assert traci.simulation.getTime() == pytest.approx(
+                phase_a_time + STEP_LENGTH
+            )
+            assert phase_b_lateral > 0.2
+            assert abs(phase_b_lateral - phase_a_lateral) < 0.08
+            assert math.dist(phase_b_position, phase_a_position) < 0.08
+            observed_lateral_offsets.extend((phase_a_lateral, phase_b_lateral))
+
+            target = phase_b_position
+            target_angle = traci.vehicle.getAngle("ego")
+            target_speed = traci.vehicle.getSpeed("ego")
+
+        assert max(observed_lateral_offsets) - min(observed_lateral_offsets) < 0.15
     finally:
         traci.close()
 

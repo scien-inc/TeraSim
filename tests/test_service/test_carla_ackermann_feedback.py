@@ -183,6 +183,23 @@ def test_lane_relative_position_preserves_longitudinal_and_lateral_offsets():
     assert reconstructed == pytest.approx((7.5, 1.25, 2.0))
 
 
+def test_lane_relative_position_uses_raw_position_to_disambiguate_left_hand_sign():
+    from terasim_service.utils.sumo_lane_geometry import (
+        reconstruct_position_from_lane_geometry,
+    )
+
+    reconstructed = reconstruct_position_from_lane_geometry(
+        [(0.0, 0.0), (20.0, 0.0)],
+        lane_position=7.5,
+        lateral_offset=-1.25,
+        z=2.0,
+        lane_length=20.0,
+        reference_position=(7.5, 1.25),
+    )
+
+    assert reconstructed == pytest.approx((7.5, 1.25, 2.0))
+
+
 def test_lane_relative_position_uses_normalized_declared_lane_progress():
     from terasim_service.utils.sumo_lane_geometry import (
         reconstruct_position_from_lane_geometry,
@@ -435,6 +452,8 @@ def test_external_state_lane_export_uses_live_state_over_stale_subscription(monk
     assert state.lane_id == "road_0"
     assert state.lane_position == pytest.approx(12.5)
     assert state.lateral_offset == pytest.approx(0.25)
+    assert state.reconstructed_x == pytest.approx(12.5)
+    assert state.reconstructed_y == pytest.approx(0.25)
 
 
 def test_lookahead_route_cache_avoids_repeated_traci_calls(monkeypatch):

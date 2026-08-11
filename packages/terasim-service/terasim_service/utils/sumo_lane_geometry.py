@@ -600,8 +600,14 @@ def reconstruct_position_from_lane_geometry(
     lateral_offset: float,
     z: float = 0.0,
     lane_length: float | None = None,
+    reference_position=None,
 ):
-    """Reconstruct a SUMO x/y/z position from lane-relative coordinates."""
+    """Reconstruct x/y/z, using raw x/y to disambiguate lateral sign.
+
+    SUMO's internal lateral sign changes with the network drive side, while a
+    lane shape alone carries no drive-side metadata. ``reference_position``
+    selects the geometrically matching side without changing lane progress.
+    """
     if not lane_shape or len(lane_shape) < 2:
         return None
 
@@ -611,8 +617,34 @@ def reconstruct_position_from_lane_geometry(
         lateral_offset = float(lateral_offset)
         z = float(z)
         lane_length = None if lane_length is None else float(lane_length)
+        reference_xy = (
+            None
+            if reference_position is None
+            else (float(reference_position[0]), float(reference_position[1]))
+        )
     except (TypeError, ValueError, IndexError):
         return None
+
+    def with_lateral_offset(center_x, center_y, normal_x, normal_y):
+        primary = (
+            center_x + normal_x * lateral_offset,
+            center_y + normal_y * lateral_offset,
+            z,
+        )
+        if reference_xy is None or lateral_offset == 0.0:
+            return primary
+        mirrored = (
+            center_x - normal_x * lateral_offset,
+            center_y - normal_y * lateral_offset,
+            z,
+        )
+        primary_error = math.hypot(
+            primary[0] - reference_xy[0], primary[1] - reference_xy[1]
+        )
+        mirrored_error = math.hypot(
+            mirrored[0] - reference_xy[0], mirrored[1] - reference_xy[1]
+        )
+        return mirrored if mirrored_error < primary_error else primary
 
     segments = []
     shape_length = 0.0
@@ -641,11 +673,7 @@ def reconstruct_position_from_lane_geometry(
             center_y = start[1] + dy * ratio
             normal_x = -dy / segment_length
             normal_y = dx / segment_length
-            return (
-                center_x + normal_x * lateral_offset,
-                center_y + normal_y * lateral_offset,
-                z,
-            )
+            return with_lateral_offset(center_x, center_y, normal_x, normal_y)
         travelled += segment_length
 
     if last_segment is None:
@@ -656,8 +684,4 @@ def reconstruct_position_from_lane_geometry(
     end_y = start[1] + dy
     normal_x = -dy / segment_length
     normal_y = dx / segment_length
-    return (
-        end_x + normal_x * lateral_offset,
-        end_y + normal_y * lateral_offset,
-        z,
-    )
+    return with_lateral_offset(end_x, end_y, normal_x, normal_y)

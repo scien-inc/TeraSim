@@ -55,7 +55,7 @@ FROM ${TERASIM_BASE_IMAGE}
 ARG DEBIAN_FRONTEND=noninteractive
 
 LABEL org.opencontainers.image.title="TeraSim SUMO setExternalState build" \
-      org.opencontainers.image.version="SUMO-v1.23.1-external-state-2" \
+      org.opencontainers.image.version="SUMO-v1.23.1-external-state-3" \
       org.opencontainers.image.source="https://github.com/eclipse-sumo/sumo" \
       org.opencontainers.image.revision="676720d13f6f42d8c79d156e9d67001f8c22f6f6"
 
@@ -72,6 +72,8 @@ COPY --from=sumo-builder /opt/sumo-source/tools/traci/ \
     /usr/local/lib/python3.10/site-packages/traci/
 COPY --from=sumo-builder /opt/sumo-source/tools/libsumo/ \
     /usr/local/lib/python3.10/site-packages/libsumo/
+COPY packages/terasim-service/terasim_service/ \
+    /app/packages/terasim-service/terasim_service/
 
 ENV SUMO_HOME=/opt/sumo-external-state
 ENV PATH="/opt/sumo-external-state/bin:${PATH}"

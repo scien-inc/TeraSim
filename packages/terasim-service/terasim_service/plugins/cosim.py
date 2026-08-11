@@ -2172,6 +2172,7 @@ class TeraSimCoSimPlugin(BasePlugin):
             lateral_offset,
             vehicle_state.z,
             lane_length,
+            (vehicle_state.x, vehicle_state.y),
         )
 
         vehicle_state.lane_id = lane_id
