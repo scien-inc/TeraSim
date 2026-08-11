@@ -206,6 +206,9 @@ class TeraSimCoSimPlugin(BasePlugin):
             )
             configured_assimilation_mode = "legacy"
         self.ackermann_feedback_assimilation_mode = configured_assimilation_mode
+        self.external_state_route_lookahead_only = self._parse_bool_env(
+            "TERASIM_COSIM_EXTERNAL_STATE_ROUTE_LOOKAHEAD_ONLY", True
+        )
         self.ackermann_feedback_validate_external_state = self._parse_bool_env(
             "CARLA_COSIM_ACKERMANN_FEEDBACK_VALIDATE_EXTERNAL_STATE", True
         )
@@ -936,6 +939,13 @@ class TeraSimCoSimPlugin(BasePlugin):
         return (
             getattr(self, "ackermann_feedback_assimilation_mode", "legacy")
             == "external_state"
+        )
+
+    def _uses_external_state_route_lookahead(self, actor_id):
+        return bool(
+            getattr(self, "external_state_route_lookahead_only", True)
+            and self._uses_external_state_assimilation()
+            and actor_id in getattr(self, "feedback_source_carla_frames", {})
         )
 
     def _ackermann_feedback_external_state_match_threshold(self, actor_id):
@@ -2391,7 +2401,7 @@ class TeraSimCoSimPlugin(BasePlugin):
         for request, lookahead, lookahead_distance, heading_change in zip(
             requests, lookaheads, effective_distances, heading_changes
         ):
-            _, vehicle_state, context_values = request
+            vehicle_id, vehicle_state, context_values = request
             vehicle_state.lookahead_distance = lookahead_distance
             vehicle_state.lookahead_heading_change = heading_change
             has_lateral_speed, lateral_speed = self._context_vehicle_value(
@@ -2405,22 +2415,31 @@ class TeraSimCoSimPlugin(BasePlugin):
             if not has_lateral_offset:
                 lateral_offset = getattr(vehicle_state, "lateral_offset", 0.0)
             vehicle_state.lateral_speed = lateral_speed
-            lookahead, lane_change_blend = self._profile_detail_python_call(
-                profile_ctx,
-                "blend_lane_change_lookahead",
-                blend_lane_change_lookahead,
-                lookahead,
-                (vehicle_state.lookahead_origin_x, vehicle_state.lookahead_origin_y),
-                vehicle_state.sumo_angle,
-                lookahead_distance,
-                lateral_speed,
-                lateral_offset,
-                vehicle_state.z,
-                getattr(self, "lookahead_lane_change_speed_start", 0.05),
-                getattr(self, "lookahead_lane_change_speed_full", 0.35),
-                getattr(self, "lookahead_lane_change_offset_start", 0.15),
-                getattr(self, "lookahead_lane_change_offset_full", 0.75),
-            )
+            if (
+                lookahead is not None
+                and self._uses_external_state_route_lookahead(vehicle_id)
+            ):
+                lane_change_blend = 0.0
+            else:
+                lookahead, lane_change_blend = self._profile_detail_python_call(
+                    profile_ctx,
+                    "blend_lane_change_lookahead",
+                    blend_lane_change_lookahead,
+                    lookahead,
+                    (
+                        vehicle_state.lookahead_origin_x,
+                        vehicle_state.lookahead_origin_y,
+                    ),
+                    vehicle_state.sumo_angle,
+                    lookahead_distance,
+                    lateral_speed,
+                    lateral_offset,
+                    vehicle_state.z,
+                    getattr(self, "lookahead_lane_change_speed_start", 0.05),
+                    getattr(self, "lookahead_lane_change_speed_full", 0.35),
+                    getattr(self, "lookahead_lane_change_offset_start", 0.15),
+                    getattr(self, "lookahead_lane_change_offset_full", 0.75),
+                )
             vehicle_state.lookahead_lane_change_blend = lane_change_blend
             if lookahead is None:
                 continue
