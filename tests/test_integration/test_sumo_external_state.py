@@ -103,6 +103,50 @@ def _write_straight_network(
     return network_path, routes_path
 
 
+def _position_at_declared_lane_offset(shape, declared_length: float, offset: float):
+    """Interpolate shape geometry using SUMO's declared lane-length coordinate."""
+    shape_length = sum(math.dist(start, end) for start, end in zip(shape, shape[1:]))
+    geometry_offset = min(max(offset / declared_length, 0.0), 1.0) * shape_length
+    traversed = 0.0
+    for start, end in zip(shape, shape[1:]):
+        segment_length = math.dist(start, end)
+        if traversed + segment_length >= geometry_offset:
+            ratio = (geometry_offset - traversed) / segment_length
+            return (
+                start[0] + ratio * (end[0] - start[0]),
+                start[1] + ratio * (end[1] - start[1]),
+            )
+        traversed += segment_length
+    return shape[-1]
+
+
+def _write_odaiba_edge426_route(tmp_path: Path) -> tuple[Path, Path]:
+    network_path = (
+        Path(__file__).resolve().parents[2]
+        / "examples/maps/odaiba_ll2/tlmappings_0708/network.net.xml"
+    )
+    if not network_path.is_file():
+        pytest.skip("Odaiba network is not available")
+    routes_path = tmp_path / "edge426.rou.xml"
+    routes_path.write_text(
+        textwrap.dedent(
+            """\
+            <routes>
+                <vType id="car" accel="2.6" decel="4.5" emergencyDecel="9"
+                       sigma="0" length="5" width="1.8" maxSpeed="16.667"
+                       laneChangeModel="SL2015"/>
+                <route id="route"
+                       edges="edge_426 edge_432 edge_427 edge_52 edge_54 edge_59 edge_255"/>
+                <vehicle id="ego" type="car" route="route" depart="0"
+                         departLane="1" departPos="45" departSpeed="9"/>
+            </routes>
+            """
+        ),
+        encoding="utf-8",
+    )
+    return network_path, routes_path
+
+
 @pytest.mark.integration
 @pytest.mark.requires_sumo
 def test_external_state_assimilation_and_single_step_progression(tmp_path: Path) -> None:
@@ -393,6 +437,117 @@ def test_external_state_preserves_off_center_side_on_left_hand_network(
             target_speed = traci.vehicle.getSpeed("ego")
 
         assert max(observed_lateral_offsets) - min(observed_lateral_offsets) < 0.15
+    finally:
+        traci.close()
+
+
+@pytest.mark.integration
+@pytest.mark.requires_sumo
+def test_external_state_edge426_lane_boundary_has_no_phase_b_warp(
+    tmp_path: Path,
+) -> None:
+    """A left-hand primary-lane switch must preserve the assimilated x/y state."""
+    traci = pytest.importorskip("traci")
+    if not hasattr(traci.vehicle, "setExternalState"):
+        pytest.skip("requires the dedicated SUMO setExternalState build")
+
+    sumo = _find_binary("sumo")
+    network_path, routes_path = _write_odaiba_edge426_route(tmp_path)
+    traci.start(
+        [
+            sumo,
+            "--net-file",
+            str(network_path),
+            "--route-files",
+            str(routes_path),
+            "--step-length",
+            str(STEP_LENGTH),
+            "--lateral-resolution",
+            "0.2",
+            "--no-step-log",
+            "true",
+            "--duration-log.disable",
+            "true",
+        ],
+        numRetries=5,
+    )
+    try:
+        traci.simulationStep()
+        assert traci.vehicle.getIDList() == ("ego",)
+
+        lane_2_shape = traci.lane.getShape("edge_426_2")
+        lane_1_shape = traci.lane.getShape("edge_426_1")
+        lane_2_length = traci.lane.getLength("edge_426_2")
+        lane_1_length = traci.lane.getLength("edge_426_1")
+        previous_phase_b_position = None
+        phase_a_corrections = []
+        phase_b_displacements = []
+        phase_b_lanes = []
+
+        for cycle in range(80):
+            lane_offset = 45.0 + (cycle + 1) * 9.0 * STEP_LENGTH
+            lane_2_center = _position_at_declared_lane_offset(
+                lane_2_shape, lane_2_length, lane_offset
+            )
+            lane_1_center = _position_at_declared_lane_offset(
+                lane_1_shape, lane_1_length, lane_offset
+            )
+            # Move continuously from lane 1 toward lane 2. The lane hint changes
+            # only after the physical pose passes the geometric midpoint.
+            lane_2_fraction = 0.10 + 0.50 * cycle / 79.0
+            target = (
+                lane_1_center[0]
+                + lane_2_fraction * (lane_2_center[0] - lane_1_center[0]),
+                lane_1_center[1]
+                + lane_2_fraction * (lane_2_center[1] - lane_1_center[1]),
+            )
+            next_lane_1_center = _position_at_declared_lane_offset(
+                lane_1_shape, lane_1_length, lane_offset + 0.1
+            )
+            target_angle = math.degrees(
+                math.atan2(
+                    next_lane_1_center[0] - lane_1_center[0],
+                    next_lane_1_center[1] - lane_1_center[1],
+                )
+            ) % 360.0
+            lane_hint = 1 if lane_2_fraction <= 0.5 else 2
+
+            if previous_phase_b_position is not None:
+                phase_a_corrections.append(
+                    math.dist(previous_phase_b_position, target)
+                )
+            phase_a_time = traci.simulation.getTime()
+            traci.vehicle.setExternalState(
+                "ego",
+                "edge_426",
+                lane_hint,
+                target[0],
+                target[1],
+                target_angle,
+                9.0,
+                0.0,
+                keepRoute=1,
+                matchThreshold=10.0,
+            )
+            assert traci.simulation.getTime() == phase_a_time
+            assert math.dist(traci.vehicle.getPosition("ego"), target) < POSITION_TOLERANCE
+
+            # Reproduce the stale opposite-direction maneuver seen in the field:
+            # the external actor moves toward lane 2 while SUMO still carries a
+            # lane-0 request from the preceding planning state.
+            traci.vehicle.changeLane("ego", 0, 10.0)
+            traci.simulation.executeMove()
+            assert traci.simulation.getTime() == phase_a_time
+            traci.simulationStep()
+
+            phase_b_position = traci.vehicle.getPosition("ego")
+            phase_b_displacements.append(math.dist(target, phase_b_position))
+            phase_b_lanes.append(traci.vehicle.getLaneID("ego"))
+            previous_phase_b_position = phase_b_position
+
+        assert max(phase_b_displacements) < 1.2
+        assert max(phase_a_corrections) < 1.2
+        assert all(lane in {"edge_426_1", "edge_426_2"} for lane in phase_b_lanes)
     finally:
         traci.close()
 

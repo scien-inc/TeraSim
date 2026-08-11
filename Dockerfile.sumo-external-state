@@ -26,8 +26,10 @@ RUN git clone --branch "${SUMO_TAG}" --depth 1 \
 COPY apps/sumo_external_state/sumo-v1.23.1-set-external-state.patch \
     /tmp/sumo-v1.23.1-set-external-state.patch
 
-RUN git -C /opt/sumo-source apply --check /tmp/sumo-v1.23.1-set-external-state.patch \
-    && git -C /opt/sumo-source apply /tmp/sumo-v1.23.1-set-external-state.patch
+RUN git -C /opt/sumo-source apply --unidiff-zero --check \
+        /tmp/sumo-v1.23.1-set-external-state.patch \
+    && git -C /opt/sumo-source apply --unidiff-zero \
+        /tmp/sumo-v1.23.1-set-external-state.patch
 
 RUN cmake -S /opt/sumo-source -B /opt/sumo-source/build-external-state \
     -DCMAKE_BUILD_TYPE=Release \
@@ -55,7 +57,7 @@ FROM ${TERASIM_BASE_IMAGE}
 ARG DEBIAN_FRONTEND=noninteractive
 
 LABEL org.opencontainers.image.title="TeraSim SUMO setExternalState build" \
-      org.opencontainers.image.version="SUMO-v1.23.1-external-state-3" \
+      org.opencontainers.image.version="SUMO-v1.23.1-external-state-4" \
       org.opencontainers.image.source="https://github.com/eclipse-sumo/sumo" \
       org.opencontainers.image.revision="676720d13f6f42d8c79d156e9d67001f8c22f6f6"
 
