@@ -405,6 +405,72 @@ def test_vehicle_lookahead_exports_phase_aligned_lane_progress_error(monkeypatch
     assert state.feedback_longitudinal_error == pytest.approx(0.0)
 
 
+@pytest.mark.parametrize(
+    ("assimilation_mode", "expected_lookahead", "expected_blend"),
+    [
+        ("external_state", (10.0, 1.5), 0.0),
+        ("legacy", (11.5, -0.9), 1.0),
+    ],
+)
+def test_feedback_lookahead_blending_depends_on_assimilation_mode(
+    monkeypatch,
+    assimilation_mode,
+    expected_lookahead,
+    expected_blend,
+):
+    from terasim_service.plugins import cosim as plugin_module
+    from terasim_service.utils.messages.AgentStateSimplified import (
+        AgentStateSimplified,
+    )
+    from terasim_service.utils.sumo_lane_geometry import compile_lane_shapes
+
+    constants = types.SimpleNamespace(VAR_SPEED_LAT=1, VAR_LANEPOSITION_LAT=2)
+    monkeypatch.setattr(
+        plugin_module, "traci", types.SimpleNamespace(constants=constants)
+    )
+    plugin = plugin_module.TeraSimCoSimPlugin.__new__(plugin_module.TeraSimCoSimPlugin)
+    plugin.feedback_observed_positions = {"AV": (8.0, -0.9)}
+    plugin.feedback_source_carla_frames = {"AV": 123}
+    plugin.ackermann_feedback_assimilation_mode = assimilation_mode
+    plugin.external_state_route_lookahead_only = True
+    plugin.lookahead_straight_min_distance = 7.0
+    plugin.lookahead_max_distance = 15.0
+    plugin.lookahead_curve_min_distance = 3.5
+    plugin.lookahead_curve_start_radians = math.radians(5.0)
+    plugin.lookahead_curve_full_scale_radians = math.radians(45.0)
+    plugin._get_vehicle_lookahead_compiled_path = lambda *args, **kwargs: (
+        compile_lane_shapes(
+            [[(0.0, 0.0), (10.0, 0.0)], [(10.0, 0.0), (10.0, 20.0)]]
+        )
+    )
+    state = AgentStateSimplified(
+        x=8.0,
+        y=-0.9,
+        speed=10.0,
+        sumo_angle=90.0,
+        z=0.0,
+    )
+
+    plugin._populate_vehicle_lookaheads(
+        [
+            (
+                "AV",
+                state,
+                {
+                    constants.VAR_SPEED_LAT: 0.35,
+                    constants.VAR_LANEPOSITION_LAT: -0.9,
+                },
+            )
+        ]
+    )
+
+    assert state.lookahead_distance == pytest.approx(3.5)
+    assert state.lookahead_heading_change == pytest.approx(math.pi / 2.0)
+    assert state.lookahead_lane_change_blend == pytest.approx(expected_blend)
+    assert state.lookahead_x == pytest.approx(expected_lookahead[0])
+    assert state.lookahead_y == pytest.approx(expected_lookahead[1])
+
+
 def test_external_state_lane_export_uses_live_state_over_stale_subscription(monkeypatch):
     from terasim_service.plugins import cosim as plugin_module
     from terasim_service.utils.messages.AgentStateSimplified import (
