@@ -1,8 +1,8 @@
 diff --git a/src/libsumo/Helper.cpp b/src/libsumo/Helper.cpp
-index d0b6e8989..799b4c845 100644
+index d0b6e8989..fab82310d 100644
 --- a/src/libsumo/Helper.cpp
 +++ b/src/libsumo/Helper.cpp
-@@ -1411,6 +1411,18 @@ Helper::setRemoteControlled(MSPerson* p, Position xyPos, MSLane* l, double pos,
+@@ -1411,6 +1411,19 @@ Helper::setRemoteControlled(MSPerson* p, Position xyPos, MSLane* l, double pos,
  }
  
  
@@ -13,7 +13,8 @@ index d0b6e8989..799b4c845 100644
 +        throw TraCIException("Vehicle '" + v->getID() + "' has no pending remote-control state.");
 +    }
 +    controlled->second->getInfluencer().postProcessRemoteControl(controlled->second);
-+    controlled->second->getInfluencer().completeRemoteControl(MSNet::getInstance()->getCurrentTimeStep());
++    controlled->second->getInfluencer().completeRemoteControl(
++        controlled->second, MSNet::getInstance()->getCurrentTimeStep());
 +    myRemoteControlledVehicles.erase(controlled);
 +}
 +
@@ -50,7 +51,7 @@ index fa301b9d6..7731aec92 100644
  // value = stopped + 2 * parking + 4 * triggered
  TRACI_CONST int VAR_STOPSTATE = 0xb5;
 diff --git a/src/libsumo/Vehicle.cpp b/src/libsumo/Vehicle.cpp
-index 239ef17be..b87a0a893 100644
+index 239ef17be..b75744a26 100644
 --- a/src/libsumo/Vehicle.cpp
 +++ b/src/libsumo/Vehicle.cpp
 @@ -1835,6 +1835,26 @@ Vehicle::moveToXY(const std::string& vehID, const std::string& edgeID, const int
@@ -95,15 +96,33 @@ index a733726bc..3f18d48ef 100644
      static void setLine(const std::string& vehID, const std::string& line);
      static void setVia(const std::string& vehID, const std::vector<std::string>& edgeList);
 diff --git a/src/microsim/MSVehicle.cpp b/src/microsim/MSVehicle.cpp
-index 1792121ea..32a6882fd 100644
+index 1792121ea..0b0f585cc 100644
 --- a/src/microsim/MSVehicle.cpp
 +++ b/src/microsim/MSVehicle.cpp
-@@ -932,6 +932,17 @@ MSVehicle::Influencer::postProcessRemoteControl(MSVehicle* v) {
+@@ -932,6 +932,35 @@ MSVehicle::Influencer::postProcessRemoteControl(MSVehicle* v) {
  }
  
  
 +void
-+MSVehicle::Influencer::completeRemoteControl(SUMOTime t) {
++MSVehicle::Influencer::completeRemoteControl(MSVehicle* v, SUMOTime t) {
++    if (v->isOnRoad() && myRemoteLane != nullptr) {
++        // moveToXY reports the geometric lateral offset independently of the
++        // network drive side. The regular vehicle state uses the opposite
++        // sign for left-hand networks. Once the remote-control latch is
++        // released, choose the internal sign whose ordinary lane-geometry
++        // reconstruction remains closest to the external x/y state.
++        const double posLat = v->getLateralPositionOnLane();
++        const double geometrySign = MSGlobals::gLefthand ? 1. : -1.;
++        const Position currentPos = myRemoteLane->geometryPositionAtOffset(
++                                        v->getPositionOnLane(), geometrySign * posLat);
++        const Position flippedPos = myRemoteLane->geometryPositionAtOffset(
++                                        v->getPositionOnLane(), -geometrySign * posLat);
++        if (flippedPos != Position::INVALID
++                && (currentPos == Position::INVALID
++                    || flippedPos.distanceTo2D(myRemoteXYPos) < currentPos.distanceTo2D(myRemoteXYPos))) {
++            v->setLateralPositionOnLane(-posLat);
++        }
++    }
 +    if (myLastRemoteAccess == t) {
 +        // Keep wasRemoteControlled() true while ensuring that planning in a
 +        // simulationStep at the same timestamp no longer treats the vehicle
@@ -117,15 +136,15 @@ index 1792121ea..32a6882fd 100644
  MSVehicle::Influencer::implicitSpeedRemote(const MSVehicle* veh, double oldSpeed) {
      if (veh->getPosition() == Position::INVALID) {
 diff --git a/src/microsim/MSVehicle.h b/src/microsim/MSVehicle.h
-index 05b62c06a..102abda91 100644
+index 05b62c06a..9a15829c8 100644
 --- a/src/microsim/MSVehicle.h
 +++ b/src/microsim/MSVehicle.h
 @@ -1570,6 +1570,9 @@ public:
          /// @brief update position from remote control
          void postProcessRemoteControl(MSVehicle* v);
  
-+        /// @brief mark an already-applied remote-control update as complete
-+        void completeRemoteControl(SUMOTime t);
++        /// @brief normalize and mark an already-applied remote-control update as complete
++        void completeRemoteControl(MSVehicle* v, SUMOTime t);
 +
          /// @brief return the speed that is implicit in the new remote position
          double implicitSpeedRemote(const MSVehicle* veh, double oldSpeed);
