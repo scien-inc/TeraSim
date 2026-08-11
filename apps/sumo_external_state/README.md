@@ -34,11 +34,15 @@ TraCI `setSpeed` timeline before setting the assimilated speed and acceleration,
 so Phase B starts from the external state. TeraSim/NADE may install a new speed
 action after Phase A. Normal `moveToXY` behavior is unchanged.
 
-For left-hand networks, the dedicated completion path also normalizes the
-mapped lateral state before releasing the remote-control latch. It selects the
-internal lateral sign whose ordinary lane-geometry position is closest to the
-external x/y state. The service uses the raw SUMO x/y position to disambiguate
-the drive-side-dependent lateral sign when exporting lane-relative geometry.
+Before releasing the remote-control latch, the dedicated completion path
+separates the lane-change model's lane-index-relative lateral coordinate from
+the sign needed to project that coordinate onto the actual lane geometry. It
+inspects the center geometry of an adjacent lane to infer the physical
+direction of increasing lane indices, normalizes the internal lateral state,
+and stores a per-vehicle projection sign. This handles both ordinary left-hand
+networks and Odaiba edges whose declared lane order is reversed in space. The
+service still uses raw SUMO x/y to disambiguate drive-side-dependent lateral
+signs when exporting lane-relative geometry.
 
 The intended cycle is:
 
@@ -82,7 +86,10 @@ docker run --rm \
 The TeraSim gate executes Phase A at priority `-90`, observes and plans at
 priority `0` (including `executeMove`), and calls the ordinary 0.05-second
 `simulationStep` once at priority `10`. It repeats 12 cycles and rejects large
-position corrections or speed/yaw oscillation.
+position corrections or speed/yaw oscillation. The same test file also runs an
+80-cycle one-vehicle regression on Odaiba `edge_426`, crossing the lane 1/2
+boundary while injecting a stale lane-0 request. The Phase B displacement and
+next Phase A correction must both remain below `1.2 m`.
 
 Do not proceed to Odaiba until this gate passes.
 

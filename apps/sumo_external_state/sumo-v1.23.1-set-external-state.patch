@@ -96,32 +96,66 @@ index a733726bc..3f18d48ef 100644
      static void setLine(const std::string& vehID, const std::string& line);
      static void setVia(const std::string& vehID, const std::vector<std::string>& edgeList);
 diff --git a/src/microsim/MSVehicle.cpp b/src/microsim/MSVehicle.cpp
-index 1792121ea..0b0f585cc 100644
+index 1792121ea..ef8353df9 100644
 --- a/src/microsim/MSVehicle.cpp
 +++ b/src/microsim/MSVehicle.cpp
-@@ -932,6 +932,35 @@ MSVehicle::Influencer::postProcessRemoteControl(MSVehicle* v) {
- }
- 
- 
+@@ -382,0 +383 @@ MSVehicle::Influencer::Influencer() :
++    myRemotePositionGeometrySign(0.),
+@@ -934,0 +936,64 @@ MSVehicle::Influencer::postProcessRemoteControl(MSVehicle* v) {
 +void
 +MSVehicle::Influencer::completeRemoteControl(MSVehicle* v, SUMOTime t) {
 +    if (v->isOnRoad() && myRemoteLane != nullptr) {
 +        // moveToXY reports the geometric lateral offset independently of the
-+        // network drive side. The regular vehicle state uses the opposite
-+        // sign for left-hand networks. Once the remote-control latch is
-+        // released, choose the internal sign whose ordinary lane-geometry
-+        // reconstruction remains closest to the external x/y state.
-+        const double posLat = v->getLateralPositionOnLane();
-+        const double geometrySign = MSGlobals::gLefthand ? 1. : -1.;
++        // network drive side. First recover the geometry-side offset that
++        // reconstructs the external x/y state.
++        const double remotePosLat = v->getLateralPositionOnLane();
++        const double defaultGeometrySign = MSGlobals::gLefthand ? 1. : -1.;
 +        const Position currentPos = myRemoteLane->geometryPositionAtOffset(
-+                                        v->getPositionOnLane(), geometrySign * posLat);
++                                        v->getPositionOnLane(), defaultGeometrySign * remotePosLat);
 +        const Position flippedPos = myRemoteLane->geometryPositionAtOffset(
-+                                        v->getPositionOnLane(), -geometrySign * posLat);
++                                        v->getPositionOnLane(), -defaultGeometrySign * remotePosLat);
++        double externalGeometrySign = defaultGeometrySign;
 +        if (flippedPos != Position::INVALID
 +                && (currentPos == Position::INVALID
 +                    || flippedPos.distanceTo2D(myRemoteXYPos) < currentPos.distanceTo2D(myRemoteXYPos))) {
-+            v->setLateralPositionOnLane(-posLat);
++            externalGeometrySign = -defaultGeometrySign;
 +        }
++
++        // Lane indices normally follow the network drive side, but imported
++        // networks may contain the opposite geometric lane order. Determine
++        // the actual geometry direction of an index change from an adjacent
++        // lane so posLat remains meaningful to the lane-change model.
++        myRemotePositionGeometrySign = defaultGeometrySign;
++        const auto& edgeLanes = myRemoteLane->getEdge().getLanes();
++        const int laneIndex = myRemoteLane->getIndex();
++        const int neighborIndex = laneIndex + 1 < (int)edgeLanes.size()
++                                  ? laneIndex + 1
++                                  : laneIndex - 1;
++        if (neighborIndex >= 0 && neighborIndex < (int)edgeLanes.size()) {
++            const MSLane* neighborLane = edgeLanes[neighborIndex];
++            const double laneFraction = myRemoteLane->getLength() > 0.
++                                        ? v->getPositionOnLane() / myRemoteLane->getLength()
++                                        : 0.;
++            const double neighborPos = MIN2(neighborLane->getLength(),
++                                            MAX2(0., laneFraction * neighborLane->getLength()));
++            const Position neighborCenter = neighborLane->geometryPositionAtOffset(neighborPos);
++            const Position positiveProbe = myRemoteLane->geometryPositionAtOffset(
++                                               v->getPositionOnLane(), 0.5);
++            const Position negativeProbe = myRemoteLane->geometryPositionAtOffset(
++                                               v->getPositionOnLane(), -0.5);
++            if (neighborCenter != Position::INVALID
++                    && positiveProbe != Position::INVALID
++                    && negativeProbe != Position::INVALID) {
++                const double neighborDirection = neighborIndex > laneIndex ? 1. : -1.;
++                const double geometryDirection =
++                    positiveProbe.distanceTo2D(neighborCenter)
++                    < negativeProbe.distanceTo2D(neighborCenter) ? 1. : -1.;
++                myRemotePositionGeometrySign = geometryDirection * neighborDirection;
++            }
++        }
++        v->setLateralPositionOnLane(
++            externalGeometrySign * remotePosLat / myRemotePositionGeometrySign);
++        v->getLaneChangeModel().resetForExternalState();
 +    }
 +    if (myLastRemoteAccess == t) {
 +        // Keep wasRemoteControlled() true while ensuring that planning in a
@@ -132,23 +166,95 @@ index 1792121ea..0b0f585cc 100644
 +}
 +
 +
- double
- MSVehicle::Influencer::implicitSpeedRemote(const MSVehicle* veh, double oldSpeed) {
-     if (veh->getPosition() == Position::INVALID) {
+@@ -1247,0 +1313,12 @@ MSVehicle::getSlope() const {
++double
++MSVehicle::getLateralGeometrySign() const {
++    if (myInfluencer != nullptr) {
++        const double remoteSign = myInfluencer->getRemotePositionGeometrySign();
++        if (remoteSign != 0.) {
++            return remoteSign;
++        }
++    }
++    return MSGlobals::gLefthand ? 1. : -1.;
++}
++
++
+@@ -1272 +1349 @@ MSVehicle::getPosition(const double offset) const {
+-    const double posLat = (MSGlobals::gLefthand ? 1 : -1) * getLateralPositionOnLane();
++    const double posLat = getLateralGeometrySign() * getLateralPositionOnLane();
+@@ -1482,2 +1559,2 @@ MSVehicle::computeAngle() const {
+-    const double posLat = -myState.myPosLat; // @todo get rid of the '-'
+-    const double lefthandSign = (MSGlobals::gLefthand ? -1 : 1);
++    const double geometrySign = getLateralGeometrySign();
++    const double posLat = geometrySign * myState.myPosLat;
+@@ -1499 +1576 @@ MSVehicle::computeAngle() const {
+-        p1 = myLane->geometryPositionAtOffset(myState.myPos, lefthandSign * posLat);
++        p1 = myLane->geometryPositionAtOffset(myState.myPos, posLat);
+@@ -1503 +1580 @@ MSVehicle::computeAngle() const {
+-            p1 = predecessorLane->geometryPositionAtOffset(predecessorLane->getLength() + myState.myPos, lefthandSign * posLat);
++            p1 = predecessorLane->geometryPositionAtOffset(predecessorLane->getLength() + myState.myPos, posLat);
+@@ -1532 +1609 @@ MSVehicle::computeAngle() const {
+-    result += lefthandSign * myLaneChangeModel->calcAngleOffset();
++    result -= geometrySign * myLaneChangeModel->calcAngleOffset();
+@@ -1545 +1622,2 @@ MSVehicle::getBackPosition() const {
+-    const double posLat = MSGlobals::gLefthand ? myState.myPosLat : -myState.myPosLat;
++    const double geometrySign = getLateralGeometrySign();
++    const double posLat = geometrySign * myState.myPosLat;
+@@ -1568 +1646 @@ MSVehicle::getBackPosition() const {
+-                result = myFurtherLanes.back()->geometryPositionAtOffset(backPos, -myFurtherLanesPosLat.back() * (MSGlobals::gLefthand ? -1 : 1));
++                result = myFurtherLanes.back()->geometryPositionAtOffset(backPos, geometrySign * myFurtherLanesPosLat.back());
 diff --git a/src/microsim/MSVehicle.h b/src/microsim/MSVehicle.h
-index 05b62c06a..9a15829c8 100644
+index 05b62c06a..773f22ede 100644
 --- a/src/microsim/MSVehicle.h
 +++ b/src/microsim/MSVehicle.h
-@@ -1570,6 +1570,9 @@ public:
-         /// @brief update position from remote control
-         void postProcessRemoteControl(MSVehicle* v);
- 
+@@ -566,0 +567,3 @@ public:
++    /// @brief geometry-side multiplier for the internal lateral lane position
++    double getLateralGeometrySign() const;
++
+@@ -1572,0 +1576,7 @@ public:
 +        /// @brief normalize and mark an already-applied remote-control update as complete
 +        void completeRemoteControl(MSVehicle* v, SUMOTime t);
 +
-         /// @brief return the speed that is implicit in the new remote position
-         double implicitSpeedRemote(const MSVehicle* veh, double oldSpeed);
- 
++        double getRemotePositionGeometrySign() const {
++            return myRemotePositionGeometrySign;
++        }
++
+@@ -1656,0 +1667 @@ public:
++        double myRemotePositionGeometrySign;
+diff --git a/src/microsim/lcmodels/MSAbstractLaneChangeModel.cpp b/src/microsim/lcmodels/MSAbstractLaneChangeModel.cpp
+index 3ca03b555..37e762a80 100644
+--- a/src/microsim/lcmodels/MSAbstractLaneChangeModel.cpp
++++ b/src/microsim/lcmodels/MSAbstractLaneChangeModel.cpp
+@@ -483,0 +484,21 @@ MSAbstractLaneChangeModel::endLaneChangeManeuver(const MSMoveReminder::Notificat
++void
++MSAbstractLaneChangeModel::resetForExternalState() {
++    // The external pose is authoritative. A continuous maneuver that was
++    // planned before assimilation must not switch the primary lane from stale
++    // completion state during the following simulationStep. Preserve posLat
++    // (unlike endLaneChangeManeuver) and rebuild only physical lane overlap.
++    cleanupShadowLane();
++    cleanupTargetLane();
++    myLaneChangeCompletion = 1;
++    myLaneChangeDirection = 0;
++    setManeuverDist(0.);
++    setSpeedLat(0.);
++    myAngleOffset = 0.;
++    myPreviousAngleOffset = 0.;
++    myAlreadyChanged = false;
++    clearGapsAtLCInit();
++    myNoPartiallyOccupatedByShadow.clear();
++    updateShadowLane();
++}
++
++
+diff --git a/src/microsim/lcmodels/MSAbstractLaneChangeModel.h b/src/microsim/lcmodels/MSAbstractLaneChangeModel.h
+index d04c54723..85efa7ba6 100644
+--- a/src/microsim/lcmodels/MSAbstractLaneChangeModel.h
++++ b/src/microsim/lcmodels/MSAbstractLaneChangeModel.h
+@@ -538,0 +539,3 @@ public:
++    /// @brief discard stale maneuver progress while preserving external posLat
++    void resetForExternalState();
++
 diff --git a/src/traci-server/TraCIServerAPI_Vehicle.cpp b/src/traci-server/TraCIServerAPI_Vehicle.cpp
 index a161772c8..42ef22a73 100644
 --- a/src/traci-server/TraCIServerAPI_Vehicle.cpp
