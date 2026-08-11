@@ -167,6 +167,67 @@ def test_lane_lookahead_crosses_internal_and_destination_lanes():
     assert point == pytest.approx((15.0, 0.0, 1.5))
 
 
+def test_lane_relative_position_preserves_longitudinal_and_lateral_offsets():
+    from terasim_service.utils.sumo_lane_geometry import (
+        reconstruct_position_from_lane_geometry,
+    )
+
+    reconstructed = reconstruct_position_from_lane_geometry(
+        [(0.0, 0.0), (20.0, 0.0)],
+        lane_position=7.5,
+        lateral_offset=1.25,
+        z=2.0,
+        lane_length=20.0,
+    )
+
+    assert reconstructed == pytest.approx((7.5, 1.25, 2.0))
+
+
+def test_lane_relative_position_uses_normalized_declared_lane_progress():
+    from terasim_service.utils.sumo_lane_geometry import (
+        reconstruct_position_from_lane_geometry,
+    )
+
+    reconstructed = reconstruct_position_from_lane_geometry(
+        [(0.0, 0.0), (90.0, 0.0)],
+        lane_position=50.0,
+        lateral_offset=-1.0,
+        z=0.0,
+        lane_length=100.0,
+    )
+
+    assert reconstructed == pytest.approx((45.0, -1.0, 0.0))
+
+
+def test_carla_prefers_lane_relative_target_and_falls_back_to_raw_position():
+    install_fake_carla()
+    from terasim_service.utils.carla.cosim import CarlaCosim
+
+    cosim = CarlaCosim.__new__(CarlaCosim)
+    cosim._invalid_location_warnings = set()
+    actor_info = {
+        "x": 10.0,
+        "y": 20.0,
+        "z": 1.0,
+        "reconstructed_x": 11.0,
+        "reconstructed_y": 21.0,
+        "reconstructed_z": 1.5,
+        "reconstructed_position_valid": True,
+    }
+
+    assert cosim._resolve_sumo_location(
+        "vehicle", "BV", actor_info, prefer_lane_relative=True
+    ) == pytest.approx([11.0, 21.0, 1.5])
+    assert cosim._resolve_sumo_location(
+        "vehicle", "BV", actor_info, prefer_lane_relative=False
+    ) == pytest.approx([10.0, 20.0, 1.0])
+
+    actor_info["reconstructed_x"] = None
+    assert cosim._resolve_sumo_location(
+        "vehicle", "BV", actor_info, prefer_lane_relative=True
+    ) == pytest.approx([10.0, 20.0, 1.0])
+
+
 def test_batched_lane_lookahead_matches_scalar_results():
     from terasim_service.utils.sumo_lane_geometry import (
         compile_lane_shapes,
@@ -327,12 +388,59 @@ def test_vehicle_lookahead_exports_phase_aligned_lane_progress_error(monkeypatch
     assert state.feedback_longitudinal_error == pytest.approx(0.0)
 
 
+def test_external_state_lane_export_uses_live_state_over_stale_subscription(monkeypatch):
+    from terasim_service.plugins import cosim as plugin_module
+    from terasim_service.utils.messages.AgentStateSimplified import (
+        AgentStateSimplified,
+    )
+
+    constants = types.SimpleNamespace(
+        VAR_LANE_ID=1,
+        VAR_LANEPOSITION=2,
+        VAR_LANEPOSITION_LAT=3,
+    )
+    calls = []
+    fake_vehicle = types.SimpleNamespace(
+        getLaneID=lambda actor_id: calls.append(("lane", actor_id)) or "road_0",
+        getLanePosition=lambda actor_id: calls.append(("position", actor_id)) or 12.5,
+        getLateralLanePosition=lambda actor_id: calls.append(("lateral", actor_id)) or 0.25,
+    )
+    monkeypatch.setattr(
+        plugin_module,
+        "traci",
+        types.SimpleNamespace(constants=constants, vehicle=fake_vehicle),
+    )
+    plugin = plugin_module.TeraSimCoSimPlugin.__new__(plugin_module.TeraSimCoSimPlugin)
+    plugin.lane_relative_position_enabled = True
+    plugin.ackermann_feedback_assimilation_mode = "external_state"
+    plugin.feedback_observed_speeds = {"AV": 4.0}
+    plugin._get_lookahead_lane_shape = lambda *_args, **_kwargs: [
+        (0.0, 0.0),
+        (100.0, 0.0),
+    ]
+    plugin._get_lane_length = lambda *_args, **_kwargs: 100.0
+    state = AgentStateSimplified(x=12.5, y=0.25)
+
+    plugin._populate_lane_relative_position(
+        "AV",
+        state,
+        context_values={
+            constants.VAR_LANE_ID: "",
+            constants.VAR_LANEPOSITION: 0.0,
+            constants.VAR_LANEPOSITION_LAT: 0.0,
+        },
+    )
+
+    assert calls == [("lane", "AV"), ("position", "AV"), ("lateral", "AV")]
+    assert state.lane_id == "road_0"
+    assert state.lane_position == pytest.approx(12.5)
+    assert state.lateral_offset == pytest.approx(0.25)
+
+
 def test_lookahead_route_cache_avoids_repeated_traci_calls(monkeypatch):
     from terasim_service.plugins import cosim as plugin_module
 
-    constants = types.SimpleNamespace(
-        VAR_LANE_ID=1, VAR_NEXT_LINKS=2, VAR_ROUTE_ID=3, VAR_EDGES=4
-    )
+    constants = types.SimpleNamespace(VAR_LANE_ID=1, VAR_NEXT_LINKS=2, VAR_ROUTE_ID=3, VAR_EDGES=4)
     lane_shapes = {
         "edge_0_0": [(0.0, 0.0), (10.0, 0.0)],
         ":junction_0_0": [(10.0, 0.0), (12.0, 0.0)],
@@ -1379,7 +1487,6 @@ def test_actor_radius_filter_uses_exit_hysteresis():
     assert set(filtered) == {"AV", "BV"}
 
 
-
 def test_state_detail_radius_uses_physics_hysteresis():
     from terasim_service.plugins.cosim import TeraSimCoSimPlugin
 
@@ -1862,6 +1969,197 @@ def test_feedback_ack_is_cached_by_shared_sumo_command_handler(monkeypatch):
     assert plugin.feedback_observed_rear_axle_positions == {"AV": (0.25, 2.0)}
     assert plugin.feedback_source_carla_frames == {"AV": 101}
     assert calls[-1] == ("speed", ("AV", 3.5))
+
+
+def _external_state_handler_plugin(plugin_module):
+    plugin = plugin_module.TeraSimCoSimPlugin.__new__(plugin_module.TeraSimCoSimPlugin)
+    plugin.controlled_agents_each_step = set()
+    plugin.feedback_observed_speeds = {}
+    plugin.feedback_observed_rear_axle_positions = {}
+    plugin.feedback_source_carla_frames = {}
+    plugin.feedback_observed_lane_progress = {}
+    plugin.feedback_lane_geometry_cache = {"road_0": {"length": 500.0}}
+    plugin.feedback_lane_change_active_actor_ids = set()
+    plugin.ackermann_feedback_lane_change_settings_applied = set()
+    plugin.ackermann_feedback_lc_keep_right = None
+    plugin.ackermann_feedback_assimilation_mode = "external_state"
+    plugin.ackermann_feedback_validate_external_state = True
+    plugin.ackermann_feedback_external_state_position_tolerance = 1e-3
+    plugin.ackermann_feedback_move_to_max_distance = 8.0
+    plugin.ackermann_feedback_background_move_to_max_distance = None
+    plugin.ackermann_feedback_log_lane_transitions = False
+    plugin.logger = types.SimpleNamespace(
+        info=lambda *args, **kwargs: None,
+        debug=lambda *args, **kwargs: None,
+        warning=lambda *args, **kwargs: None,
+        error=lambda *args, **kwargs: None,
+    )
+    return plugin
+
+
+def test_external_state_feedback_is_immediate_and_does_not_step(monkeypatch):
+    from terasim_service.plugins import cosim as plugin_module
+
+    events = []
+    state = {
+        "time": 12.5,
+        "position": (0.0, 0.0),
+        "angle": 0.0,
+        "speed": 0.0,
+    }
+    command = types.SimpleNamespace(
+        agent_id="AV",
+        agent_type="vehicle",
+        command_type="set_state",
+        data={
+            "position": [41.0, 2.0],
+            "sumo_angle": 90.0,
+            "speed": 8.5,
+            "acceleration": -1.25,
+            "source_carla_frame": 101,
+        },
+    )
+
+    def set_external_state(*args):
+        events.append(("external_state", args))
+        state["position"] = (args[3], args[4])
+        state["angle"] = args[5]
+        state["speed"] = args[6]
+
+    def unexpected_previous_speed(*_args):
+        raise AssertionError("setPreviousSpeed must not follow setExternalState")
+
+    fake_vehicle = types.SimpleNamespace(
+        setExternalState=set_external_state,
+        setPreviousSpeed=unexpected_previous_speed,
+        getPosition=lambda _actor_id: state["position"],
+        getAngle=lambda _actor_id: state["angle"],
+        getSpeed=lambda _actor_id: state["speed"],
+    )
+    fake_simulation = types.SimpleNamespace(
+        getTime=lambda: events.append(("time", state["time"])) or state["time"]
+    )
+    monkeypatch.setattr(
+        plugin_module,
+        "traci",
+        types.SimpleNamespace(vehicle=fake_vehicle, simulation=fake_simulation),
+    )
+    monkeypatch.setattr(
+        plugin_module.AgentCommand,
+        "model_validate_json",
+        staticmethod(lambda payload: command),
+    )
+
+    plugin = _external_state_handler_plugin(plugin_module)
+
+    def project(actor_id, position, sumo_angle, **kwargs):
+        events.append(("project", actor_id, position, sumo_angle, kwargs))
+        return {
+            "lane_id": "road_0",
+            "edge_id": "road",
+            "lane_index": 0,
+            "lane_position": 41.0,
+        }
+
+    plugin._move_ackermann_feedback_actor = project
+
+    assert plugin._handle_agent_command(b"{}") is True
+    assert events[0][0] == "project"
+    assert events[0][4]["apply_position"] is False
+    external_calls = [event for event in events if event[0] == "external_state"]
+    assert external_calls == [
+        (
+            "external_state",
+            ("AV", "road", 0, 41.0, 2.0, 90.0, 8.5, -1.25, 1, 8.0),
+        )
+    ]
+    assert [event for event in events if event[0] == "time"] == [
+        ("time", 12.5),
+        ("time", 12.5),
+    ]
+    assert state == {
+        "time": 12.5,
+        "position": (41.0, 2.0),
+        "angle": 90.0,
+        "speed": 8.5,
+    }
+    assert plugin.feedback_observed_speeds == {"AV": 8.5}
+    assert plugin.feedback_source_carla_frames == {"AV": 101}
+
+
+def test_external_state_validation_accepts_geometry_rounding(monkeypatch):
+    from terasim_service.plugins import cosim as plugin_module
+
+    plugin = _external_state_handler_plugin(plugin_module)
+    fake_vehicle = types.SimpleNamespace(
+        setExternalState=lambda *_args: None,
+        getPosition=lambda _actor_id: (41.0005, 2.0),
+        getAngle=lambda _actor_id: 90.0,
+        getSpeed=lambda _actor_id: 8.5,
+    )
+    monkeypatch.setattr(
+        plugin_module,
+        "traci",
+        types.SimpleNamespace(
+            vehicle=fake_vehicle,
+            simulation=types.SimpleNamespace(getTime=lambda: 12.5),
+        ),
+    )
+
+    assert plugin._apply_ackermann_feedback_external_state(
+        "AV",
+        (41.0, 2.0),
+        90.0,
+        8.5,
+        -1.25,
+        {"edge_id": "road", "lane_index": 0},
+    )
+
+
+def test_external_state_mode_fails_closed_without_dedicated_api(monkeypatch):
+    from terasim_service.plugins import cosim as plugin_module
+
+    command = types.SimpleNamespace(
+        agent_id="AV",
+        agent_type="vehicle",
+        command_type="set_state",
+        data={
+            "position": [41.0, 2.0],
+            "sumo_angle": 90.0,
+            "speed": 8.5,
+            "source_carla_frame": 101,
+        },
+    )
+    fake_vehicle = types.SimpleNamespace(
+        setPreviousSpeed=lambda *_args: (_ for _ in ()).throw(
+            AssertionError("speed must not be applied after API capability failure")
+        )
+    )
+    monkeypatch.setattr(
+        plugin_module,
+        "traci",
+        types.SimpleNamespace(vehicle=fake_vehicle),
+    )
+    monkeypatch.setattr(
+        plugin_module.AgentCommand,
+        "model_validate_json",
+        staticmethod(lambda payload: command),
+    )
+
+    plugin = _external_state_handler_plugin(plugin_module)
+    plugin._move_ackermann_feedback_actor = lambda *_args, **_kwargs: {
+        "lane_id": "road_0",
+        "edge_id": "road",
+        "lane_index": 0,
+        "lane_position": 41.0,
+    }
+
+    assert plugin._handle_agent_command(b"{}") is False
+    assert plugin.last_agent_command_failure == {
+        "actor_id": "AV",
+        "reason": "ackermann_feedback_external_state_api_unavailable",
+        "ackermann_feedback": True,
+    }
 
 
 def test_feedback_move_to_is_immediate_and_preserves_current_sumo_lane(monkeypatch):

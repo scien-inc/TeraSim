@@ -196,6 +196,26 @@ class TeraSimCoSimPlugin(BasePlugin):
                 configured_feedback_position_mode,
             )
         self.ackermann_feedback_position_mode = "moveTo"
+        configured_assimilation_mode = os.getenv(
+            "CARLA_COSIM_ACKERMANN_FEEDBACK_ASSIMILATION_MODE", "legacy"
+        ).strip().lower()
+        if configured_assimilation_mode not in {"legacy", "external_state"}:
+            self.logger.warning(
+                "Invalid Ackermann feedback assimilation mode=%s; using legacy",
+                configured_assimilation_mode,
+            )
+            configured_assimilation_mode = "legacy"
+        self.ackermann_feedback_assimilation_mode = configured_assimilation_mode
+        self.ackermann_feedback_validate_external_state = self._parse_bool_env(
+            "CARLA_COSIM_ACKERMANN_FEEDBACK_VALIDATE_EXTERNAL_STATE", True
+        )
+        self.ackermann_feedback_external_state_position_tolerance = max(
+            0.0,
+            self._parse_float_env(
+                "CARLA_COSIM_ACKERMANN_FEEDBACK_EXTERNAL_STATE_POSITION_TOLERANCE",
+                1e-3,
+            ),
+        )
         self.ackermann_feedback_move_to_max_distance = max(
             0.0,
             self._parse_float_env(
@@ -306,6 +326,7 @@ class TeraSimCoSimPlugin(BasePlugin):
         # Initialize last orientations cache
         self.last_orientations = {}  # {vehicle_id: (last_orientation, last_time)}
         self.lookahead_lane_shape_cache = {}  # {lane_id: immutable lane shape}
+        self.lane_length_cache = {}  # {lane_id: SUMO declared lane length}
         self.lookahead_geometry_cache = {}  # {lane ID tuple: compiled route geometry}
         # Route IDs are identifiers, not immutable route versions, so the full
         # route edge sequence is part of each per-vehicle cache key.
@@ -418,7 +439,8 @@ class TeraSimCoSimPlugin(BasePlugin):
             )
 
         self.lane_relative_position_enabled = self._parse_bool_env(
-            "TERASIM_COSIM_LANE_RELATIVE_POSITION", False
+            "TERASIM_COSIM_LANE_RELATIVE_POSITION",
+            self._uses_external_state_assimilation(),
         )
         if self.lane_relative_position_enabled:
             self.logger.info(
@@ -910,6 +932,162 @@ class TeraSimCoSimPlugin(BasePlugin):
             )
         return clamp_at_signal_stop_line
 
+    def _uses_external_state_assimilation(self):
+        return (
+            getattr(self, "ackermann_feedback_assimilation_mode", "legacy")
+            == "external_state"
+        )
+
+    def _ackermann_feedback_external_state_match_threshold(self, actor_id):
+        max_distance = getattr(
+            self,
+            "ackermann_feedback_move_to_max_distance",
+            8.0,
+        )
+        if actor_id != "AV":
+            background_max_distance = getattr(
+                self,
+                "ackermann_feedback_background_move_to_max_distance",
+                None,
+            )
+            if background_max_distance is not None:
+                max_distance = background_max_distance
+        return max(0.0, float(max_distance))
+
+    def _apply_ackermann_feedback_external_state(
+        self,
+        actor_id,
+        position,
+        sumo_angle,
+        speed,
+        acceleration,
+        projection,
+        profile_ctx=None,
+    ):
+        """Assimilate one CARLA state immediately without advancing SUMO time."""
+        external_state_setter = getattr(traci.vehicle, "setExternalState", None)
+        if not callable(external_state_setter):
+            self.last_agent_command_failure = {
+                "actor_id": actor_id,
+                "reason": "ackermann_feedback_external_state_api_unavailable",
+                "ackermann_feedback": True,
+            }
+            self.logger.error(
+                "Ackermann feedback external_state requires the dedicated SUMO "
+                "build; traci.vehicle.setExternalState is unavailable"
+            )
+            return False
+
+        speed = self._as_finite_float(speed)
+        acceleration = self._as_finite_float(acceleration)
+        edge_id = projection.get("edge_id", "")
+        lane_index = projection.get("lane_index", -1)
+        if speed is None or speed < 0.0:
+            failure_reason = "ackermann_feedback_external_state_invalid_speed"
+        elif acceleration is None:
+            failure_reason = "ackermann_feedback_external_state_invalid_acceleration"
+        elif not edge_id or not isinstance(lane_index, int) or lane_index < 0:
+            failure_reason = "ackermann_feedback_external_state_invalid_lane_hint"
+        else:
+            failure_reason = None
+        if failure_reason is not None:
+            self.last_agent_command_failure = {
+                "actor_id": actor_id,
+                "reason": failure_reason,
+                "ackermann_feedback": True,
+            }
+            self.logger.error(
+                "Ackermann feedback external_state input rejected actor=%s reason=%s",
+                actor_id,
+                failure_reason,
+            )
+            return False
+
+        validate = getattr(
+            self,
+            "ackermann_feedback_validate_external_state",
+            True,
+        )
+        phase_a_time = traci.simulation.getTime() if validate else None
+        try:
+            self._profile_feedback_command_call(
+                profile_ctx,
+                "traci",
+                "vehicle_set_external_state",
+                external_state_setter,
+                actor_id,
+                edge_id,
+                lane_index,
+                position[0],
+                position[1],
+                sumo_angle,
+                speed,
+                acceleration,
+                1,
+                self._ackermann_feedback_external_state_match_threshold(actor_id),
+            )
+        except Exception as exc:
+            self.last_agent_command_failure = {
+                "actor_id": actor_id,
+                "reason": "ackermann_feedback_external_state_failed",
+                "ackermann_feedback": True,
+                "exception_type": type(exc).__name__,
+            }
+            self.logger.error(
+                "Ackermann feedback external_state failed actor=%s: %s",
+                actor_id,
+                exc,
+            )
+            return False
+
+        if not validate:
+            return True
+
+        observed_time = traci.simulation.getTime()
+        observed_position = traci.vehicle.getPosition(actor_id)
+        observed_angle = traci.vehicle.getAngle(actor_id)
+        observed_speed = traci.vehicle.getSpeed(actor_id)
+        position_error = math.hypot(
+            observed_position[0] - position[0],
+            observed_position[1] - position[1],
+        )
+        angle_error = abs((observed_angle - sumo_angle + 180.0) % 360.0 - 180.0)
+        position_tolerance = getattr(
+            self,
+            "ackermann_feedback_external_state_position_tolerance",
+            1e-3,
+        )
+        state_matches = bool(
+            abs(observed_time - phase_a_time) <= 1e-9
+            and position_error <= position_tolerance
+            and angle_error <= 1e-6
+            and abs(observed_speed - speed) <= 1e-6
+        )
+        if not state_matches:
+            self.last_agent_command_failure = {
+                "actor_id": actor_id,
+                "reason": "ackermann_feedback_external_state_validation_failed",
+                "ackermann_feedback": True,
+                "phase_a_time": phase_a_time,
+                "observed_time": observed_time,
+                "position_error": position_error,
+                "position_tolerance": position_tolerance,
+                "angle_error": angle_error,
+                "speed_error": abs(observed_speed - speed),
+            }
+            self.logger.error(
+                "Ackermann feedback external_state validation failed actor=%s "
+                "time=%s->%s positionError=%.9f angleError=%.9f speedError=%.9f",
+                actor_id,
+                phase_a_time,
+                observed_time,
+                position_error,
+                angle_error,
+                abs(observed_speed - speed),
+            )
+            return False
+        return True
+
     def _move_ackermann_feedback_actor(
         self,
         actor_id,
@@ -917,6 +1095,7 @@ class TeraSimCoSimPlugin(BasePlugin):
         sumo_angle,
         profile_ctx=None,
         position_z=None,
+        apply_position=True,
     ):
         current_lane_id, current_lane_candidates = (
             self._get_ackermann_feedback_current_lane_candidate(actor_id, profile_ctx)
@@ -1057,15 +1236,16 @@ class TeraSimCoSimPlugin(BasePlugin):
             }
             return None
 
-        self._profile_feedback_command_call(
-            profile_ctx,
-            "traci",
-            "vehicle_move_to",
-            traci.vehicle.moveTo,
-            actor_id,
-            projection["lane_id"],
-            projection["lane_position"],
-        )
+        if apply_position:
+            self._profile_feedback_command_call(
+                profile_ctx,
+                "traci",
+                "vehicle_move_to",
+                traci.vehicle.moveTo,
+                actor_id,
+                projection["lane_id"],
+                projection["lane_position"],
+            )
         self.logger.debug(
             "Ackermann feedback moveTo actor=%s lane=%s lanePos=%.3f "
             "distance=%.3f headingError=%.3f%s",
@@ -1085,6 +1265,7 @@ class TeraSimCoSimPlugin(BasePlugin):
         sumo_angle,
         profile_ctx=None,
         position_z=None,
+        apply_position=True,
     ):
         """Mirror a lane change without allowing free network remapping."""
         current_lane_id, current_edge_id, current_edge_candidates = (
@@ -1258,15 +1439,16 @@ class TeraSimCoSimPlugin(BasePlugin):
             }
             return None
 
-        self._profile_feedback_command_call(
-            profile_ctx,
-            "traci",
-            "vehicle_move_to_lane_change",
-            traci.vehicle.moveTo,
-            actor_id,
-            projection["lane_id"],
-            projection["lane_position"],
-        )
+        if apply_position:
+            self._profile_feedback_command_call(
+                profile_ctx,
+                "traci",
+                "vehicle_move_to_lane_change",
+                traci.vehicle.moveTo,
+                actor_id,
+                projection["lane_id"],
+                projection["lane_position"],
+            )
         self.logger.debug(
             "Ackermann feedback moveTo lane-change actor=%s lane=%s lanePos=%.3f "
             "position=(%.3f, %.3f, %s) angle=%.3f "
@@ -1909,6 +2091,25 @@ class TeraSimCoSimPlugin(BasePlugin):
         cache[lane_id] = immutable_shape
         return immutable_shape
 
+    def _get_lane_length(self, lane_id, profile_ctx=None):
+        if not lane_id:
+            return None
+        cache = getattr(self, "lane_length_cache", None)
+        if cache is None:
+            cache = {}
+            self.lane_length_cache = cache
+        if lane_id in cache:
+            return cache[lane_id]
+        lane_length = self._profile_detail_traci_call(
+            profile_ctx,
+            "lane_get_length",
+            traci.lane.getLength,
+            lane_id,
+        )
+        lane_length = self._as_finite_float(lane_length)
+        cache[lane_id] = lane_length
+        return lane_length
+
     def _populate_lane_relative_position(
         self,
         vehicle_id,
@@ -1919,11 +2120,15 @@ class TeraSimCoSimPlugin(BasePlugin):
         if not self.lane_relative_position_enabled:
             return
 
+        force_live_lane_state = bool(
+            self._uses_external_state_assimilation()
+            and vehicle_id in getattr(self, "feedback_observed_speeds", {})
+        )
         context_values = context_values or {}
         has_lane_id, lane_id = self._context_vehicle_value(
             context_values, "VAR_LANE_ID"
         )
-        if not has_lane_id:
+        if force_live_lane_state or not has_lane_id or not lane_id:
             lane_id = self._profile_detail_traci_call(
                 profile_ctx,
                 "vehicle_get_lane_id",
@@ -1936,7 +2141,7 @@ class TeraSimCoSimPlugin(BasePlugin):
         has_lane_position, lane_position = self._context_vehicle_value(
             context_values, "VAR_LANEPOSITION"
         )
-        if not has_lane_position:
+        if force_live_lane_state or not has_lane_position:
             lane_position = self._profile_detail_traci_call(
                 profile_ctx,
                 "vehicle_get_lane_position",
@@ -1946,7 +2151,7 @@ class TeraSimCoSimPlugin(BasePlugin):
         has_lateral_offset, lateral_offset = self._context_vehicle_value(
             context_values, "VAR_LANEPOSITION_LAT"
         )
-        if not has_lateral_offset:
+        if force_live_lane_state or not has_lateral_offset:
             lateral_offset = self._profile_detail_traci_call(
                 profile_ctx,
                 "vehicle_get_lateral_lane_position",
@@ -1954,6 +2159,10 @@ class TeraSimCoSimPlugin(BasePlugin):
                 vehicle_id,
             )
         lane_shape = self._get_lookahead_lane_shape(lane_id, profile_ctx=profile_ctx)
+        try:
+            lane_length = self._get_lane_length(lane_id, profile_ctx=profile_ctx)
+        except Exception:
+            lane_length = None
         reconstructed = self._profile_detail_python_call(
             profile_ctx,
             "reconstruct_lane_relative_position",
@@ -1962,6 +2171,7 @@ class TeraSimCoSimPlugin(BasePlugin):
             lane_position,
             lateral_offset,
             vehicle_state.z,
+            lane_length,
         )
 
         vehicle_state.lane_id = lane_id
@@ -2719,6 +2929,11 @@ class TeraSimCoSimPlugin(BasePlugin):
                                 command.agent_id,
                             )
                         use_move_to = is_ackermann_feedback
+                        use_external_state = (
+                            is_ackermann_feedback
+                            and self._uses_external_state_assimilation()
+                        )
+                        external_state_applied = False
                         lane_index = 0
                         keep_route = 0
                         log_lane_transition = is_ackermann_feedback and getattr(
@@ -2766,6 +2981,7 @@ class TeraSimCoSimPlugin(BasePlugin):
                                 position_z=self._as_finite_float(
                                     command.data.get("position_z")
                                 ),
+                                apply_position=not use_external_state,
                             )
                             if projection is None:
                                 if not self._should_continue_after_agent_command_failure():
@@ -2774,9 +2990,23 @@ class TeraSimCoSimPlugin(BasePlugin):
                                     "feedback_moveTo_lane_change_skipped"
                                 )
                             else:
-                                feedback_move_source = (
-                                    "feedback_moveTo_lane_change"
-                                )
+                                if use_external_state:
+                                    external_state_applied = (
+                                        self._apply_ackermann_feedback_external_state(
+                                            command.agent_id,
+                                            (x, y),
+                                            command.data.get("sumo_angle", 0),
+                                            command.data.get("speed"),
+                                            command.data.get("acceleration", 0.0),
+                                            projection,
+                                            profile_ctx=profile_ctx,
+                                        )
+                                    )
+                                    if not external_state_applied:
+                                        return False
+                                    feedback_move_source = "feedback_external_state_lane_change"
+                                else:
+                                    feedback_move_source = "feedback_moveTo_lane_change"
                             getattr(
                                 self, "feedback_observed_lane_progress", {}
                             ).pop(
@@ -2791,6 +3021,7 @@ class TeraSimCoSimPlugin(BasePlugin):
                                 position_z=self._as_finite_float(
                                     command.data.get("position_z")
                                 ),
+                                apply_position=not use_external_state,
                             )
                             if projection is None:
                                 if not self._should_continue_after_agent_command_failure():
@@ -2799,10 +3030,24 @@ class TeraSimCoSimPlugin(BasePlugin):
                                 # still apply the observed CARLA speed below.
                                 feedback_move_source = "feedback_moveTo_skipped"
                             else:
-                                feedback_move_source = "feedback_moveTo"
-                                if not hasattr(
-                                    self, "feedback_observed_lane_progress"
-                                ):
+                                if use_external_state:
+                                    external_state_applied = (
+                                        self._apply_ackermann_feedback_external_state(
+                                            command.agent_id,
+                                            (x, y),
+                                            command.data.get("sumo_angle", 0),
+                                            command.data.get("speed"),
+                                            command.data.get("acceleration", 0.0),
+                                            projection,
+                                            profile_ctx=profile_ctx,
+                                        )
+                                    )
+                                    if not external_state_applied:
+                                        return False
+                                    feedback_move_source = "feedback_external_state"
+                                else:
+                                    feedback_move_source = "feedback_moveTo"
+                                if not hasattr(self, "feedback_observed_lane_progress"):
                                     self.feedback_observed_lane_progress = {}
                                 lane_geometry = getattr(
                                     self, "feedback_lane_geometry_cache", {}
@@ -2884,14 +3129,15 @@ class TeraSimCoSimPlugin(BasePlugin):
 
                         if "speed" in command.data:
                             if is_ackermann_feedback:
-                                self._profile_feedback_command_call(
-                                    profile_ctx,
-                                    "traci",
-                                    "vehicle_set_previous_speed",
-                                    traci.vehicle.setPreviousSpeed,
-                                    command.agent_id,
-                                    command.data["speed"],
-                                )
+                                if not external_state_applied:
+                                    self._profile_feedback_command_call(
+                                        profile_ctx,
+                                        "traci",
+                                        "vehicle_set_previous_speed",
+                                        traci.vehicle.setPreviousSpeed,
+                                        command.agent_id,
+                                        command.data["speed"],
+                                    )
                             else:
                                 traci.vehicle.setPreviousSpeed(
                                     command.agent_id, command.data["speed"]

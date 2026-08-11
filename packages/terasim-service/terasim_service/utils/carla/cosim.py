@@ -371,7 +371,11 @@ class CarlaCosim(object):
             )
         self.use_lane_relative_position = _env_bool(
             "CARLA_COSIM_USE_LANE_RELATIVE_POSITION",
-            bool(getattr(args, "use_lane_relative_position", False)),
+            bool(getattr(args, "use_lane_relative_position", False))
+            or os.environ.get(
+                "CARLA_COSIM_ACKERMANN_FEEDBACK_ASSIMILATION_MODE", "legacy"
+            ).strip().lower()
+            == "external_state",
         )
         if self.use_lane_relative_position:
             print("CARLA co-sim lane-relative reconstructed positions enabled.", flush=True)

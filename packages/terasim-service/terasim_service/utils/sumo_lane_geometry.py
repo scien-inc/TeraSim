@@ -599,6 +599,7 @@ def reconstruct_position_from_lane_geometry(
     lane_position: float,
     lateral_offset: float,
     z: float = 0.0,
+    lane_length: float | None = None,
 ):
     """Reconstruct a SUMO x/y/z position from lane-relative coordinates."""
     if not lane_shape or len(lane_shape) < 2:
@@ -609,15 +610,28 @@ def reconstruct_position_from_lane_geometry(
         target_distance = max(0.0, float(lane_position))
         lateral_offset = float(lateral_offset)
         z = float(z)
+        lane_length = None if lane_length is None else float(lane_length)
     except (TypeError, ValueError, IndexError):
         return None
 
+    segments = []
+    shape_length = 0.0
+    for start, end in zip(points, points[1:]):
+        segment_length = math.hypot(end[0] - start[0], end[1] - start[1])
+        segments.append((start, end, segment_length))
+        shape_length += segment_length
+    if lane_length is not None and lane_length > 0.0 and shape_length > 0.0:
+        # SUMO lanePosition uses the lane's declared length. Repaired or
+        # simplified lane shapes may have a different polyline length, so use
+        # normalized lane progress rather than treating both metres as equal.
+        progress = min(1.0, target_distance / lane_length)
+        target_distance = progress * shape_length
+
     travelled = 0.0
     last_segment = None
-    for start, end in zip(points, points[1:]):
+    for start, end, segment_length in segments:
         dx = end[0] - start[0]
         dy = end[1] - start[1]
-        segment_length = math.hypot(dx, dy)
         if segment_length <= 0.0:
             continue
         last_segment = (start, dx, dy, segment_length)
