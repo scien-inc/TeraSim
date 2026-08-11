@@ -12,6 +12,10 @@ class AckermannTuning:
     kp_position: float = 0.15
     max_accel: float = 3.0
     max_decel: float = 6.0
+    restart_enter_speed: float = 0.05
+    restart_release_speed: float = 0.2
+    restart_speed_epsilon: float = 1e-3
+    restart_max_target_speed: float = 0.3
 
 
 @dataclass(frozen=True)
