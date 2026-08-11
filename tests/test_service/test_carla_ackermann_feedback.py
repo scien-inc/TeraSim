@@ -2870,6 +2870,129 @@ def test_ackermann_feedback_uses_same_tick_position_speed_and_acceleration():
     )
     assert acceleration == pytest.approx(1.735)
     assert target == pytest.approx(1.7)
+    assert cosim._ackermann_actor_state["AV"]["restart_active"] is False
+    assert "restart_target_speed" not in cosim._ackermann_actor_state["AV"]
+
+
+def _make_ackermann_restart_test_cosim(actor_id):
+    install_fake_carla()
+    from terasim_service.utils.carla.ackermann_control import AckermannTuning
+    from terasim_service.utils.carla.cosim import CarlaCosim
+
+    cosim = CarlaCosim.__new__(CarlaCosim)
+    cosim.ackermann_feedback_apply_enabled = True
+    if actor_id == "AV":
+        cosim.ackermann_feedback_actor_ids = {"AV"}
+        cosim.ackermann_feedback_all_background_actors = False
+    else:
+        cosim.ackermann_feedback_actor_ids = {"*"}
+        cosim.ackermann_feedback_all_background_actors = True
+    cosim.step_length = 0.05
+    cosim.ackermann_tuning = AckermannTuning()
+    cosim._ackermann_actor_state = {}
+    return cosim
+
+
+@pytest.mark.parametrize("actor_id", ["AV", "vehicle123"])
+def test_ackermann_restart_target_accumulates_for_av_and_background(actor_id):
+    cosim = _make_ackermann_restart_test_cosim(actor_id)
+    veh_info = {
+        "speed": 0.092,
+        "sumo_desired_speed": 0.092,
+        "feedback_observed_speed": 0.0,
+        "acceleration": 1.84,
+    }
+
+    targets = [
+        cosim._resolve_ackermann_longitudinal_target(
+            actor_id,
+            veh_info,
+            current_speed=0.0,
+        )[0]
+        for _ in range(4)
+    ]
+
+    assert targets == pytest.approx([0.092, 0.184, 0.276, 0.3])
+    assert cosim._ackermann_actor_state[actor_id]["restart_active"] is True
+    assert cosim._ackermann_actor_state[actor_id]["restart_target_speed"] == pytest.approx(
+        0.3
+    )
+
+
+@pytest.mark.parametrize("actor_id", ["AV", "vehicle123"])
+def test_ackermann_restart_target_is_held_until_carla_reaches_release_speed(actor_id):
+    cosim = _make_ackermann_restart_test_cosim(actor_id)
+    cosim._ackermann_actor_state = {
+        actor_id: {
+            "restart_active": True,
+            "restart_target_speed": 0.276,
+        }
+    }
+
+    held_target, _acceleration = cosim._resolve_ackermann_longitudinal_target(
+        actor_id,
+        {
+            "speed": 0.192,
+            "sumo_desired_speed": 0.192,
+            "feedback_observed_speed": 0.1,
+            "acceleration": 1.84,
+        },
+        current_speed=0.1,
+    )
+    assert held_target == pytest.approx(0.276)
+    assert cosim._ackermann_actor_state[actor_id]["restart_active"] is True
+
+    released_target, _acceleration = cosim._resolve_ackermann_longitudinal_target(
+        actor_id,
+        {
+            "speed": 0.292,
+            "sumo_desired_speed": 0.292,
+            "feedback_observed_speed": 0.2,
+            "acceleration": 1.84,
+        },
+        current_speed=0.2,
+    )
+    assert released_target == pytest.approx(0.292)
+    assert cosim._ackermann_actor_state[actor_id]["restart_active"] is False
+    assert "restart_target_speed" not in cosim._ackermann_actor_state[actor_id]
+
+
+@pytest.mark.parametrize("actor_id", ["AV", "vehicle123"])
+@pytest.mark.parametrize(
+    ("sumo_next_speed", "requested_acceleration"),
+    [
+        (0.0, 1.0),
+        (0.05, 0.0),
+        (0.05, -1.0),
+    ],
+)
+def test_ackermann_restart_is_cancelled_by_sumo_stop_or_deceleration(
+    actor_id,
+    sumo_next_speed,
+    requested_acceleration,
+):
+    cosim = _make_ackermann_restart_test_cosim(actor_id)
+    cosim._ackermann_actor_state = {
+        actor_id: {
+            "restart_active": True,
+            "restart_target_speed": 0.276,
+        }
+    }
+
+    target, _acceleration = cosim._resolve_ackermann_longitudinal_target(
+        actor_id,
+        {
+            "speed": sumo_next_speed,
+            "sumo_desired_speed": sumo_next_speed,
+            "feedback_observed_speed": 0.0,
+            "acceleration": requested_acceleration,
+        },
+        current_speed=0.0,
+    )
+
+    assert target == pytest.approx(sumo_next_speed)
+    assert cosim._ackermann_actor_state[actor_id]["restart_active"] is False
+    assert "restart_target_speed" not in cosim._ackermann_actor_state[actor_id]
 
 
 def test_ackermann_longitudinal_error_compares_positions_at_t_plus_dt():
@@ -3187,6 +3310,8 @@ def test_ackermann_control_trace_records_sumo_command_and_carla_response(capsys)
         "AV": {
             "sumo_requested_acceleration": -7.06,
             "sumo_emergency_decel": 7.06,
+            "restart_active": True,
+            "restart_target_speed": 0.276,
             "wheel_base_m": 2.85,
             "rear_axle_local_x_m": -1.4,
             "emergency_brake_active": True,
@@ -3237,6 +3362,8 @@ def test_ackermann_control_trace_records_sumo_command_and_carla_response(capsys)
     record = json.loads(payload)
     assert prefix == "AckermannControlTrace"
     assert record["sumo_requested_acceleration"] == pytest.approx(-7.06)
+    assert record["restart_active"] is True
+    assert record["restart_target_speed"] == pytest.approx(0.276)
     assert record["ackermann_target_acceleration"] == pytest.approx(-7.06)
     assert record["control_mode"] == "emergency_brake"
     assert record["commanded_throttle"] == pytest.approx(0.0)

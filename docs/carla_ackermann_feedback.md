@@ -56,6 +56,24 @@ Ackermann speed/acceleration targets, and measured CARLA speed and longitudinal 
 CARLA braking uses the vehicle-specific SUMO `emergencyDecel` when it is available; the configured
 Ackermann maximum deceleration is the fallback.
 
+When CARLA remains in its standstill range but SUMO requests a positive next speed and positive
+acceleration, the controller accumulates a small restart speed target from SUMO's requested
+acceleration. The same logic applies to every selected feedback actor, including background
+vehicles selected by `*`. The assist is cancelled immediately when SUMO requests zero/negative
+acceleration or a zero next speed, and normal control resumes after CARLA reaches the release speed.
+
+The restart thresholds can be tuned with:
+
+```bash
+export CARLA_COSIM_ACKERMANN_RESTART_ENTER_SPEED=0.05
+export CARLA_COSIM_ACKERMANN_RESTART_RELEASE_SPEED=0.2
+export CARLA_COSIM_ACKERMANN_RESTART_SPEED_EPSILON=0.001
+export CARLA_COSIM_ACKERMANN_RESTART_MAX_TARGET_SPEED=0.3
+```
+
+`AckermannControlTrace` records `restart_active` and `restart_target_speed` while the assist is
+active.
+
 ## Constraints
 
 - CARLA must be synchronous.
