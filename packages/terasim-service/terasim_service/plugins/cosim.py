@@ -964,6 +964,68 @@ class TeraSimCoSimPlugin(BasePlugin):
                 max_distance = background_max_distance
         return max(0.0, float(max_distance))
 
+    def _project_ackermann_feedback_external_state_current_lane(
+        self,
+        actor_id,
+        position,
+        sumo_angle,
+        profile_ctx=None,
+        position_z=None,
+    ):
+        """Project CARLA state only onto the lane selected by the last SUMO step."""
+        current_lane_id, current_lane_candidates = (
+            self._get_ackermann_feedback_current_lane_candidate(actor_id, profile_ctx)
+        )
+        max_distance = self._ackermann_feedback_external_state_match_threshold(actor_id)
+        max_elevation_error = getattr(
+            self,
+            "ackermann_feedback_max_elevation_error",
+            2.0,
+        )
+        projection = self._profile_feedback_command_call(
+            profile_ctx,
+            "python",
+            "external_state_current_lane_projection",
+            select_route_aware_lane_projection,
+            position,
+            sumo_angle,
+            current_lane_candidates,
+            position_z=position_z,
+            current_lane_id=current_lane_id,
+            max_distance=max_distance,
+            max_elevation_error=max_elevation_error,
+            max_heading_error=180.0,
+            prefer_current_lane=True,
+        )
+        if projection is not None:
+            return projection
+
+        self.last_agent_command_failure = {
+            "actor_id": actor_id,
+            "reason": "ackermann_feedback_external_state_current_lane_mapping_failed",
+            "ackermann_feedback": True,
+            "position": [position[0], position[1]],
+            "position_z": position_z,
+            "sumo_angle": sumo_angle,
+            "current_lane_id": current_lane_id,
+            "candidate_lane_ids": [
+                candidate["lane_id"] for candidate in current_lane_candidates
+            ],
+        }
+        self.logger.error(
+            "Ackermann feedback external_state current-lane mapping failed "
+            "actor=%s position=(%.3f, %.3f, %s) angle=%.3f "
+            "currentLane=%s threshold=%.3f",
+            actor_id,
+            position[0],
+            position[1],
+            position_z,
+            sumo_angle,
+            current_lane_id,
+            max_distance,
+        )
+        return None
+
     def _apply_ackermann_feedback_external_state(
         self,
         actor_id,
@@ -992,11 +1054,17 @@ class TeraSimCoSimPlugin(BasePlugin):
         acceleration = self._as_finite_float(acceleration)
         edge_id = projection.get("edge_id", "")
         lane_index = projection.get("lane_index", -1)
+        lane_id = projection.get("lane_id", "")
         if speed is None or speed < 0.0:
             failure_reason = "ackermann_feedback_external_state_invalid_speed"
         elif acceleration is None:
             failure_reason = "ackermann_feedback_external_state_invalid_acceleration"
-        elif not edge_id or not isinstance(lane_index, int) or lane_index < 0:
+        elif (
+            not lane_id
+            or not edge_id
+            or not isinstance(lane_index, int)
+            or lane_index < 0
+        ):
             failure_reason = "ackermann_feedback_external_state_invalid_lane_hint"
         else:
             failure_reason = None
@@ -1035,6 +1103,7 @@ class TeraSimCoSimPlugin(BasePlugin):
                 acceleration,
                 1,
                 self._ackermann_feedback_external_state_match_threshold(actor_id),
+                True,
             )
         except Exception as exc:
             self.last_agent_command_failure = {
@@ -1057,6 +1126,7 @@ class TeraSimCoSimPlugin(BasePlugin):
         observed_position = traci.vehicle.getPosition(actor_id)
         observed_angle = traci.vehicle.getAngle(actor_id)
         observed_speed = traci.vehicle.getSpeed(actor_id)
+        observed_lane_id = traci.vehicle.getLaneID(actor_id)
         position_error = math.hypot(
             observed_position[0] - position[0],
             observed_position[1] - position[1],
@@ -1072,6 +1142,7 @@ class TeraSimCoSimPlugin(BasePlugin):
             and position_error <= position_tolerance
             and angle_error <= 1e-6
             and abs(observed_speed - speed) <= 1e-6
+            and observed_lane_id == lane_id
         )
         if not state_matches:
             self.last_agent_command_failure = {
@@ -1084,16 +1155,21 @@ class TeraSimCoSimPlugin(BasePlugin):
                 "position_tolerance": position_tolerance,
                 "angle_error": angle_error,
                 "speed_error": abs(observed_speed - speed),
+                "requested_lane_id": lane_id,
+                "observed_lane_id": observed_lane_id,
             }
             self.logger.error(
                 "Ackermann feedback external_state validation failed actor=%s "
-                "time=%s->%s positionError=%.9f angleError=%.9f speedError=%.9f",
+                "time=%s->%s positionError=%.9f angleError=%.9f "
+                "speedError=%.9f lane=%s->%s",
                 actor_id,
                 phase_a_time,
                 observed_time,
                 position_error,
                 angle_error,
                 abs(observed_speed - speed),
+                lane_id,
+                observed_lane_id,
             )
             return False
         return True
@@ -2992,7 +3068,7 @@ class TeraSimCoSimPlugin(BasePlugin):
                             self, "feedback_lane_change_active_actor_ids", set()
                         )
                         position_feedback_start = time.perf_counter()
-                        if use_move_to and lane_change_active:
+                        if use_move_to and lane_change_active and not use_external_state:
                             projection = self._move_ackermann_feedback_actor_exact(
                                 command.agent_id,
                                 (x, y),
@@ -3001,7 +3077,7 @@ class TeraSimCoSimPlugin(BasePlugin):
                                 position_z=self._as_finite_float(
                                     command.data.get("position_z")
                                 ),
-                                apply_position=not use_external_state,
+                                apply_position=True,
                             )
                             if projection is None:
                                 if not self._should_continue_after_agent_command_failure():
@@ -3010,39 +3086,36 @@ class TeraSimCoSimPlugin(BasePlugin):
                                     "feedback_moveTo_lane_change_skipped"
                                 )
                             else:
-                                if use_external_state:
-                                    external_state_applied = (
-                                        self._apply_ackermann_feedback_external_state(
-                                            command.agent_id,
-                                            (x, y),
-                                            command.data.get("sumo_angle", 0),
-                                            command.data.get("speed"),
-                                            command.data.get("acceleration", 0.0),
-                                            projection,
-                                            profile_ctx=profile_ctx,
-                                        )
-                                    )
-                                    if not external_state_applied:
-                                        return False
-                                    feedback_move_source = "feedback_external_state_lane_change"
-                                else:
-                                    feedback_move_source = "feedback_moveTo_lane_change"
+                                feedback_move_source = "feedback_moveTo_lane_change"
                             getattr(
                                 self, "feedback_observed_lane_progress", {}
                             ).pop(
                                 command.agent_id, None
                             )
                         elif use_move_to:
-                            projection = self._move_ackermann_feedback_actor(
-                                command.agent_id,
-                                (x, y),
-                                command.data.get("sumo_angle", 0),
-                                profile_ctx=profile_ctx,
-                                position_z=self._as_finite_float(
-                                    command.data.get("position_z")
-                                ),
-                                apply_position=not use_external_state,
-                            )
+                            if use_external_state:
+                                projection = (
+                                    self._project_ackermann_feedback_external_state_current_lane(
+                                        command.agent_id,
+                                        (x, y),
+                                        command.data.get("sumo_angle", 0),
+                                        profile_ctx=profile_ctx,
+                                        position_z=self._as_finite_float(
+                                            command.data.get("position_z")
+                                        ),
+                                    )
+                                )
+                            else:
+                                projection = self._move_ackermann_feedback_actor(
+                                    command.agent_id,
+                                    (x, y),
+                                    command.data.get("sumo_angle", 0),
+                                    profile_ctx=profile_ctx,
+                                    position_z=self._as_finite_float(
+                                        command.data.get("position_z")
+                                    ),
+                                    apply_position=True,
+                                )
                             if projection is None:
                                 if not self._should_continue_after_agent_command_failure():
                                     return False

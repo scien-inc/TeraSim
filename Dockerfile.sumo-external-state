@@ -57,7 +57,7 @@ FROM ${TERASIM_BASE_IMAGE}
 ARG DEBIAN_FRONTEND=noninteractive
 
 LABEL org.opencontainers.image.title="TeraSim SUMO setExternalState build" \
-      org.opencontainers.image.version="SUMO-v1.23.1-external-state-4" \
+      org.opencontainers.image.version="SUMO-v1.23.1-external-state-5" \
       org.opencontainers.image.source="https://github.com/eclipse-sumo/sumo" \
       org.opencontainers.image.revision="676720d13f6f42d8c79d156e9d67001f8c22f6f6"
 
