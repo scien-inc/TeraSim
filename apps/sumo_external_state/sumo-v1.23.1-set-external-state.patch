@@ -45,7 +45,9 @@ diff --git a/src/libsumo/Vehicle.cpp b/src/libsumo/Vehicle.cpp
 index 239ef17be1f94ad7bba940da58b3e3dfb13aa22e..1cb39dff51369962aa7e26a8c1691f4ce85e6730 100644
 --- a/src/libsumo/Vehicle.cpp
 +++ b/src/libsumo/Vehicle.cpp
-@@ -1837,0 +1838,80 @@ Vehicle::moveToXY(const std::string& vehID, const std::string& edgeID, const int
+@@ -21,0 +22 @@
++#include <cmath>
+@@ -1837,0 +1839,97 @@ Vehicle::moveToXY(const std::string& vehID, const std::string& edgeID, const int
 +void
 +Vehicle::setExternalState(const std::string& vehID, const std::string& edgeID, const int laneIndex,
 +                          const double x, const double y, double angle, double speed, double acceleration,
@@ -85,8 +87,15 @@ index 239ef17be1f94ad7bba940da58b3e3dfb13aa22e..1cb39dff51369962aa7e26a8c1691f4c
 +        pos.setz(veh->getPosition().z());
 +        const double geometryPos = hintLane->getShape().nearest_offset_to_point2D(pos, false);
 +        const double bestDistance = hintLane->getShape().distance2D(pos, false);
++        const Position extendedCoordinates =
++            hintLane->getShape().transformToVectorCoordinates(pos, true);
++        const double shapeLength = hintLane->getShape().length2D();
 +        if (geometryPos == GeomHelper::INVALID_OFFSET
 +                || bestDistance == GeomHelper::INVALID_OFFSET
++                || extendedCoordinates == Position::INVALID
++                || !std::isfinite(extendedCoordinates.x())
++                || !std::isfinite(extendedCoordinates.y())
++                || !std::isfinite(shapeLength)
 +                || bestDistance > matchThreshold) {
 +            throw TraCIException("Could not strictly map vehicle '" + vehID
 +                                 + "' to lane '" + hintLane->getID()
@@ -94,15 +103,26 @@ index 239ef17be1f94ad7bba940da58b3e3dfb13aa22e..1cb39dff51369962aa7e26a8c1691f4c
 +        }
 +        const double lanePos = hintLane->interpolateGeometryPosToLanePos(geometryPos);
 +        double lanePosLat = bestDistance;
-+        PositionVector leftShape = hintLane->getShape();
-+        try {
-+            leftShape.move2side(-lanePosLat);
-+        } catch (ProcessError&) {
-+            throw TraCIException("Could not determine strict external-state lateral position on lane '"
-+                                 + hintLane->getID() + "'.");
-+        }
-+        if (leftShape.distance2D(pos) > bestDistance) {
-+            lanePosLat = -lanePosLat;
++        const bool projectsToStart = geometryPos <= POSITION_EPS;
++        const bool projectsToEnd = geometryPos >= shapeLength - POSITION_EPS;
++        const bool outsideLongitudinalRange =
++            (projectsToStart && extendedCoordinates.x() < -NUMERICAL_EPS)
++            || (projectsToEnd && extendedCoordinates.x() > shapeLength + NUMERICAL_EPS);
++        if (outsideLongitudinalRange) {
++            // nearest_offset_to_point2D clamps to a finite shape endpoint.
++            // Keep endpoint overrun longitudinal instead of rotating it into posLat.
++            lanePosLat = -extendedCoordinates.y();
++        } else {
++            PositionVector leftShape = hintLane->getShape();
++            try {
++                leftShape.move2side(-lanePosLat);
++            } catch (ProcessError&) {
++                throw TraCIException("Could not determine strict external-state lateral position on lane '"
++                                     + hintLane->getID() + "'.");
++            }
++            if (leftShape.distance2D(pos) > bestDistance) {
++                lanePosLat = -lanePosLat;
++            }
 +        }
 +        if (angle != INVALID_DOUBLE_VALUE) {
 +            while (angle >= 360.) {
