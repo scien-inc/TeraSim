@@ -177,6 +177,31 @@ def _write_odaiba_edge0_route(
     return network_path, routes_path
 
 
+def _write_odaiba_edge32_lane_change_route(
+    tmp_path: Path, *, vehicle_id: str
+) -> tuple[Path, Path]:
+    network_path = _odaiba_network_path()
+    routes_path = tmp_path / f"edge32-lane-change-{vehicle_id}.rou.xml"
+    routes_path.write_text(
+        textwrap.dedent(
+            f"""\
+            <routes>
+                <vType id="car" accel="2.6" decel="4.5" emergencyDecel="9"
+                       sigma="0" length="5" width="1.8" maxSpeed="13.889"
+                       laneChangeModel="SL2015"/>
+                <route id="route" edges="edge_32 edge_35 edge_1517"/>
+                <vehicle id="{vehicle_id}" type="car" route="route" depart="0"
+                         departLane="1" departPos="20" departSpeed="0"/>
+                <vehicle id="blocker" type="car" route="route" depart="0"
+                         departLane="2" departPos="18" departSpeed="0"/>
+            </routes>
+            """
+        ),
+        encoding="utf-8",
+    )
+    return network_path, routes_path
+
+
 def _write_junction_network(
     tmp_path: Path, netconvert: str, *, vehicle_id: str
 ) -> tuple[Path, Path]:
@@ -648,6 +673,173 @@ def test_external_state_edge426_lane_boundary_has_no_phase_b_warp(
 def _current_lane_hint(traci, vehicle_id: str) -> tuple[str, int, str]:
     lane_id = traci.vehicle.getLaneID(vehicle_id)
     return traci.lane.getEdgeID(lane_id), int(lane_id.rsplit("_", 1)[1]), lane_id
+
+
+@pytest.mark.parametrize("vehicle_id", ["AV", "BV"])
+@pytest.mark.integration
+@pytest.mark.requires_sumo
+def test_strict_external_state_preserves_strategic_lane_change_until_gap_opens(
+    tmp_path: Path, vehicle_id: str
+) -> None:
+    """A blocked route-required lane change completes after its gap opens."""
+    traci = pytest.importorskip("traci")
+    if not hasattr(traci.vehicle, "setExternalState"):
+        pytest.skip("requires the dedicated SUMO setExternalState build")
+
+    sumo = _find_binary("sumo")
+    network_path, routes_path = _write_odaiba_edge32_lane_change_route(
+        tmp_path, vehicle_id=vehicle_id
+    )
+    traci.start(
+        [
+            sumo,
+            "--net-file",
+            str(network_path),
+            "--route-files",
+            str(routes_path),
+            "--step-length",
+            str(STEP_LENGTH),
+            "--lateral-resolution",
+            "0.5",
+            "--no-step-log",
+            "true",
+            "--duration-log.disable",
+            "true",
+        ],
+        numRetries=5,
+    )
+    try:
+        traci.simulationStep()
+        assert set(traci.vehicle.getIDList()) == {vehicle_id, "blocker"}
+        assert traci.vehicle.getLaneID(vehicle_id) == "edge_32_1"
+        assert traci.vehicle.getLaneID("blocker") == "edge_32_2"
+        traci.vehicle.setSpeed("blocker", 0.0)
+        for tls_id in traci.trafficlight.getIDList():
+            state = traci.trafficlight.getRedYellowGreenState(tls_id)
+            traci.trafficlight.setRedYellowGreenState(tls_id, "G" * len(state))
+
+        lane_shape = traci.lane.getShape("edge_32_1")
+        lane_length = traci.lane.getLength("edge_32_1")
+        target = _position_at_declared_lane_offset(lane_shape, lane_length, 20.0)
+        next_target = _position_at_declared_lane_offset(
+            lane_shape, lane_length, 20.1
+        )
+        target_angle = math.degrees(
+            math.atan2(
+                next_target[0] - target[0],
+                next_target[1] - target[1],
+            )
+        ) % 360.0
+
+        for _cycle in range(20):
+            phase_a_time = traci.simulation.getTime()
+            traci.vehicle.setExternalState(
+                vehicle_id,
+                "edge_32",
+                1,
+                target[0],
+                target[1],
+                target_angle,
+                8.0,
+                0.0,
+                keepRoute=1,
+                matchThreshold=10.0,
+                strictLaneHint=True,
+            )
+            assert traci.simulation.getTime() == phase_a_time
+            assert traci.vehicle.getLaneID(vehicle_id) == "edge_32_1"
+
+            traci.simulationStep()
+
+            assert traci.simulation.getTime() == pytest.approx(
+                phase_a_time + STEP_LENGTH
+            )
+            assert traci.vehicle.getLaneID(vehicle_id) == "edge_32_1"
+            lane_change_state = str(
+                traci.vehicle.getLaneChangeStatePretty(vehicle_id, 1)
+            ).lower()
+            assert "strategic" in lane_change_state
+            assert "urgent" in lane_change_state
+            assert "blocked by left follower" in lane_change_state
+
+        traci.vehicle.remove("blocker")
+        changed_phase_b = None
+        phase_b_state = (
+            traci.vehicle.getPosition(vehicle_id),
+            traci.vehicle.getAngle(vehicle_id),
+            traci.vehicle.getSpeed(vehicle_id),
+            traci.vehicle.getLaneID(vehicle_id),
+        )
+        for release_cycle in range(80):
+            edge_id, lane_index, lane_id = _current_lane_hint(traci, vehicle_id)
+            phase_a_time = traci.simulation.getTime()
+            traci.vehicle.setExternalState(
+                vehicle_id,
+                edge_id,
+                lane_index,
+                phase_b_state[0][0],
+                phase_b_state[0][1],
+                phase_b_state[1],
+                phase_b_state[2],
+                0.0,
+                keepRoute=1,
+                matchThreshold=10.0,
+                strictLaneHint=True,
+            )
+            assert traci.simulation.getTime() == phase_a_time
+            assert traci.vehicle.getLaneID(vehicle_id) == lane_id
+            assert math.dist(
+                traci.vehicle.getPosition(vehicle_id), phase_b_state[0]
+            ) < POSITION_TOLERANCE
+
+            traci.simulationStep()
+            assert traci.simulation.getTime() == pytest.approx(
+                phase_a_time + STEP_LENGTH
+            )
+            phase_b_state = (
+                traci.vehicle.getPosition(vehicle_id),
+                traci.vehicle.getAngle(vehicle_id),
+                traci.vehicle.getSpeed(vehicle_id),
+                traci.vehicle.getLaneID(vehicle_id),
+            )
+            if phase_b_state[3] == "edge_32_2":
+                changed_phase_b = release_cycle
+                break
+
+        assert changed_phase_b is not None, {
+            "vehicles": traci.vehicle.getIDList(),
+            "lane": traci.vehicle.getLaneID(vehicle_id),
+            "left_state": traci.vehicle.getLaneChangeStatePretty(vehicle_id, 1),
+            "right_state": traci.vehicle.getLaneChangeStatePretty(vehicle_id, -1),
+            "best_lanes": traci.vehicle.getBestLanes(vehicle_id),
+        }
+
+        phase_a_time = traci.simulation.getTime()
+        traci.vehicle.setExternalState(
+            vehicle_id,
+            "edge_32",
+            2,
+            phase_b_state[0][0],
+            phase_b_state[0][1],
+            phase_b_state[1],
+            phase_b_state[2],
+            0.0,
+            keepRoute=1,
+            matchThreshold=10.0,
+            strictLaneHint=True,
+        )
+        assert traci.simulation.getTime() == phase_a_time
+        assert traci.vehicle.getLaneID(vehicle_id) == "edge_32_2"
+        assert math.dist(
+            traci.vehicle.getPosition(vehicle_id), phase_b_state[0]
+        ) < POSITION_TOLERANCE
+        traci.simulationStep()
+        assert traci.simulation.getTime() == pytest.approx(
+            phase_a_time + STEP_LENGTH
+        )
+        assert traci.vehicle.getLaneID(vehicle_id) == "edge_32_2"
+    finally:
+        traci.close()
 
 
 @pytest.mark.parametrize("vehicle_id", ["AV", "BV"])
