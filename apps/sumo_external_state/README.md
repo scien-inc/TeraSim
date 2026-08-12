@@ -24,15 +24,19 @@ traci.vehicle.setExternalState(
     acceleration,
     keepRoute=1,
     matchThreshold=100,
+    strictLaneHint=False,
 )
 ```
 
-The setter reuses SUMO's `moveToXY` mapping, immediately applies the queued
-remote state for that vehicle, removes it from the global post-move queue, and
-retires the same-timestamp remote-control latch. It also clears any older
-TraCI `setSpeed` timeline before setting the assimilated speed and acceleration,
-so Phase B starts from the external state. TeraSim/NADE may install a new speed
-action after Phase A. Normal `moveToXY` behavior is unchanged.
+With the default `strictLaneHint=False`, the setter retains the original
+`moveToXY` matching path. With `strictLaneHint=True`, it projects lane position
+and lateral offset only against the supplied current lane, rejects invalid or
+stale route lanes and threshold violations, and never rematches an adjacent,
+predecessor, or different internal lane. Both paths immediately apply the
+remote state, remove it from the global post-move queue, retire the
+same-timestamp remote-control latch, clear stale lane-change state, and release
+any older TraCI `setSpeed` timeline before setting speed and acceleration.
+Normal `moveToXY` behavior is unchanged.
 
 Before releasing the remote-control latch, the dedicated completion path
 separates the lane-change model's lane-index-relative lateral coordinate from
@@ -86,10 +90,10 @@ docker run --rm \
 The TeraSim gate executes Phase A at priority `-90`, observes and plans at
 priority `0` (including `executeMove`), and calls the ordinary 0.05-second
 `simulationStep` once at priority `10`. It repeats 12 cycles and rejects large
-position corrections or speed/yaw oscillation. The same test file also runs an
-80-cycle one-vehicle regression on Odaiba `edge_426`, crossing the lane 1/2
-boundary while injecting a stale lane-0 request. The Phase B displacement and
-next Phase A correction must both remain below `1.2 m`.
+position corrections or speed/yaw oscillation. The same test file also runs the
+legacy 80-cycle Odaiba lane-boundary regression plus strict AV/BV gates for a
+20-cycle predecessor/internal boundary, lane-1-side poses constrained to
+`edge_426_0` with lane-0 lookahead, and the `edge_0_0 -> edge_3_0` route.
 
 Do not proceed to Odaiba until this gate passes.
 
@@ -103,12 +107,15 @@ export CARLA_COSIM_ACKERMANN_FEEDBACK_ASSIMILATION_MODE=external_state
 ```
 
 The repository default is `legacy`, which preserves the existing
-`moveTo` plus `setPreviousSpeed` behavior. In `external_state` mode the lane
-projection remains a route/elevation/distance safety check, but it does not
-move the vehicle. The handler then calls `setExternalState` once with the raw
-CARLA x/y/yaw/speed and the validated edge/lane hint.
+`moveTo` plus `setPreviousSpeed` behavior. In `external_state` mode only the
+lane selected by the preceding SUMO Phase B is projected; CARLA lateral offset
+or speed never triggers current-edge all-lane selection. The handler then calls
+`setExternalState(..., strictLaneHint=True)` with raw CARLA x/y/yaw/speed.
+A legitimate Phase B lane or route transition automatically becomes the next
+Phase A hint.
 
-Immediate time, position, angle, and speed validation is enabled by default.
+Immediate time, position, angle, speed, and primary-lane validation is enabled
+by default.
 Position readback allows 1 millimetre by default to cover CARLA float32 and
 SUMO lane-geometry reconstruction precision. Override it with
 `CARLA_COSIM_ACKERMANN_FEEDBACK_EXTERNAL_STATE_POSITION_TOLERANCE` when needed.

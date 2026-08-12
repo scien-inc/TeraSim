@@ -2082,7 +2082,8 @@ def _external_state_handler_plugin(plugin_module):
     return plugin
 
 
-def test_external_state_feedback_is_immediate_and_does_not_step(monkeypatch):
+@pytest.mark.parametrize("actor_id", ["AV", "BV"])
+def test_external_state_feedback_is_immediate_and_does_not_step(monkeypatch, actor_id):
     from terasim_service.plugins import cosim as plugin_module
 
     events = []
@@ -2093,7 +2094,7 @@ def test_external_state_feedback_is_immediate_and_does_not_step(monkeypatch):
         "speed": 0.0,
     }
     command = types.SimpleNamespace(
-        agent_id="AV",
+        agent_id=actor_id,
         agent_type="vehicle",
         command_type="set_state",
         data={
@@ -2120,6 +2121,7 @@ def test_external_state_feedback_is_immediate_and_does_not_step(monkeypatch):
         getPosition=lambda _actor_id: state["position"],
         getAngle=lambda _actor_id: state["angle"],
         getSpeed=lambda _actor_id: state["speed"],
+        getLaneID=lambda _actor_id: "road_0",
     )
     fake_simulation = types.SimpleNamespace(
         getTime=lambda: events.append(("time", state["time"])) or state["time"]
@@ -2146,16 +2148,22 @@ def test_external_state_feedback_is_immediate_and_does_not_step(monkeypatch):
             "lane_position": 41.0,
         }
 
-    plugin._move_ackermann_feedback_actor = project
+    plugin.feedback_lane_change_active_actor_ids = {actor_id}
+    plugin._project_ackermann_feedback_external_state_current_lane = project
+    plugin._move_ackermann_feedback_actor_exact = lambda *_args, **_kwargs: (
+        (_ for _ in ()).throw(
+            AssertionError("external_state must not use current-edge all-lane selection")
+        )
+    )
 
     assert plugin._handle_agent_command(b"{}") is True
     assert events[0][0] == "project"
-    assert events[0][4]["apply_position"] is False
+    assert "apply_position" not in events[0][4]
     external_calls = [event for event in events if event[0] == "external_state"]
     assert external_calls == [
         (
             "external_state",
-            ("AV", "road", 0, 41.0, 2.0, 90.0, 8.5, -1.25, 1, 8.0),
+            (actor_id, "road", 0, 41.0, 2.0, 90.0, 8.5, -1.25, 1, 8.0, True),
         )
     ]
     assert [event for event in events if event[0] == "time"] == [
@@ -2168,8 +2176,8 @@ def test_external_state_feedback_is_immediate_and_does_not_step(monkeypatch):
         "angle": 90.0,
         "speed": 8.5,
     }
-    assert plugin.feedback_observed_speeds == {"AV": 8.5}
-    assert plugin.feedback_source_carla_frames == {"AV": 101}
+    assert plugin.feedback_observed_speeds == {actor_id: 8.5}
+    assert plugin.feedback_source_carla_frames == {actor_id: 101}
 
 
 def test_external_state_validation_accepts_geometry_rounding(monkeypatch):
@@ -2181,6 +2189,7 @@ def test_external_state_validation_accepts_geometry_rounding(monkeypatch):
         getPosition=lambda _actor_id: (41.0005, 2.0),
         getAngle=lambda _actor_id: 90.0,
         getSpeed=lambda _actor_id: 8.5,
+        getLaneID=lambda _actor_id: "road_0",
     )
     monkeypatch.setattr(
         plugin_module,
@@ -2197,8 +2206,43 @@ def test_external_state_validation_accepts_geometry_rounding(monkeypatch):
         90.0,
         8.5,
         -1.25,
-        {"edge_id": "road", "lane_index": 0},
+        {"lane_id": "road_0", "edge_id": "road", "lane_index": 0},
     )
+
+
+def test_external_state_validation_fails_closed_on_lane_mismatch(monkeypatch):
+    from terasim_service.plugins import cosim as plugin_module
+
+    plugin = _external_state_handler_plugin(plugin_module)
+    fake_vehicle = types.SimpleNamespace(
+        setExternalState=lambda *_args: None,
+        getPosition=lambda _actor_id: (41.0, 2.0),
+        getAngle=lambda _actor_id: 90.0,
+        getSpeed=lambda _actor_id: 8.5,
+        getLaneID=lambda _actor_id: "road_1",
+    )
+    monkeypatch.setattr(
+        plugin_module,
+        "traci",
+        types.SimpleNamespace(
+            vehicle=fake_vehicle,
+            simulation=types.SimpleNamespace(getTime=lambda: 12.5),
+        ),
+    )
+
+    assert not plugin._apply_ackermann_feedback_external_state(
+        "AV",
+        (41.0, 2.0),
+        90.0,
+        8.5,
+        -1.25,
+        {"lane_id": "road_0", "edge_id": "road", "lane_index": 0},
+    )
+    assert plugin.last_agent_command_failure["reason"] == (
+        "ackermann_feedback_external_state_validation_failed"
+    )
+    assert plugin.last_agent_command_failure["requested_lane_id"] == "road_0"
+    assert plugin.last_agent_command_failure["observed_lane_id"] == "road_1"
 
 
 def test_external_state_mode_fails_closed_without_dedicated_api(monkeypatch):
@@ -2232,7 +2276,7 @@ def test_external_state_mode_fails_closed_without_dedicated_api(monkeypatch):
     )
 
     plugin = _external_state_handler_plugin(plugin_module)
-    plugin._move_ackermann_feedback_actor = lambda *_args, **_kwargs: {
+    plugin._project_ackermann_feedback_external_state_current_lane = lambda *_args, **_kwargs: {
         "lane_id": "road_0",
         "edge_id": "road",
         "lane_index": 0,
