@@ -282,13 +282,42 @@ diff --git a/src/microsim/lcmodels/MSAbstractLaneChangeModel.cpp b/src/microsim/
 index 3ca03b55598964b4935b2c662f1d8df5c2e5aeee..37e762a80ab3a4a9421f09fdfb1b461b5fd09076 100644
 --- a/src/microsim/lcmodels/MSAbstractLaneChangeModel.cpp
 +++ b/src/microsim/lcmodels/MSAbstractLaneChangeModel.cpp
-@@ -483,0 +484,21 @@ MSAbstractLaneChangeModel::endLaneChangeManeuver(const MSMoveReminder::Notificat
+@@ -483,0 +484,50 @@ MSAbstractLaneChangeModel::endLaneChangeManeuver(const MSMoveReminder::Notificat
 +void
 +MSAbstractLaneChangeModel::resetForExternalState() {
++    // Preserve only an active maneuver whose direction agrees with the newly
++    // assimilated physical offset. This lets a legitimate SUMO maneuver span
++    // multiple Phase A/B cycles without retaining an opposite stale request.
++    const double posLat = myVehicle.getLateralPositionOnLane();
++    const int requestedDirection = (myOwnState & LCA_LEFT) != 0
++                                   ? 1
++                                   : ((myOwnState & LCA_RIGHT) != 0 ? -1 : 0);
++    const bool unblockedSublaneManeuver = MSGlobals::gSublane
++                                          && requestedDirection != 0
++                                          && (myOwnState & LCA_BLOCKED) == 0
++                                          && fabs(mySpeedLat) > NUMERICAL_EPS;
++    const int expectedOffsetDirection = isChangingLanes()
++                                        ? (pastMidpoint()
++                                           ? -myLaneChangeDirection
++                                           : myLaneChangeDirection)
++                                        : requestedDirection;
++    const bool alignedActiveManeuver = (isChangingLanes()
++                                        || unblockedSublaneManeuver)
++                                       && (fabs(posLat) <= 0.1
++                                           || posLat * expectedOffsetDirection >= 0.);
++    if (alignedActiveManeuver) {
++        // The external yaw is authoritative, while completion, lateral speed,
++        // target reservations and memorized gaps belong to the live maneuver.
++        myAngleOffset = 0.;
++        myPreviousAngleOffset = 0.;
++        myAlreadyChanged = false;
++        updateShadowLane();
++        return;
++    }
++
 +    // The external pose is authoritative. A continuous maneuver that was
-+    // planned before assimilation must not switch the primary lane from stale
-+    // completion state during the following simulationStep. Preserve posLat
-+    // (unlike endLaneChangeManeuver) and rebuild only physical lane overlap.
++    // inconsistent with it must not switch the primary lane from stale state.
++    // Preserve posLat and rebuild only physical lane overlap.
 +    cleanupShadowLane();
 +    cleanupTargetLane();
 +    myLaneChangeCompletion = 1;
