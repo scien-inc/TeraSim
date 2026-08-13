@@ -56,8 +56,8 @@ FROM ${TERASIM_BASE_IMAGE}
 
 ARG DEBIAN_FRONTEND=noninteractive
 
-LABEL org.opencontainers.image.title="TeraSim SUMO setExternalState build" \
-      org.opencontainers.image.version="SUMO-v1.23.1-external-state-5" \
+LABEL org.opencontainers.image.title="TeraSim SUMO moveToXYImmediate build" \
+      org.opencontainers.image.version="SUMO-v1.23.1-immediate-movetoxy-1" \
       org.opencontainers.image.source="https://github.com/eclipse-sumo/sumo" \
       org.opencontainers.image.revision="676720d13f6f42d8c79d156e9d67001f8c22f6f6"
 
@@ -81,5 +81,5 @@ ENV SUMO_HOME=/opt/sumo-external-state
 ENV PATH="/opt/sumo-external-state/bin:${PATH}"
 
 RUN sumo --version \
-    && python3 -c "import traci; assert hasattr(traci.vehicle, 'setExternalState')" \
-    && python3 -c "import libsumo; assert hasattr(libsumo.vehicle, 'setExternalState')"
+    && python3 -c "import traci; assert hasattr(traci.vehicle, 'moveToXYImmediate')" \
+    && python3 -c "import libsumo; assert hasattr(libsumo.vehicle, 'moveToXYImmediate')"
