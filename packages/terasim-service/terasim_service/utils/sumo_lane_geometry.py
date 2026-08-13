@@ -524,6 +524,186 @@ def find_lookahead_positions_from_compiled_paths(
     return results
 
 
+def build_external_state_lateral_action_lookahead(
+    compiled_path,
+    current_position,
+    lookahead_distance,
+    *,
+    target_lane_shape=None,
+    lateral_speed=0.0,
+    desired_speed=None,
+    maneuver_active=False,
+    min_forward_speed=0.2,
+    previous_lateral_displacement=None,
+    max_lateral_displacement_change=None,
+    z=0.0,
+):
+    """Build a rolling lookahead from route geometry and SUMO lateral action.
+
+    The current CARLA position remains the origin. SUMO's route geometry supplies
+    the longitudinal displacement, while its lateral speed controls how far the
+    target advances toward the lane selected by SUMO. SUMO's reported angle is
+    deliberately not an input. When continuity state is supplied, only the
+    preview displacement is rate-limited; SUMO still owns its sign and target.
+    """
+
+    def invalid(reason):
+        return {
+            "valid": False,
+            "error": reason,
+            "mode": "route",
+            "lookahead": None,
+            "route_lookahead": None,
+            "lateral_displacement": 0.0,
+            "target_lateral_distance": None,
+        }
+
+    try:
+        origin = np.asarray(
+            [float(current_position[0]), float(current_position[1])],
+            dtype=np.float64,
+        )
+        distance = max(0.0, float(lookahead_distance))
+        z = float(z)
+    except (TypeError, ValueError, IndexError):
+        return invalid("invalid_route_input")
+    if not np.all(np.isfinite(origin)) or not math.isfinite(distance) or not math.isfinite(z):
+        return invalid("non_finite_route_input")
+    if compiled_path is None:
+        return invalid("missing_route_geometry")
+
+    try:
+        starts = np.asarray(compiled_path["starts"], dtype=np.float64)
+        deltas = np.asarray(compiled_path["deltas"], dtype=np.float64)
+        length_sq = np.asarray(compiled_path["length_sq"], dtype=np.float64)
+        lengths = np.asarray(compiled_path["lengths"], dtype=np.float64)
+        cumulative_starts = np.asarray(compiled_path["cumulative_starts"], dtype=np.float64)
+        cumulative_ends = np.asarray(compiled_path["cumulative_ends"], dtype=np.float64)
+    except (KeyError, TypeError, ValueError):
+        return invalid("invalid_route_geometry")
+    if (
+        starts.ndim != 2
+        or starts.shape[1] != 2
+        or len(starts) == 0
+        or deltas.shape != starts.shape
+        or len(length_sq) != len(starts)
+        or len(lengths) != len(starts)
+        or not all(
+            np.all(np.isfinite(values))
+            for values in (starts, deltas, length_sq, lengths, cumulative_starts, cumulative_ends)
+        )
+        or np.any(length_sq <= 0.0)
+        or np.any(lengths <= 0.0)
+    ):
+        return invalid("invalid_route_geometry")
+
+    offsets = origin[None, :] - starts
+    ratios = np.einsum("si,si->s", offsets, deltas) / length_sq
+    ratios = np.clip(ratios, 0.0, 1.0)
+    projections = starts + ratios[:, None] * deltas
+    nearest_index = int(np.argmin(np.sum((origin[None, :] - projections) ** 2, axis=1)))
+    projected_point = projections[nearest_index]
+    projected_distance = (
+        cumulative_starts[nearest_index] + lengths[nearest_index] * ratios[nearest_index]
+    )
+    target_distance = projected_distance + distance
+    target_index = int(np.searchsorted(cumulative_ends, target_distance, side="left"))
+    if target_index >= len(lengths):
+        target_point = starts[-1] + deltas[-1]
+    else:
+        target_ratio = (target_distance - cumulative_starts[target_index]) / lengths[target_index]
+        target_ratio = min(1.0, max(0.0, float(target_ratio)))
+        target_point = starts[target_index] + target_ratio * deltas[target_index]
+
+    tangent = deltas[nearest_index] / lengths[nearest_index]
+    route_displacement = target_point - projected_point
+    route_lookahead_xy = origin + route_displacement
+    route_lookahead = (
+        float(route_lookahead_xy[0]),
+        float(route_lookahead_xy[1]),
+        z,
+    )
+    result = {
+        "valid": True,
+        "error": "",
+        "mode": "route",
+        "lookahead": route_lookahead,
+        "route_lookahead": route_lookahead,
+        "lateral_displacement": 0.0,
+        "target_lateral_distance": None,
+    }
+    if not maneuver_active:
+        return result
+
+    try:
+        lateral_speed = float(lateral_speed)
+        desired_speed = float(desired_speed)
+        min_forward_speed = max(0.0, float(min_forward_speed))
+    except (TypeError, ValueError):
+        return invalid("invalid_lateral_action")
+    if not all(math.isfinite(value) for value in (lateral_speed, desired_speed, min_forward_speed)):
+        return invalid("non_finite_lateral_action")
+    target_projection = project_position_to_lane_shape(target_lane_shape, origin)
+    if target_projection is None:
+        return invalid("missing_target_lane_geometry")
+    target_point = np.asarray(
+        [target_projection["projected_x"], target_projection["projected_y"]],
+        dtype=np.float64,
+    )
+    lateral_vector = target_point - origin
+    lateral_vector = lateral_vector - float(np.dot(lateral_vector, tangent)) * tangent
+    target_lateral_distance = float(np.linalg.norm(lateral_vector))
+    if not math.isfinite(target_lateral_distance):
+        return invalid("invalid_target_lane_geometry")
+    result["target_lateral_distance"] = target_lateral_distance
+    mode = "sumo_lateral_velocity"
+    if desired_speed <= min_forward_speed:
+        requested_lateral_displacement = 0.0
+        mode = "deferred"
+    else:
+        requested_lateral_displacement = min(
+            target_lateral_distance,
+            abs(lateral_speed) * distance / desired_speed,
+        )
+
+    lateral_displacement = requested_lateral_displacement
+    if previous_lateral_displacement is not None:
+        try:
+            previous_lateral_displacement = max(
+                0.0, float(previous_lateral_displacement)
+            )
+            max_lateral_displacement_change = max(
+                0.0, float(max_lateral_displacement_change)
+            )
+        except (TypeError, ValueError):
+            return invalid("invalid_lateral_continuity_state")
+        if not math.isfinite(
+            previous_lateral_displacement
+        ) or not math.isfinite(max_lateral_displacement_change):
+            return invalid("non_finite_lateral_continuity_state")
+        lateral_displacement = min(
+            previous_lateral_displacement + max_lateral_displacement_change,
+            max(
+                previous_lateral_displacement - max_lateral_displacement_change,
+                requested_lateral_displacement,
+            ),
+        )
+        lateral_displacement = min(target_lateral_distance, lateral_displacement)
+
+    result["mode"] = mode
+    if target_lateral_distance > 1e-9 and lateral_displacement > 0.0:
+        route_lookahead_xy = (
+            route_lookahead_xy + lateral_vector / target_lateral_distance * lateral_displacement
+        )
+    result["lateral_displacement"] = float(lateral_displacement)
+    result["lookahead"] = (
+        float(route_lookahead_xy[0]),
+        float(route_lookahead_xy[1]),
+        z,
+    )
+    return result
+
+
 def project_position_by_sumo_angle(position, sumo_angle, distance, z=0.0):
     """Project a SUMO position forward using SUMO's heading convention."""
     try:
