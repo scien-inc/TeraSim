@@ -2179,6 +2179,87 @@ def test_http_feedback_tick_orders_feedback_before_next_sumo_step(monkeypatch):
     ]
 
 
+def test_http_authority_cycle_applies_one_control_one_tick_without_teleport(
+    monkeypatch,
+):
+    install_fake_carla()
+    from terasim_service.utils.carla import cosim as cosim_module
+    from terasim_service.utils.carla.cosim import CarlaCosim
+
+    events = []
+    controls = []
+    transforms = []
+    monkeypatch.setattr(
+        cosim_module,
+        "tick_terasim",
+        lambda *args: events.append("request_sumo_tick"),
+    )
+    actor = types.SimpleNamespace(
+        id=42,
+        apply_ackermann_control=lambda control: (
+            controls.append(control),
+            events.append("apply_control"),
+        ),
+        set_transform=transforms.append,
+    )
+    control = FakeVehicleAckermannControl(speed=3.0, acceleration=1.0)
+    cosim = CarlaCosim.__new__(CarlaCosim)
+    cosim.args = types.SimpleNamespace(
+        skip_tls=True,
+        terasim_host="terasim",
+        terasim_port=8000,
+    )
+    cosim.terasim = {"simulation_id": "simulation"}
+    cosim._wait_for_terasim_step = lambda: "ticked"
+    cosim.use_lane_relative_position = False
+    cosim._spawn_failures = {}
+    cosim._is_spawn_abandoned = lambda *_args: False
+    cosim._uses_ackermann_physics = lambda _actor_id: True
+    cosim._ensure_collision_sensor = lambda *_args: None
+    cosim._get_carla_offset = lambda *_args: [0.0, 0.0, 0.0]
+    cosim._sumo_front_to_carla_transform = (
+        lambda *_args, **_kwargs: FakeTransform()
+    )
+    cosim._ensure_ackermann_actor_physics = lambda *_args: True
+    cosim._ackermann_actor_state = {"AV": {"control_mode": "ackermann"}}
+    cosim._build_ackermann_control = lambda *_args: control
+
+    def apply_sumo_action():
+        cosim._process_vehicle(
+            "AV",
+            {
+                "x": 1.0,
+                "y": 2.0,
+                "z": 0.0,
+                "sumo_angle": 90.0,
+                "speed": 3.0,
+                "length": 5.0,
+                "width": 1.8,
+                "height": 1.5,
+            },
+            set(),
+            carla_actor=actor,
+        )
+
+    cosim.sync_cosim_actor_to_carla = apply_sumo_action
+    cosim.world = types.SimpleNamespace(
+        tick=lambda: events.append("carla_tick")
+    )
+    cosim.sync_carla_ackermann_feedback_to_cosim = lambda: events.append(
+        "queue_feedback"
+    )
+
+    assert cosim._tick_ackermann_feedback_apply_http() is True
+    assert controls == [control]
+    assert transforms == []
+    assert events == [
+        "apply_control",
+        "carla_tick",
+        "queue_feedback",
+        "request_sumo_tick",
+    ]
+
+
 def test_grpc_feedback_is_attached_to_tick_after_carla_frame(monkeypatch):
     install_fake_carla()
     from terasim_service.utils.carla.cosim import CarlaCosim
@@ -3358,13 +3439,13 @@ def test_ackermann_feedback_uses_same_tick_position_speed_and_acceleration():
         current_speed=1.0,
         longitudinal_error=0.5,
     )
-    assert acceleration == pytest.approx(1.735)
-    assert target == pytest.approx(1.7)
+    assert acceleration == pytest.approx(1.5)
+    assert target == pytest.approx(1.2)
     assert cosim._ackermann_actor_state["AV"]["restart_active"] is False
     assert "restart_target_speed" not in cosim._ackermann_actor_state["AV"]
 
 
-def _make_ackermann_restart_test_cosim(actor_id):
+def _make_ackermann_authority_test_cosim(actor_id):
     install_fake_carla()
     from terasim_service.utils.carla.ackermann_control import AckermannTuning
     from terasim_service.utils.carla.cosim import CarlaCosim
@@ -3384,8 +3465,8 @@ def _make_ackermann_restart_test_cosim(actor_id):
 
 
 @pytest.mark.parametrize("actor_id", ["AV", "vehicle123"])
-def test_ackermann_restart_target_accumulates_for_av_and_background(actor_id):
-    cosim = _make_ackermann_restart_test_cosim(actor_id)
+def test_ackermann_target_never_accumulates_above_sumo_action(actor_id):
+    cosim = _make_ackermann_authority_test_cosim(actor_id)
     veh_info = {
         "speed": 0.092,
         "sumo_desired_speed": 0.092,
@@ -3402,16 +3483,14 @@ def test_ackermann_restart_target_accumulates_for_av_and_background(actor_id):
         for _ in range(4)
     ]
 
-    assert targets == pytest.approx([0.092, 0.184, 0.276, 0.3])
-    assert cosim._ackermann_actor_state[actor_id]["restart_active"] is True
-    assert cosim._ackermann_actor_state[actor_id]["restart_target_speed"] == pytest.approx(
-        0.3
-    )
+    assert targets == pytest.approx([0.092] * 4)
+    assert cosim._ackermann_actor_state[actor_id]["restart_active"] is False
+    assert "restart_target_speed" not in cosim._ackermann_actor_state[actor_id]
 
 
 @pytest.mark.parametrize("actor_id", ["AV", "vehicle123"])
-def test_ackermann_restart_target_is_held_until_carla_reaches_release_speed(actor_id):
-    cosim = _make_ackermann_restart_test_cosim(actor_id)
+def test_ackermann_stale_restart_target_is_discarded(actor_id):
+    cosim = _make_ackermann_authority_test_cosim(actor_id)
     cosim._ackermann_actor_state = {
         actor_id: {
             "restart_active": True,
@@ -3429,8 +3508,9 @@ def test_ackermann_restart_target_is_held_until_carla_reaches_release_speed(acto
         },
         current_speed=0.1,
     )
-    assert held_target == pytest.approx(0.276)
-    assert cosim._ackermann_actor_state[actor_id]["restart_active"] is True
+    assert held_target == pytest.approx(0.192)
+    assert cosim._ackermann_actor_state[actor_id]["restart_active"] is False
+    assert "restart_target_speed" not in cosim._ackermann_actor_state[actor_id]
 
     released_target, _acceleration = cosim._resolve_ackermann_longitudinal_target(
         actor_id,
@@ -3461,7 +3541,7 @@ def test_ackermann_restart_is_cancelled_by_sumo_stop_or_deceleration(
     sumo_next_speed,
     requested_acceleration,
 ):
-    cosim = _make_ackermann_restart_test_cosim(actor_id)
+    cosim = _make_ackermann_authority_test_cosim(actor_id)
     cosim._ackermann_actor_state = {
         actor_id: {
             "restart_active": True,
@@ -3483,6 +3563,127 @@ def test_ackermann_restart_is_cancelled_by_sumo_stop_or_deceleration(
     assert target == pytest.approx(sumo_next_speed)
     assert cosim._ackermann_actor_state[actor_id]["restart_active"] is False
     assert "restart_target_speed" not in cosim._ackermann_actor_state[actor_id]
+
+
+def test_invalid_declared_lookahead_fails_closed_only_for_authoritative_actor():
+    cosim = _make_ackermann_authority_test_cosim("AV")
+    invalid_lookahead = {
+        "lookahead_position_valid": True,
+        "lookahead_x": float("nan"),
+        "lookahead_y": 2.0,
+        "lookahead_z": 0.0,
+        "sumo_desired_speed": 5.0,
+    }
+
+    with pytest.raises(ValueError, match="invalid authoritative SUMO lookahead"):
+        cosim._resolve_sumo_lookahead_location(
+            "AV",
+            invalid_lookahead,
+            [0.0, 0.0, 0.0],
+            90.0,
+        )
+
+    install_fake_carla()
+    from terasim_service.utils.carla.ackermann_control import AckermannTuning
+    from terasim_service.utils.carla.cosim import CarlaCosim
+
+    legacy = CarlaCosim.__new__(CarlaCosim)
+    legacy.ackermann_feedback_apply_enabled = False
+    legacy.ackermann_feedback_actor_ids = set()
+    legacy.ackermann_feedback_all_background_actors = False
+    legacy.ackermann_tuning = AckermannTuning()
+    fallback = legacy._resolve_sumo_lookahead_location(
+        "AV",
+        {
+            **invalid_lookahead,
+            "speed": 5.0,
+        },
+        [0.0, 0.0, 0.0],
+        90.0,
+    )
+
+    assert fallback == pytest.approx([7.0, 0.0, 0.0])
+
+
+def test_invalid_authoritative_action_pose_returns_full_fail_closed_brake():
+    cosim = _make_ackermann_authority_test_cosim("AV")
+    cosim._ackermann_actor_state = {"AV": {"steer": 0.0}}
+    vehicle = types.SimpleNamespace(
+        get_control=lambda: types.SimpleNamespace(steer=0.0)
+    )
+
+    control = cosim._build_ackermann_control(
+        "AV",
+        {},
+        vehicle,
+        [float("nan"), 0.0, 0.0],
+        90.0,
+        FakeTransform(),
+    )
+
+    assert isinstance(control, FakeVehicleControl)
+    assert control.throttle == pytest.approx(0.0)
+    assert control.brake == pytest.approx(1.0)
+    assert cosim._ackermann_actor_state["AV"]["control_mode"] == (
+        "fail_closed_brake"
+    )
+
+
+@pytest.mark.parametrize("actor_id", ["AV", "vehicle123"])
+@pytest.mark.parametrize(
+    ("requested_acceleration", "expected_acceleration"),
+    [(8.0, 3.0), (-9.0, -7.06)],
+)
+def test_ackermann_acceleration_keeps_sumo_sign_and_clamps_to_physical_bounds(
+    actor_id,
+    requested_acceleration,
+    expected_acceleration,
+):
+    cosim = _make_ackermann_authority_test_cosim(actor_id)
+
+    target, acceleration = cosim._resolve_ackermann_longitudinal_target(
+        actor_id,
+        {
+            "sumo_desired_speed": 4.25,
+            "feedback_observed_speed": 3.9,
+            "sumo_emergency_decel": 7.06,
+            "acceleration": requested_acceleration,
+        },
+        current_speed=3.9,
+        longitudinal_error=100.0,
+    )
+
+    assert target == pytest.approx(4.25)
+    assert acceleration == pytest.approx(expected_acceleration)
+    assert cosim._ackermann_actor_state[actor_id]["sumo_action_invalid"] is False
+
+
+@pytest.mark.parametrize("actor_id", ["AV", "vehicle123"])
+@pytest.mark.parametrize(
+    "invalid_action",
+    [
+        {"sumo_desired_speed": 1.0},
+        {"sumo_desired_speed": float("nan"), "acceleration": 1.0},
+        {"sumo_desired_speed": -0.1, "acceleration": -1.0},
+        {"sumo_desired_speed": 1.0, "acceleration": float("inf")},
+    ],
+)
+def test_ackermann_invalid_sumo_action_is_marked_fail_closed(
+    actor_id,
+    invalid_action,
+):
+    cosim = _make_ackermann_authority_test_cosim(actor_id)
+
+    target, acceleration = cosim._resolve_ackermann_longitudinal_target(
+        actor_id,
+        invalid_action,
+        current_speed=1.0,
+    )
+
+    assert target == pytest.approx(0.0)
+    assert acceleration == pytest.approx(-cosim.ackermann_tuning.max_decel)
+    assert cosim._ackermann_actor_state[actor_id]["sumo_action_invalid"] is True
+    assert cosim._ackermann_actor_state[actor_id]["restart_active"] is False
 
 
 def test_ackermann_longitudinal_error_compares_positions_at_t_plus_dt():
@@ -3640,6 +3841,57 @@ def test_direct_emergency_brake_engages_and_releases_with_hysteresis():
         is None
     )
     assert state["control_mode"] == "ackermann"
+
+
+@pytest.mark.parametrize("actor_id", ["AV", "vehicle123"])
+def test_authoritative_direct_brake_is_proportional_and_releases_on_positive_accel(
+    actor_id,
+):
+    install_fake_carla()
+    from terasim_service.utils.carla.ackermann_control import (
+        AckermannEmergencyBrakeTuning,
+        AckermannTuning,
+    )
+
+    cosim = _make_ackermann_authority_test_cosim(actor_id)
+    cosim.ackermann_emergency_brake_tuning = AckermannEmergencyBrakeTuning(
+        engage_decel=0.5,
+        release_decel=0.1,
+        release_ticks=3,
+        stop_speed=0.2,
+        min_brake=0.5,
+    )
+    cosim.ackermann_tuning = AckermannTuning(max_decel=6.0)
+    cosim._ackermann_actor_state = {
+        actor_id: {
+            "steer": 0.0,
+            "sumo_emergency_decel": 6.0,
+        }
+    }
+    vehicle = types.SimpleNamespace(
+        get_control=lambda: types.SimpleNamespace(steer=0.0)
+    )
+
+    brakes = []
+    for requested_acceleration in (-1.0, -3.0, -6.0):
+        cosim._ackermann_actor_state[actor_id][
+            "sumo_requested_acceleration"
+        ] = requested_acceleration
+        control = cosim._update_ackermann_emergency_brake(
+            actor_id, vehicle, current_speed=5.0
+        )
+        assert isinstance(control, FakeVehicleControl)
+        brakes.append(control.brake)
+
+    assert brakes == pytest.approx([1.0 / 6.0, 0.5, 1.0])
+    cosim._ackermann_actor_state[actor_id]["sumo_requested_acceleration"] = 1.0
+    assert (
+        cosim._update_ackermann_emergency_brake(
+            actor_id, vehicle, current_speed=4.5
+        )
+        is None
+    )
+    assert cosim._ackermann_actor_state[actor_id]["emergency_brake_command"] == 0.0
 
 
 def test_direct_emergency_brake_releases_at_stop_without_reengaging():
