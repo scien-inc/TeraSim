@@ -181,6 +181,7 @@ class TeraSimCoSimPlugin(BasePlugin):
             self._parse_float_env("CARLA_COSIM_STEP_LENGTH", 0.05),
         )
         self.feedback_lane_change_active_actor_ids = set()
+        self.external_state_lane_change_maneuvers = {}
         feedback_actor_value = os.getenv("CARLA_COSIM_ACKERMANN_FEEDBACK_ACTORS", "")
         self.ackermann_feedback_actor_ids = {
             actor_id.strip()
@@ -2212,6 +2213,15 @@ class TeraSimCoSimPlugin(BasePlugin):
             return "none", ""
         direction = 1 if wants_left else -1
         intent = "left" if wants_left else "right"
+        maneuver = getattr(
+            self, "external_state_lane_change_maneuvers", {}
+        ).get(vehicle_id)
+        if (
+            maneuver is not None
+            and maneuver.get("intent") == intent
+            and maneuver.get("target_lane_id") == current_lane_id
+        ):
+            return intent, current_lane_id
         target_lane_id = self._lane_change_target_lane_id(
             current_lane_id, current_lane_index, direction
         )
@@ -2444,10 +2454,13 @@ class TeraSimCoSimPlugin(BasePlugin):
                         lane_id, profile_ctx=profile_ctx
                     )
                 except Exception:
+                    lane_shape = None
+                if lane_shape is None:
+                    if self._uses_external_state_route_lookahead(vehicle_id):
+                        break
                     continue
-                if lane_shape is not None:
-                    lane_shapes.append(lane_shape)
-                    valid_lane_ids.append(lane_id)
+                lane_shapes.append(lane_shape)
+                valid_lane_ids.append(lane_id)
             if lane_shapes:
                 compiled_path = self._profile_detail_python_call(
                     profile_ctx,
@@ -2461,6 +2474,63 @@ class TeraSimCoSimPlugin(BasePlugin):
                     geometry_cache.setdefault(valid_route_key, compiled_path)
 
         return compiled_path
+
+    def _external_state_lane_change_blend_active(
+        self,
+        vehicle_id,
+        vehicle_state,
+        lateral_speed,
+        lateral_offset,
+    ):
+        """Gate CARLA lane-change steering on SUMO's explicit maneuver intent."""
+        maneuvers = getattr(self, "external_state_lane_change_maneuvers", None)
+        if maneuvers is None:
+            maneuvers = {}
+            self.external_state_lane_change_maneuvers = maneuvers
+
+        intent = getattr(vehicle_state, "sumo_lane_change_intent", "none")
+        target_lane_id = getattr(
+            vehicle_state, "sumo_lane_change_target_lane_id", ""
+        )
+        current_lane_id = getattr(vehicle_state, "lane_id", "")
+        if intent in {"left", "right"}:
+            existing_maneuver = maneuvers.get(vehicle_id)
+            if (
+                existing_maneuver is not None
+                and existing_maneuver.get("intent") == intent
+                and existing_maneuver.get("target_lane_id") == current_lane_id
+            ):
+                return True
+            if target_lane_id:
+                maneuvers[vehicle_id] = {
+                    "intent": intent,
+                    "source_lane_id": current_lane_id,
+                    "target_lane_id": target_lane_id,
+                }
+            return True
+
+        maneuver = maneuvers.get(vehicle_id)
+        if maneuver is None:
+            return False
+        maneuver_lanes = {
+            maneuver.get("source_lane_id"),
+            maneuver.get("target_lane_id"),
+        }
+        if current_lane_id not in maneuver_lanes:
+            maneuvers.pop(vehicle_id, None)
+            return False
+
+        lateral_motion_active = (
+            abs(float(lateral_speed))
+            >= getattr(self, "lookahead_lane_change_speed_start", 0.05)
+            or abs(float(lateral_offset))
+            >= getattr(self, "lookahead_lane_change_offset_start", 0.15)
+        )
+        if lateral_motion_active:
+            return True
+
+        maneuvers.pop(vehicle_id, None)
+        return False
 
     def _populate_vehicle_lookaheads(self, requests, profile_ctx=None):
         if not requests:
@@ -2559,12 +2629,18 @@ class TeraSimCoSimPlugin(BasePlugin):
             if not has_lateral_offset:
                 lateral_offset = getattr(vehicle_state, "lateral_offset", 0.0)
             vehicle_state.lateral_speed = lateral_speed
-            if (
-                lookahead is not None
-                and self._uses_external_state_route_lookahead(vehicle_id)
-            ):
-                lane_change_blend = 0.0
-            else:
+            use_external_state_lookahead = self._uses_external_state_route_lookahead(
+                vehicle_id
+            )
+            blend_lane_change = not use_external_state_lookahead
+            if use_external_state_lookahead:
+                blend_lane_change = self._external_state_lane_change_blend_active(
+                    vehicle_id,
+                    vehicle_state,
+                    lateral_speed,
+                    lateral_offset,
+                )
+            if blend_lane_change:
                 lookahead, lane_change_blend = self._profile_detail_python_call(
                     profile_ctx,
                     "blend_lane_change_lookahead",
@@ -2584,6 +2660,8 @@ class TeraSimCoSimPlugin(BasePlugin):
                     getattr(self, "lookahead_lane_change_offset_start", 0.15),
                     getattr(self, "lookahead_lane_change_offset_full", 0.75),
                 )
+            else:
+                lane_change_blend = 0.0
             vehicle_state.lookahead_lane_change_blend = lane_change_blend
             if lookahead is None:
                 continue
@@ -2643,6 +2721,12 @@ class TeraSimCoSimPlugin(BasePlugin):
         )
         lane_change_active_actor_ids.intersection_update(active_vehicle_ids)
         self.feedback_lane_change_active_actor_ids = lane_change_active_actor_ids
+        lane_change_maneuvers = getattr(
+            self, "external_state_lane_change_maneuvers", {}
+        )
+        for actor_id in list(lane_change_maneuvers):
+            if actor_id not in active_vehicle_ids:
+                lane_change_maneuvers.pop(actor_id, None)
         detail_vehicle_ids = self._update_state_detail_active_vehicle_ids(
             vehicle_ids, vehicle_position_cache
         )
