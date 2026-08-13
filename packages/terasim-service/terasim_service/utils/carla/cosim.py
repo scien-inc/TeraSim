@@ -1890,6 +1890,12 @@ class CarlaCosim(object):
                 lookahead[2] = sumo_location[2]
             if lookahead[0] is not None and lookahead[1] is not None:
                 return lookahead
+            if bool(
+                getattr(self, "ackermann_feedback_apply_enabled", False)
+            ) and self._is_ackermann_feedback_apply_actor(veh_id):
+                raise ValueError(
+                    f"invalid authoritative SUMO lookahead for actor {veh_id}"
+                )
 
         desired_speed = self._resolve_ackermann_desired_speed(veh_id, veh_info)
         lookahead_distance = min(15.0, max(7.0, desired_speed))
@@ -2955,7 +2961,9 @@ class CarlaCosim(object):
     def _is_ackermann_feedback_healthy(self, veh_id, feedback, observed_frame):
         state = self._ackermann_actor_state.setdefault(veh_id, {})
         if feedback.get("feedback_status") != "queued":
-            state["feedback_ack_failures"] = 0
+            state["feedback_ack_failures"] = 1
+            state["feedback_frame_lag"] = None
+            state["feedback_frame_mismatch"] = True
             return False
 
         expected_frame = self._as_finite_float(feedback.get("source_carla_frame"))
@@ -3001,13 +3009,14 @@ class CarlaCosim(object):
         state = self._ackermann_actor_state.setdefault(veh_id, {})
         max_decel = self._resolve_ackermann_max_decel(veh_info)
         state["sumo_emergency_decel"] = max_decel
-        desired_speed = self._resolve_ackermann_desired_speed(veh_id, veh_info)
         requested_acceleration = self._as_finite_float(veh_info.get("acceleration"))
         state["sumo_requested_acceleration"] = requested_acceleration
         if not self._is_ackermann_feedback_apply_actor(veh_id):
+            desired_speed = self._resolve_ackermann_desired_speed(veh_id, veh_info)
             state["applied_desired_acceleration"] = None
             state.pop("restart_target_speed", None)
             state["restart_active"] = False
+            state["sumo_action_invalid"] = False
             return desired_speed, None
 
         sumo_next_speed = self._as_finite_float(veh_info.get("sumo_desired_speed"))
@@ -3016,71 +3025,27 @@ class CarlaCosim(object):
         state["sumo_desired_speed"] = sumo_next_speed
         state["feedback_observed_speed"] = observed_speed
         state["longitudinal_position_error"] = longitudinal_error
-        if sumo_next_speed is None or self.step_length <= 0.0:
-            state["sumo_requested_acceleration"] = None
+        invalid_action = (
+            sumo_next_speed is None
+            or sumo_next_speed < 0.0
+            or requested_acceleration is None
+            or self.step_length <= 0.0
+        )
+        state["sumo_action_invalid"] = invalid_action
+        state.pop("restart_target_speed", None)
+        state["restart_active"] = False
+        if invalid_action:
             state["applied_desired_acceleration"] = None
-            state.pop("restart_target_speed", None)
-            state["restart_active"] = False
-            return desired_speed, None
+            state["longitudinal_velocity_error"] = None
+            return 0.0, -max_decel
 
-        if requested_acceleration is None:
-            acceleration_origin_speed = (
-                observed_speed if observed_speed is not None else current_speed
-            )
-            requested_acceleration = (
-                sumo_next_speed - acceleration_origin_speed
-            ) / self.step_length
-        velocity_error = sumo_next_speed - current_speed
         desired_acceleration = min(
             self.ackermann_tuning.max_accel,
-            max(
-                -max_decel,
-                requested_acceleration
-                + self.ackermann_tuning.kp_position * longitudinal_error
-                + self.ackermann_tuning.kp_speed * velocity_error,
-            ),
+            max(-max_decel, requested_acceleration),
         )
-        state["sumo_requested_acceleration"] = requested_acceleration
-        state["longitudinal_velocity_error"] = velocity_error
+        state["longitudinal_velocity_error"] = sumo_next_speed - current_speed
         state["applied_desired_acceleration"] = desired_acceleration
-        speed_target = max(
-            0.0,
-            sumo_next_speed
-            + self.ackermann_tuning.position_speed_gain * longitudinal_error,
-        )
-        restart_target = self._as_finite_float(state.get("restart_target_speed"))
-        restart_active = bool(state.get("restart_active")) and restart_target is not None
-        restart_cancelled = (
-            requested_acceleration <= 0.0
-            or sumo_next_speed <= self.ackermann_tuning.restart_speed_epsilon
-            or current_speed >= self.ackermann_tuning.restart_release_speed
-        )
-        if restart_cancelled:
-            state.pop("restart_target_speed", None)
-            state["restart_active"] = False
-        else:
-            restart_requested = (
-                current_speed <= self.ackermann_tuning.restart_enter_speed
-                and sumo_next_speed
-                > current_speed + self.ackermann_tuning.restart_speed_epsilon
-            )
-            if restart_requested:
-                if restart_target is None:
-                    restart_target = sumo_next_speed
-                else:
-                    restart_target += requested_acceleration * self.step_length
-                restart_target = min(
-                    self.ackermann_tuning.restart_max_target_speed,
-                    max(0.0, restart_target),
-                )
-                restart_active = True
-                state["restart_target_speed"] = restart_target
-                state["restart_active"] = True
-
-            if restart_active and restart_target is not None:
-                speed_target = max(speed_target, restart_target)
-
-        return speed_target, desired_acceleration
+        return sumo_next_speed, desired_acceleration
 
     def _current_direct_brake_steer(self, veh_id, vehicle):
         try:
@@ -3116,10 +3081,18 @@ class CarlaCosim(object):
         requested_acceleration = self._as_finite_float(
             state.get("sumo_requested_acceleration")
         )
+        authoritative = bool(
+            getattr(self, "ackermann_feedback_apply_enabled", False)
+        ) and self._is_ackermann_feedback_apply_actor(veh_id)
         active = bool(state.get("emergency_brake_active", False))
         release_ticks = int(state.get("emergency_brake_release_ticks", 0))
 
         if not tuning.enabled:
+            active = False
+            release_ticks = 0
+        elif authoritative and (
+            requested_acceleration is None or requested_acceleration >= 0.0
+        ):
             active = False
             release_ticks = 0
         elif active:
@@ -3157,7 +3130,7 @@ class CarlaCosim(object):
         brake = compute_direct_brake_value(
             requested_acceleration or 0.0,
             max_decel,
-            tuning.min_brake,
+            0.0 if authoritative else tuning.min_brake,
         )
         state["emergency_brake_command"] = brake
         return self._make_direct_brake_control(veh_id, vehicle, brake)
@@ -3225,6 +3198,18 @@ class CarlaCosim(object):
         desired_transform,
     ):
         state = self._ackermann_actor_state.setdefault(veh_id, {})
+        feedback_actor = self._is_ackermann_feedback_apply_actor(veh_id)
+        action_pose = [
+            self._as_finite_float(value)
+            for value in (*sumo_location[:3], sumo_angle)
+        ]
+        if feedback_actor and any(value is None for value in action_pose):
+            state["control_mode"] = "fail_closed_brake"
+            state["sumo_action_invalid"] = True
+            state["emergency_brake_command"] = 1.0
+            return self._make_direct_brake_control(
+                veh_id, vehicle, brake=1.0
+            )
         try:
             current_transform = vehicle.get_transform()
             current_velocity = vehicle.get_velocity()
@@ -3265,14 +3250,21 @@ class CarlaCosim(object):
             except Exception:
                 pass
 
-        lookahead_sumo_location = self._resolve_sumo_lookahead_location(
-            veh_id, veh_info, sumo_location, sumo_angle
-        )
         try:
+            lookahead_sumo_location = self._resolve_sumo_lookahead_location(
+                veh_id, veh_info, sumo_location, sumo_angle
+            )
             lookahead_location = self._sumo_point_to_carla_location(
                 lookahead_sumo_location
             )
         except Exception:
+            if feedback_actor:
+                state["control_mode"] = "fail_closed_brake"
+                state["sumo_action_invalid"] = True
+                state["emergency_brake_command"] = 1.0
+                return self._make_direct_brake_control(
+                    veh_id, vehicle, brake=1.0
+                )
             state["control_mode"] = "ackermann"
             return self._make_brake_ackermann_control(veh_id)
 
@@ -3334,31 +3326,38 @@ class CarlaCosim(object):
         state["last_phase_b_target_sumo_angle"] = sumo_angle
         state["last_phase_b_target_carla_yaw"] = (sumo_angle - 90.0) % 360.0
         feedback_unhealthy = (
-            self._is_ackermann_feedback_apply_actor(veh_id)
-            and feedback
+            feedback_actor
             and not self._is_ackermann_feedback_healthy(
                 veh_id, feedback, veh_info.get("feedback_source_carla_frame")
             )
         )
         target_behind = (
-            self._is_ackermann_feedback_apply_actor(veh_id)
-            and values.lookahead_local_x <= 0.0
+            feedback_actor and values.lookahead_local_x <= 0.0
         )
-        if feedback_unhealthy or target_behind:
+        invalid_action = feedback_actor and bool(state.get("sumo_action_invalid"))
+        fail_closed = feedback_unhealthy or target_behind or invalid_action
+        if fail_closed:
             final_steer = self._neutralize_ackermann_steer(veh_id)
             final_speed = 0.0
             final_acceleration = -self._resolve_ackermann_max_decel(veh_info)
 
-        emergency_control = self._update_ackermann_emergency_brake(
-            veh_id, vehicle, current_speed
-        )
+        if fail_closed:
+            emergency_control = self._make_direct_brake_control(
+                veh_id, vehicle, brake=1.0
+            )
+            state["control_mode"] = "fail_closed_brake"
+            state["emergency_brake_command"] = 1.0
+        else:
+            emergency_control = self._update_ackermann_emergency_brake(
+                veh_id, vehicle, current_speed
+            )
         if emergency_control is None:
             control_mode = "ackermann"
             commanded_throttle = None
             commanded_brake = None
             commanded_steer = final_steer
         else:
-            control_mode = "emergency_brake"
+            control_mode = state.get("control_mode", "emergency_brake")
             commanded_throttle = emergency_control.throttle
             commanded_brake = emergency_control.brake
             commanded_steer = emergency_control.steer
@@ -4230,7 +4229,11 @@ class CarlaCosim(object):
                     control,
                     ackermann_batch,
                     direct_vehicle_control=(
-                        actor_state.get("control_mode") == "emergency_brake"
+                        actor_state.get("control_mode")
+                        in {
+                            "emergency_brake",
+                            "fail_closed_brake",
+                        }
                     ),
                 )
             else:
