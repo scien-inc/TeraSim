@@ -929,10 +929,13 @@ def _current_lane_hint(traci, vehicle_id: str) -> tuple[str, int, str]:
 
 
 @pytest.mark.parametrize("vehicle_id", ["AV", "BV"])
+@pytest.mark.parametrize(
+    "strict_lane_hint", [False, True], ids=["standard", "strict"]
+)
 @pytest.mark.integration
 @pytest.mark.requires_sumo
-def test_strict_immediate_move_to_xy_preserves_strategic_lane_change_until_gap_opens(
-    tmp_path: Path, vehicle_id: str
+def test_immediate_move_to_xy_preserves_strategic_lane_change_until_gap_opens(
+    tmp_path: Path, vehicle_id: str, strict_lane_hint: bool
 ) -> None:
     """A blocked route-required lane change completes after its gap opens."""
     traci = pytest.importorskip("traci")
@@ -998,7 +1001,7 @@ def test_strict_immediate_move_to_xy_preserves_strategic_lane_change_until_gap_o
                 0.0,
                 keepRoute=1,
                 matchThreshold=10.0,
-                strictLaneHint=True,
+                strictLaneHint=strict_lane_hint,
             )
             assert traci.simulation.getTime() == phase_a_time
             assert traci.vehicle.getLaneID(vehicle_id) == "edge_32_1"
@@ -1039,7 +1042,7 @@ def test_strict_immediate_move_to_xy_preserves_strategic_lane_change_until_gap_o
                 0.0,
                 keepRoute=1,
                 matchThreshold=10.0,
-                strictLaneHint=True,
+                strictLaneHint=strict_lane_hint,
             )
             assert traci.simulation.getTime() == phase_a_time
             assert traci.vehicle.getLaneID(vehicle_id) == lane_id
@@ -1082,7 +1085,7 @@ def test_strict_immediate_move_to_xy_preserves_strategic_lane_change_until_gap_o
             0.0,
             keepRoute=1,
             matchThreshold=10.0,
-            strictLaneHint=True,
+            strictLaneHint=strict_lane_hint,
         )
         assert traci.simulation.getTime() == phase_a_time
         assert traci.vehicle.getLaneID(vehicle_id) == "edge_32_2"
@@ -1099,12 +1102,15 @@ def test_strict_immediate_move_to_xy_preserves_strategic_lane_change_until_gap_o
 
 
 @pytest.mark.parametrize("vehicle_id", ["AV", "BV"])
+@pytest.mark.parametrize(
+    "strict_lane_hint", [False, True], ids=["standard", "strict"]
+)
 @pytest.mark.integration
 @pytest.mark.requires_sumo
-def test_strict_immediate_move_to_xy_has_no_junction_predecessor_bounce(
-    tmp_path: Path, vehicle_id: str
+def test_immediate_move_to_xy_junction_boundary_selects_expected_lane(
+    tmp_path: Path, vehicle_id: str, strict_lane_hint: bool
 ) -> None:
-    """A predecessor-side pose must not rematch an internal primary lane."""
+    """Standard documents predecessor remapping; strict preserves the internal lane."""
     traci = pytest.importorskip("traci")
     if not hasattr(traci.vehicle, "moveToXYImmediate"):
         pytest.skip("requires the dedicated SUMO moveToXYImmediate build")
@@ -1179,12 +1185,13 @@ def test_strict_immediate_move_to_xy_has_no_junction_predecessor_bounce(
                 0.0,
                 keepRoute=1,
                 matchThreshold=1.0,
-                strictLaneHint=True,
+                strictLaneHint=strict_lane_hint,
             )
             assert traci.simulation.getTime() == phase_a_time
+            position_tolerance = POSITION_TOLERANCE if strict_lane_hint else 0.02
             assert (
                 math.dist(traci.vehicle.getPosition(vehicle_id), target)
-                < POSITION_TOLERANCE
+                < position_tolerance
             )
             assert _angle_difference(
                 traci.vehicle.getAngle(vehicle_id), target_angle
@@ -1192,6 +1199,9 @@ def test_strict_immediate_move_to_xy_has_no_junction_predecessor_bounce(
             assert traci.vehicle.getSpeed(vehicle_id) == pytest.approx(
                 target_speed, abs=SPEED_TOLERANCE
             )
+            if not strict_lane_hint:
+                assert traci.vehicle.getLaneID(vehicle_id) == "incoming_0"
+                return
             assert traci.vehicle.getLaneID(vehicle_id) == lane_id
 
             traci.simulationStep()

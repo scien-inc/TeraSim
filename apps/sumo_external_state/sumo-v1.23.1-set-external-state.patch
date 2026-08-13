@@ -42,7 +42,7 @@ index fa301b9d6..c48bc7000 100644
 +TRACI_CONST int MOVE_TO_XY_IMMEDIATE = 0xf8;
 +
 diff --git a/src/libsumo/Vehicle.cpp b/src/libsumo/Vehicle.cpp
-index 239ef17be..c6a498097 100644
+index 239ef17be..947b205ac 100644
 --- a/src/libsumo/Vehicle.cpp
 +++ b/src/libsumo/Vehicle.cpp
 @@ -21,0 +22 @@
@@ -153,7 +153,7 @@ index 239ef17be..c6a498097 100644
 +}
 +
 diff --git a/src/libsumo/Vehicle.h b/src/libsumo/Vehicle.h
-index a733726bc..a67221f43 100644
+index a733726bc..72cc5565f 100644
 --- a/src/libsumo/Vehicle.h
 +++ b/src/libsumo/Vehicle.h
 @@ -213,0 +214,3 @@ public:
@@ -161,7 +161,7 @@ index a733726bc..a67221f43 100644
 +                                  const double x, const double y, double angle = libsumo::INVALID_DOUBLE_VALUE,
 +                                 const int keepRoute = 1, double matchThreshold = 100, bool strictLaneHint = false);
 diff --git a/src/microsim/MSVehicle.cpp b/src/microsim/MSVehicle.cpp
-index 1792121ea..39f8953e9 100644
+index 1792121ea..8d134c97f 100644
 --- a/src/microsim/MSVehicle.cpp
 +++ b/src/microsim/MSVehicle.cpp
 @@ -382,0 +383,2 @@ MSVehicle::Influencer::Influencer() :
@@ -180,7 +180,7 @@ index 1792121ea..39f8953e9 100644
 +    if (!myRemoteStrictLaneHint) {
 +        v->myCurrEdge = v->getRoute().begin() + myRemoteEdgeOffset;
 +    }
-@@ -934,0 +940,64 @@ MSVehicle::Influencer::postProcessRemoteControl(MSVehicle* v) {
+@@ -934,0 +940,63 @@ MSVehicle::Influencer::postProcessRemoteControl(MSVehicle* v) {
 +void
 +MSVehicle::Influencer::completeRemoteControl(MSVehicle* v, SUMOTime t) {
 +    if (v->isOnRoad() && myRemoteLane != nullptr) {
@@ -234,7 +234,6 @@ index 1792121ea..39f8953e9 100644
 +        }
 +        v->setLateralPositionOnLane(
 +            externalGeometrySign * remotePosLat / myRemotePositionGeometrySign);
-+        v->getLaneChangeModel().resetForExternalState();
 +    }
 +    if (myLastRemoteAccess == t) {
 +        // Keep wasRemoteControlled() true while ensuring that planning in a
@@ -245,7 +244,7 @@ index 1792121ea..39f8953e9 100644
 +}
 +
 +
-@@ -1247,0 +1317,12 @@ MSVehicle::getSlope() const {
+@@ -1247,0 +1316,12 @@ MSVehicle::getSlope() const {
 +double
 +MSVehicle::getLateralGeometrySign() const {
 +    if (myInfluencer != nullptr) {
@@ -258,28 +257,28 @@ index 1792121ea..39f8953e9 100644
 +}
 +
 +
-@@ -1272 +1353 @@ MSVehicle::getPosition(const double offset) const {
+@@ -1272 +1352 @@ MSVehicle::getPosition(const double offset) const {
 -    const double posLat = (MSGlobals::gLefthand ? 1 : -1) * getLateralPositionOnLane();
 +    const double posLat = getLateralGeometrySign() * getLateralPositionOnLane();
-@@ -1482,2 +1563,2 @@ MSVehicle::computeAngle() const {
+@@ -1482,2 +1562,2 @@ MSVehicle::computeAngle() const {
 -    const double posLat = -myState.myPosLat; // @todo get rid of the '-'
 -    const double lefthandSign = (MSGlobals::gLefthand ? -1 : 1);
 +    const double geometrySign = getLateralGeometrySign();
 +    const double posLat = geometrySign * myState.myPosLat;
-@@ -1499 +1580 @@ MSVehicle::computeAngle() const {
+@@ -1499 +1579 @@ MSVehicle::computeAngle() const {
 -        p1 = myLane->geometryPositionAtOffset(myState.myPos, lefthandSign * posLat);
 +        p1 = myLane->geometryPositionAtOffset(myState.myPos, posLat);
-@@ -1503 +1584 @@ MSVehicle::computeAngle() const {
+@@ -1503 +1583 @@ MSVehicle::computeAngle() const {
 -            p1 = predecessorLane->geometryPositionAtOffset(predecessorLane->getLength() + myState.myPos, lefthandSign * posLat);
 +            p1 = predecessorLane->geometryPositionAtOffset(predecessorLane->getLength() + myState.myPos, posLat);
-@@ -1532 +1613 @@ MSVehicle::computeAngle() const {
+@@ -1532 +1612 @@ MSVehicle::computeAngle() const {
 -    result += lefthandSign * myLaneChangeModel->calcAngleOffset();
 +    result -= geometrySign * myLaneChangeModel->calcAngleOffset();
-@@ -1545 +1626,2 @@ MSVehicle::getBackPosition() const {
+@@ -1545 +1625,2 @@ MSVehicle::getBackPosition() const {
 -    const double posLat = MSGlobals::gLefthand ? myState.myPosLat : -myState.myPosLat;
 +    const double geometrySign = getLateralGeometrySign();
 +    const double posLat = geometrySign * myState.myPosLat;
-@@ -1568 +1650 @@ MSVehicle::getBackPosition() const {
+@@ -1568 +1649 @@ MSVehicle::getBackPosition() const {
 -                result = myFurtherLanes.back()->geometryPositionAtOffset(backPos, -myFurtherLanesPosLat.back() * (MSGlobals::gLefthand ? -1 : 1));
 +                result = myFurtherLanes.back()->geometryPositionAtOffset(backPos, geometrySign * myFurtherLanesPosLat.back());
 diff --git a/src/microsim/MSVehicle.h b/src/microsim/MSVehicle.h
@@ -304,69 +303,6 @@ index 05b62c06a..1e0993a56 100644
 @@ -1656,0 +1667,2 @@ public:
 +        double myRemotePositionGeometrySign;
 +        bool myRemoteStrictLaneHint;
-diff --git a/src/microsim/lcmodels/MSAbstractLaneChangeModel.cpp b/src/microsim/lcmodels/MSAbstractLaneChangeModel.cpp
-index 3ca03b555..d29130264 100644
---- a/src/microsim/lcmodels/MSAbstractLaneChangeModel.cpp
-+++ b/src/microsim/lcmodels/MSAbstractLaneChangeModel.cpp
-@@ -483,0 +484,50 @@ MSAbstractLaneChangeModel::endLaneChangeManeuver(const MSMoveReminder::Notificat
-+void
-+MSAbstractLaneChangeModel::resetForExternalState() {
-+    // Preserve only an active maneuver whose direction agrees with the newly
-+    // assimilated physical offset. This lets a legitimate SUMO maneuver span
-+    // multiple Phase A/B cycles without retaining an opposite stale request.
-+    const double posLat = myVehicle.getLateralPositionOnLane();
-+    const int requestedDirection = (myOwnState & LCA_LEFT) != 0
-+                                   ? 1
-+                                   : ((myOwnState & LCA_RIGHT) != 0 ? -1 : 0);
-+    const bool unblockedSublaneManeuver = MSGlobals::gSublane
-+                                          && requestedDirection != 0
-+                                          && (myOwnState & LCA_BLOCKED) == 0
-+                                          && fabs(mySpeedLat) > NUMERICAL_EPS;
-+    const int expectedOffsetDirection = isChangingLanes()
-+                                        ? (pastMidpoint()
-+                                           ? -myLaneChangeDirection
-+                                           : myLaneChangeDirection)
-+                                        : requestedDirection;
-+    const bool alignedActiveManeuver = (isChangingLanes()
-+                                        || unblockedSublaneManeuver)
-+                                       && (fabs(posLat) <= 0.1
-+                                           || posLat * expectedOffsetDirection >= 0.);
-+    if (alignedActiveManeuver) {
-+        // The external yaw is authoritative, while completion, lateral speed,
-+        // target reservations and memorized gaps belong to the live maneuver.
-+        myAngleOffset = 0.;
-+        myPreviousAngleOffset = 0.;
-+        myAlreadyChanged = false;
-+        updateShadowLane();
-+        return;
-+    }
-+
-+    // The external pose is authoritative. A continuous maneuver that was
-+    // inconsistent with it must not switch the primary lane from stale state.
-+    // Preserve posLat and rebuild only physical lane overlap.
-+    cleanupShadowLane();
-+    cleanupTargetLane();
-+    myLaneChangeCompletion = 1;
-+    myLaneChangeDirection = 0;
-+    setManeuverDist(0.);
-+    setSpeedLat(0.);
-+    myAngleOffset = 0.;
-+    myPreviousAngleOffset = 0.;
-+    myAlreadyChanged = false;
-+    clearGapsAtLCInit();
-+    myNoPartiallyOccupatedByShadow.clear();
-+    updateShadowLane();
-+}
-+
-+
-diff --git a/src/microsim/lcmodels/MSAbstractLaneChangeModel.h b/src/microsim/lcmodels/MSAbstractLaneChangeModel.h
-index d04c54723..85efa7ba6 100644
---- a/src/microsim/lcmodels/MSAbstractLaneChangeModel.h
-+++ b/src/microsim/lcmodels/MSAbstractLaneChangeModel.h
-@@ -538,0 +539,3 @@ public:
-+    /// @brief discard stale maneuver progress while preserving external posLat
-+    void resetForExternalState();
-+
 diff --git a/src/traci-server/TraCIServerAPI_Vehicle.cpp b/src/traci-server/TraCIServerAPI_Vehicle.cpp
 index a161772c8..911bfbd27 100644
 --- a/src/traci-server/TraCIServerAPI_Vehicle.cpp
