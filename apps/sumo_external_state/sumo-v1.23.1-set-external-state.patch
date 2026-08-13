@@ -47,7 +47,7 @@ index 239ef17be1f94ad7bba940da58b3e3dfb13aa22e..1cb39dff51369962aa7e26a8c1691f4c
 +++ b/src/libsumo/Vehicle.cpp
 @@ -21,0 +22 @@
 +#include <cmath>
-@@ -1837,0 +1839,107 @@ Vehicle::moveToXY(const std::string& vehID, const std::string& edgeID, const int
+@@ -1837,0 +1839,111 @@ Vehicle::moveToXY(const std::string& vehID, const std::string& edgeID, const int
 +void
 +Vehicle::setExternalState(const std::string& vehID, const std::string& edgeID, const int laneIndex,
 +                          const double x, const double y, double angle, double speed, double acceleration,
@@ -95,12 +95,14 @@ index 239ef17be1f94ad7bba940da58b3e3dfb13aa22e..1cb39dff51369962aa7e26a8c1691f4c
 +
 +        Position pos(x, y);
 +        pos.setz(veh->getPosition().z());
-+        const double geometryPos = hintLane->getShape().nearest_offset_to_point2D(pos, false);
++        const double geometryPos2D = hintLane->getShape().nearest_offset_to_point2D(pos, false);
++        const double geometryPos25D = hintLane->getShape().nearest_offset_to_point25D(pos, false);
 +        const double bestDistance = hintLane->getShape().distance2D(pos, false);
 +        const Position extendedCoordinates =
 +            hintLane->getShape().transformToVectorCoordinates(pos, true);
 +        const double shapeLength = hintLane->getShape().length2D();
-+        if (geometryPos == GeomHelper::INVALID_OFFSET
++        if (geometryPos2D == GeomHelper::INVALID_OFFSET
++                || geometryPos25D == GeomHelper::INVALID_OFFSET
 +                || bestDistance == GeomHelper::INVALID_OFFSET
 +                || extendedCoordinates == Position::INVALID
 +                || !std::isfinite(extendedCoordinates.x())
@@ -111,10 +113,12 @@ index 239ef17be1f94ad7bba940da58b3e3dfb13aa22e..1cb39dff51369962aa7e26a8c1691f4c
 +                                 + "' to lane '" + hintLane->getID()
 +                                 + "' within threshold " + toString(matchThreshold) + ".");
 +        }
-+        const double lanePos = hintLane->interpolateGeometryPosToLanePos(geometryPos);
++        // Lane geometry length includes elevation. Use the same 2.5D offset
++        // as moveToXY so a sloped shape endpoint maps to the declared lane end.
++        const double lanePos = hintLane->interpolateGeometryPosToLanePos(geometryPos25D);
 +        double lanePosLat = bestDistance;
-+        const bool projectsToStart = geometryPos <= POSITION_EPS;
-+        const bool projectsToEnd = geometryPos >= shapeLength - POSITION_EPS;
++        const bool projectsToStart = geometryPos2D <= POSITION_EPS;
++        const bool projectsToEnd = geometryPos2D >= shapeLength - POSITION_EPS;
 +        const bool outsideLongitudinalRange =
 +            (projectsToStart && extendedCoordinates.x() < -NUMERICAL_EPS)
 +            || (projectsToEnd && extendedCoordinates.x() > shapeLength + NUMERICAL_EPS);
@@ -143,7 +147,7 @@ index 239ef17be1f94ad7bba940da58b3e3dfb13aa22e..1cb39dff51369962aa7e26a8c1691f4c
 +            }
 +        } else {
 +            angle = GeomHelper::naviDegree(
-+                        hintLane->getShape().rotationAtOffset(geometryPos));
++                        hintLane->getShape().rotationAtOffset(geometryPos2D));
 +        }
 +        Helper::setRemoteControlled(
 +            veh, pos, hintLane, lanePos, lanePosLat, angle,
