@@ -1310,6 +1310,7 @@ class CarlaCosim(object):
             {
                 "source_carla_frame": carla_frame,
                 "carla_speed": speed,
+                "carla_yaw": float(transform.rotation.yaw),
                 "carla_longitudinal_acceleration": longitudinal_acceleration,
                 "feedback_sumo_x": sumo_state["position"][0],
                 "feedback_sumo_y": sumo_state["position"][1],
@@ -1319,6 +1320,19 @@ class CarlaCosim(object):
                 "feedback_sumo_angle": sumo_state["sumo_angle"],
             }
         )
+        if "last_action_source_carla_frame" in actor_state:
+            feedback["previous_action_source_carla_frame"] = actor_state.get(
+                "last_action_source_carla_frame"
+            )
+            feedback["previous_phase_b_target_sumo_angle"] = actor_state.get(
+                "last_phase_b_target_sumo_angle"
+            )
+            feedback["previous_phase_b_target_carla_yaw"] = actor_state.get(
+                "last_phase_b_target_carla_yaw"
+            )
+            feedback["previous_action_post_physics_carla_yaw"] = float(
+                transform.rotation.yaw
+            )
         return command, feedback
 
     def _record_ackermann_feedback(self, feedback):
@@ -2946,16 +2960,19 @@ class CarlaCosim(object):
 
         expected_frame = self._as_finite_float(feedback.get("source_carla_frame"))
         observed_frame = self._as_finite_float(observed_frame)
-        frame_lag = (
+        frame_matches = (
+            expected_frame is not None
+            and observed_frame is not None
+            and expected_frame == observed_frame
+        )
+        state["feedback_ack_failures"] = 0 if frame_matches else 1
+        state["feedback_frame_lag"] = (
             expected_frame - observed_frame
             if expected_frame is not None and observed_frame is not None
             else None
         )
-        ack_missing = frame_lag is None or frame_lag > self.ackermann_feedback_ack_max_frame_lag
-        failures = state.get("feedback_ack_failures", 0) + 1 if ack_missing else 0
-        state["feedback_ack_failures"] = failures
-        state["feedback_frame_lag"] = frame_lag
-        return failures < self.ackermann_feedback_ack_failure_limit
+        state["feedback_frame_mismatch"] = not frame_matches
+        return frame_matches
 
     def _resolve_ackermann_desired_speed(self, veh_id, veh_info):
         speed_key = (
@@ -3311,6 +3328,11 @@ class CarlaCosim(object):
             else feedback_desired_acceleration
         )
         feedback = self._ackermann_feedback_state.get(veh_id, {})
+        state["last_action_source_carla_frame"] = veh_info.get(
+            "feedback_source_carla_frame"
+        )
+        state["last_phase_b_target_sumo_angle"] = sumo_angle
+        state["last_phase_b_target_carla_yaw"] = (sumo_angle - 90.0) % 360.0
         feedback_unhealthy = (
             self._is_ackermann_feedback_apply_actor(veh_id)
             and feedback
@@ -3403,6 +3425,9 @@ class CarlaCosim(object):
         ):
             return
 
+        feedback = getattr(self, "_ackermann_feedback_state", {}).get(
+            veh_id, {}
+        )
         state = self._ackermann_actor_state.setdefault(veh_id, {})
         try:
             snapshot = self.world.get_snapshot()
@@ -3452,6 +3477,32 @@ class CarlaCosim(object):
             "actor_id": veh_id,
             "carla_frame": carla_frame,
             "simulation_time": self.terasim_states.get("simulation_time"),
+            "action_source_carla_frame": veh_info.get(
+                "feedback_source_carla_frame"
+            ),
+            "phase_a_sumo_time": self._as_finite_float(
+                veh_info.get("feedback_phase_a_sumo_time")
+            ),
+            "phase_a_observed_x": self._as_finite_float(
+                veh_info.get("feedback_observed_x")
+            ),
+            "phase_a_observed_y": self._as_finite_float(
+                veh_info.get("feedback_observed_y")
+            ),
+            "phase_a_requested_sumo_angle": self._as_finite_float(
+                feedback.get("feedback_sumo_angle")
+            ),
+            "phase_a_observed_sumo_angle": self._as_finite_float(
+                veh_info.get("feedback_observed_sumo_angle")
+            ),
+            "phase_b_target_sumo_angle": self._as_finite_float(
+                veh_info.get("sumo_angle")
+            ),
+            "phase_b_target_carla_yaw": (
+                (float(veh_info["sumo_angle"]) - 90.0) % 360.0
+                if self._as_finite_float(veh_info.get("sumo_angle")) is not None
+                else None
+            ),
             "sumo_x": self._as_finite_float(veh_info.get("x")),
             "sumo_y": self._as_finite_float(veh_info.get("y")),
             "sumo_lane_id": veh_info.get("lane_id"),
@@ -3472,6 +3523,16 @@ class CarlaCosim(object):
             "carla_x": self._as_finite_float(current_transform.location.x),
             "carla_y": self._as_finite_float(current_transform.location.y),
             "carla_yaw": self._as_finite_float(current_transform.rotation.yaw),
+            "phase_a_observed_acceleration": self._as_finite_float(
+                veh_info.get("feedback_observed_acceleration")
+            ),
+            "phase_a_observed_lane_id": veh_info.get("feedback_observed_lane_id"),
+            "sumo_lane_change_intent": veh_info.get(
+                "sumo_lane_change_intent", "none"
+            ),
+            "sumo_lane_change_target_lane_id": veh_info.get(
+                "sumo_lane_change_target_lane_id", ""
+            ),
             "sumo_desired_speed": self._as_finite_float(veh_info.get("sumo_desired_speed")),
             "sumo_reported_acceleration": self._as_finite_float(veh_info.get("acceleration")),
             "feedback_observed_speed": self._as_finite_float(veh_info.get("feedback_observed_speed")),

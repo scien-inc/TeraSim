@@ -649,6 +649,84 @@ def test_lookahead_missing_lane_does_not_reuse_stale_path(monkeypatch):
     assert compiled is None
 
 
+@pytest.mark.parametrize(
+    ("left_state", "right_state", "expected_intent", "expected_target"),
+    [
+        (2 | 8 | 256, 1, "left", "edge_32_2"),
+        (1, 4 | 8 | 256, "right", "edge_32_0"),
+        (1, 1, "none", ""),
+        (2, 4, "none", ""),
+    ],
+)
+def test_sumo_lane_change_action_exports_decision_without_changing_it(
+    monkeypatch,
+    left_state,
+    right_state,
+    expected_intent,
+    expected_target,
+):
+    from terasim_service.plugins import cosim as plugin_module
+
+    calls = []
+
+    def get_lane_change_state(actor_id, direction):
+        calls.append((actor_id, direction))
+        return (0, left_state if direction == 1 else right_state)
+
+    monkeypatch.setattr(
+        plugin_module,
+        "traci",
+        types.SimpleNamespace(
+            constants=types.SimpleNamespace(LCA_LEFT=2, LCA_RIGHT=4),
+            vehicle=types.SimpleNamespace(
+                getLaneChangeState=get_lane_change_state,
+                getLaneIndex=lambda actor_id: calls.append(
+                    (actor_id, "lane_index")
+                )
+                or 1,
+            ),
+        ),
+    )
+    plugin = plugin_module.TeraSimCoSimPlugin.__new__(plugin_module.TeraSimCoSimPlugin)
+
+    assert plugin._get_sumo_lane_change_action("AV", "edge_32_1") == (
+        expected_intent,
+        expected_target,
+    )
+    assert calls == [("AV", 1), ("AV", -1), ("AV", "lane_index")]
+
+
+def test_phase_aligned_action_schema_separates_feedback_from_target():
+    from terasim_service.utils.messages.AgentStateSimplified import (
+        AgentStateSimplified,
+    )
+
+    state = AgentStateSimplified(
+        x=20.0,
+        y=30.0,
+        sumo_angle=95.0,
+        lane_id="edge_32_2",
+        sumo_lane_change_intent="left",
+        sumo_lane_change_target_lane_id="edge_32_2",
+        feedback_observed_x=19.8,
+        feedback_observed_y=29.9,
+        feedback_observed_sumo_angle=93.0,
+        feedback_observed_speed=5.0,
+        feedback_observed_acceleration=0.25,
+        feedback_observed_lane_id="edge_32_1",
+        feedback_phase_a_sumo_time=12.5,
+        feedback_source_carla_frame=101,
+    )
+
+    assert (state.x, state.y, state.sumo_angle, state.lane_id) == (
+        20.0, 30.0, 95.0, "edge_32_2"
+    )
+    assert state.feedback_observed_x == pytest.approx(19.8)
+    assert state.feedback_observed_acceleration == pytest.approx(0.25)
+    assert state.feedback_observed_lane_id == "edge_32_1"
+    assert state.feedback_source_carla_frame == 101
+
+
 def test_route_aware_projection_switches_lane_after_centerline_midpoint():
     from terasim_service.utils.sumo_lane_geometry import (
         select_route_aware_lane_projection,
@@ -2111,6 +2189,31 @@ def test_feedback_ack_is_cached_by_shared_sumo_command_handler(monkeypatch):
     assert plugin.feedback_observed_rear_axle_positions == {"AV": (0.25, 2.0)}
     assert plugin.feedback_source_carla_frames == {"AV": 101}
     assert calls[-1] == ("speed", ("AV", 3.5))
+
+
+@pytest.mark.parametrize(
+    ("observed_frame", "expected"),
+    [(101, True), (100, False), (102, False), (None, False)],
+)
+def test_phase_b_action_requires_exact_source_carla_frame(observed_frame, expected):
+    install_fake_carla()
+    from terasim_service.utils.carla.cosim import CarlaCosim
+
+    cosim = CarlaCosim.__new__(CarlaCosim)
+    cosim._ackermann_actor_state = {}
+    cosim.ackermann_feedback_ack_max_frame_lag = 2
+    cosim.ackermann_feedback_ack_failure_limit = 3
+    feedback = {
+        "feedback_status": "queued",
+        "source_carla_frame": 101,
+    }
+
+    assert (
+        cosim._is_ackermann_feedback_healthy("AV", feedback, observed_frame)
+        is expected
+    )
+    state = cosim._ackermann_actor_state["AV"]
+    assert state["feedback_frame_mismatch"] is (not expected)
 
 
 def _external_state_handler_plugin(plugin_module):

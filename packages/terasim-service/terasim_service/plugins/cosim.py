@@ -2169,6 +2169,55 @@ class TeraSimCoSimPlugin(BasePlugin):
             add_timing(profile_ctx, f"{base}.{operation_name}_s", elapsed)
 
     @staticmethod
+    def _lane_change_target_lane_id(current_lane_id, current_lane_index, direction):
+        if not current_lane_id or direction not in {-1, 1}:
+            return ""
+        target_lane_index = current_lane_index + direction
+        if target_lane_index < 0:
+            return ""
+        lane_prefix, separator, lane_suffix = current_lane_id.rpartition("_")
+        if not separator or not lane_prefix or not lane_suffix.isdigit():
+            return ""
+        return f"{lane_prefix}_{target_lane_index}"
+
+    def _get_sumo_lane_change_action(self, vehicle_id, current_lane_id, profile_ctx=None):
+        """Export SUMO's post-decision lane-change request without altering it."""
+        try:
+            left_state = self._profile_detail_traci_call(
+                profile_ctx,
+                "vehicle_get_left_lane_change_state",
+                traci.vehicle.getLaneChangeState,
+                vehicle_id,
+                1,
+            )[1]
+            right_state = self._profile_detail_traci_call(
+                profile_ctx,
+                "vehicle_get_right_lane_change_state",
+                traci.vehicle.getLaneChangeState,
+                vehicle_id,
+                -1,
+            )[1]
+            current_lane_index = self._profile_detail_traci_call(
+                profile_ctx,
+                "vehicle_get_lane_index",
+                traci.vehicle.getLaneIndex,
+                vehicle_id,
+            )
+        except Exception:
+            return "none", ""
+
+        wants_left = bool(left_state & traci.constants.LCA_LEFT)
+        wants_right = bool(right_state & traci.constants.LCA_RIGHT)
+        if wants_left == wants_right:
+            return "none", ""
+        direction = 1 if wants_left else -1
+        intent = "left" if wants_left else "right"
+        target_lane_id = self._lane_change_target_lane_id(
+            current_lane_id, current_lane_index, direction
+        )
+        return intent, target_lane_id
+
+    @staticmethod
     def _context_vehicle_value(context_values, constant_name):
         constant = getattr(traci.constants, constant_name, None)
         if constant is None or constant not in context_values:
@@ -2730,12 +2779,52 @@ class TeraSimCoSimPlugin(BasePlugin):
                         )
                     except Exception:
                         vehicle_state.sumo_emergency_decel = None
+                    (
+                        vehicle_state.sumo_lane_change_intent,
+                        vehicle_state.sumo_lane_change_target_lane_id,
+                    ) = self._get_sumo_lane_change_action(
+                        vid, vehicle_state.lane_id, profile_ctx=profile_ctx
+                    )
+                observed_position = getattr(self, "feedback_observed_positions", {}).get(vid)
+                if observed_position is not None:
+                    vehicle_state.feedback_observed_x = observed_position[0]
+                    vehicle_state.feedback_observed_y = observed_position[1]
+                vehicle_state.feedback_observed_sumo_angle = getattr(
+                    self, "feedback_observed_angles", {}
+                ).get(vid)
                 vehicle_state.feedback_observed_speed = (
                     self.feedback_observed_speeds.get(vid)
                 )
+                vehicle_state.feedback_observed_acceleration = getattr(
+                    self, "feedback_observed_accelerations", {}
+                ).get(vid)
+                vehicle_state.feedback_observed_lane_id = getattr(
+                    self, "feedback_observed_lane_ids", {}
+                ).get(vid)
+                vehicle_state.feedback_phase_a_sumo_time = getattr(
+                    self, "feedback_phase_a_sumo_times", {}
+                ).get(vid)
                 vehicle_state.feedback_source_carla_frame = (
                     self.feedback_source_carla_frames.get(vid)
                 )
+                if vehicle_state.feedback_phase_a_sumo_time is not None:
+                    phase_delta = (
+                        simulation_state.simulation_time
+                        - vehicle_state.feedback_phase_a_sumo_time
+                    )
+                    valid_phase_delta = (
+                        abs(phase_delta) <= 1e-9
+                        or abs(
+                            phase_delta - self.ackermann_feedback_step_length
+                        ) <= 1e-9
+                    )
+                    if not valid_phase_delta:
+                        raise RuntimeError(
+                            "Ackermann Phase B time mismatch "
+                            f"actor={vid} phaseA={vehicle_state.feedback_phase_a_sumo_time} "
+                            f"phaseB={simulation_state.simulation_time} "
+                            f"expectedDelta={self.ackermann_feedback_step_length}"
+                        )
                 lookahead_requests.append((vid, vehicle_state, context_values))
                 acceleration = context_values.get(traci.constants.VAR_ACCELERATION)
                 if acceleration is None:
