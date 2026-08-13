@@ -1097,6 +1097,39 @@ def test_pure_pursuit_steers_and_rate_limits():
     assert values.acceleration == pytest.approx(3.0)
 
 
+def test_recorded_odaiba_lookahead_reproduces_raw_steer_reversal():
+    """Capture the harmful lookahead discontinuity observed for vehicle1167."""
+    from terasim_service.utils.carla.ackermann_control import (
+        compute_ackermann_control_values,
+    )
+
+    common = {
+        "current_x": 0.0,
+        "current_y": 0.0,
+        "yaw_degrees": 0.0,
+        "current_speed": 6.0,
+        "desired_x": 7.0,
+        "desired_y": 0.0,
+        "desired_speed": 6.0,
+        "wheel_base": 2.85,
+    }
+    before = compute_ackermann_control_values(
+        **common,
+        lookahead_x=6.829,
+        lookahead_y=1.536,
+    )
+    after = compute_ackermann_control_values(
+        **common,
+        lookahead_x=5.112,
+        lookahead_y=-4.782,
+    )
+
+    assert before.raw_steer == pytest.approx(0.177, abs=0.002)
+    assert after.raw_steer == pytest.approx(-0.509, abs=0.002)
+    assert before.lookahead_local_y > 0.0
+    assert after.lookahead_local_y < 0.0
+
+
 def test_feedback_wildcard_excludes_av_unless_explicit():
     install_fake_carla()
     from terasim_service.utils.carla.cosim import CarlaCosim
