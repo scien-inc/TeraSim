@@ -130,6 +130,16 @@ def _odaiba_network_path() -> Path:
     return network_path
 
 
+def _odaiba_repaired_network_path() -> Path:
+    network_path = (
+        Path(__file__).resolve().parents[2]
+        / "examples/maps/odaiba_ll2/tlmappings_0708/network.repaired_geometry.net.xml"
+    )
+    if not network_path.is_file():
+        pytest.skip("Odaiba repaired-geometry network is not available")
+    return network_path
+
+
 def _write_odaiba_edge426_route(
     tmp_path: Path, *, vehicle_id: str = "ego", depart_lane: int = 1
 ) -> tuple[Path, Path]:
@@ -192,6 +202,29 @@ def _write_odaiba_edge99_route(
                 <route id="route" edges="edge_99 edge_2474 edge_2479"/>
                 <vehicle id="{vehicle_id}" type="car" route="route" depart="0"
                          departLane="0" departPos="682.5" departSpeed="4"/>
+            </routes>
+            """
+        ),
+        encoding="utf-8",
+    )
+    return network_path, routes_path
+
+
+def _write_odaiba_edge1603_route(
+    tmp_path: Path, *, vehicle_id: str
+) -> tuple[Path, Path]:
+    network_path = _odaiba_repaired_network_path()
+    routes_path = tmp_path / f"edge1603-{vehicle_id}.rou.xml"
+    routes_path.write_text(
+        textwrap.dedent(
+            f"""\
+            <routes>
+                <vType id="car" accel="2.6" decel="4.5" emergencyDecel="9"
+                       sigma="0" length="5" width="1.8" maxSpeed="16.667"
+                       laneChangeModel="SL2015"/>
+                <route id="route" edges="edge_1603 edge_3222 edge_1287"/>
+                <vehicle id="{vehicle_id}" type="car" route="route" depart="0"
+                         departLane="0" departPos="2880" departSpeed="16"/>
             </routes>
             """
         ),
@@ -1276,6 +1309,7 @@ def test_strict_external_state_preserves_longitudinal_edge99_overrun(
         assert traci.vehicle.getLaneID(vehicle_id) == "edge_99_0"
         assert abs(traci.vehicle.getLateralLanePosition(vehicle_id)) < 0.02
 
+        traci.simulation.executeMove()
         traci.simulationStep()
 
         assert traci.simulation.getTime() == pytest.approx(
@@ -1323,6 +1357,7 @@ def test_strict_external_state_preserves_longitudinal_edge99_overrun(
                 traci.vehicle.getPosition(vehicle_id), phase_b_state[0]
             ) < POSITION_TOLERANCE
 
+            traci.simulation.executeMove()
             traci.simulationStep()
 
             assert traci.simulation.getTime() == pytest.approx(
@@ -1343,6 +1378,104 @@ def test_strict_external_state_preserves_longitudinal_edge99_overrun(
                 break
 
         assert reached_successor
+    finally:
+        traci.close()
+
+
+@pytest.mark.parametrize("vehicle_id", ["AV", "BV"])
+@pytest.mark.integration
+@pytest.mark.requires_sumo
+def test_strict_external_state_advances_from_repaired_edge1603(
+    tmp_path: Path, vehicle_id: str
+) -> None:
+    """The field-run edge transition survives planning after strict Phase A."""
+    traci = pytest.importorskip("traci")
+    if not hasattr(traci.vehicle, "setExternalState"):
+        pytest.skip("requires the dedicated SUMO setExternalState build")
+
+    sumo = _find_binary("sumo")
+    network_path, routes_path = _write_odaiba_edge1603_route(
+        tmp_path, vehicle_id=vehicle_id
+    )
+    traci.start(
+        [
+            sumo,
+            "--net-file",
+            str(network_path),
+            "--route-files",
+            str(routes_path),
+            "--step-length",
+            str(STEP_LENGTH),
+            "--lateral-resolution",
+            "0.2",
+            "--no-step-log",
+            "true",
+            "--duration-log.disable",
+            "true",
+        ],
+        numRetries=5,
+    )
+    try:
+        traci.simulationStep()
+        assert traci.vehicle.getLaneID(vehicle_id) == "edge_1603_0"
+
+        successor_shape = traci.lane.getShape("edge_3222_0")
+        successor_length = traci.lane.getLength("edge_3222_0")
+        target_position = _position_at_declared_lane_offset(
+            successor_shape, successor_length, 0.1
+        )
+        next_target = _position_at_declared_lane_offset(
+            successor_shape, successor_length, 0.2
+        )
+        direction_length = math.dist(target_position, next_target)
+        direction = (
+            (next_target[0] - target_position[0]) / direction_length,
+            (next_target[1] - target_position[1]) / direction_length,
+        )
+        target_angle = math.degrees(
+            math.atan2(direction[0], direction[1])
+        ) % 360.0
+
+        phase_a_time = traci.simulation.getTime()
+        traci.vehicle.setExternalState(
+            vehicle_id,
+            "edge_1603",
+            0,
+            target_position[0],
+            target_position[1],
+            target_angle,
+            16.0,
+            0.0,
+            keepRoute=1,
+            matchThreshold=8.0,
+            strictLaneHint=True,
+        )
+        assert traci.simulation.getTime() == phase_a_time
+        assert traci.vehicle.getLaneID(vehicle_id) == "edge_1603_0"
+        assert traci.vehicle.getLanePosition(vehicle_id) == pytest.approx(
+            traci.lane.getLength("edge_1603_0")
+        )
+
+        assert math.dist(
+            traci.vehicle.getPosition(vehicle_id), target_position
+        ) < POSITION_TOLERANCE
+
+        traci.simulation.executeMove()
+        traci.simulationStep()
+
+        assert traci.simulation.getTime() == pytest.approx(
+            phase_a_time + STEP_LENGTH
+        )
+        phase_b_lane = traci.vehicle.getLaneID(vehicle_id)
+        phase_b_position = traci.vehicle.getPosition(vehicle_id)
+        assert phase_b_lane != "edge_1603_0"
+        assert phase_b_lane.startswith(":") or phase_b_lane == "edge_3222_0"
+        assert math.dist(phase_b_position, target_position) < 1.0
+        assert abs(
+            _signed_lateral_offset(
+                phase_b_position, successor_shape[0], direction
+            )
+        ) < 0.15
     finally:
         traci.close()
 
