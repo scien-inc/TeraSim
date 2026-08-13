@@ -58,7 +58,15 @@ class AgentStateSimplified(BaseModel):
     # SUMO's next desired speed and the latest CARLA observation accepted by SUMO.
     sumo_desired_speed: float | None = None
     sumo_emergency_decel: float | None = None
+    sumo_lane_change_intent: str = "none"
+    sumo_lane_change_target_lane_id: str = ""
+    feedback_observed_x: float | None = None
+    feedback_observed_y: float | None = None
+    feedback_observed_sumo_angle: float | None = None
     feedback_observed_speed: float | None = None
+    feedback_observed_acceleration: float | None = None
+    feedback_observed_lane_id: str | None = None
+    feedback_phase_a_sumo_time: float | None = None
     feedback_source_carla_frame: int | None = None
     feedback_longitudinal_error: float | None = None
 
