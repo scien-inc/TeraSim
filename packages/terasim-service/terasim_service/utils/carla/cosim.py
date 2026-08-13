@@ -3032,9 +3032,9 @@ class CarlaCosim(object):
             or self.step_length <= 0.0
         )
         state["sumo_action_invalid"] = invalid_action
-        state.pop("restart_target_speed", None)
-        state["restart_active"] = False
         if invalid_action:
+            state.pop("restart_target_speed", None)
+            state["restart_active"] = False
             state["applied_desired_acceleration"] = None
             state["longitudinal_velocity_error"] = None
             return 0.0, -max_decel
@@ -3045,7 +3045,42 @@ class CarlaCosim(object):
         )
         state["longitudinal_velocity_error"] = sumo_next_speed - current_speed
         state["applied_desired_acceleration"] = desired_acceleration
-        return sumo_next_speed, desired_acceleration
+        speed_target = sumo_next_speed
+        restart_target = self._as_finite_float(state.get("restart_target_speed"))
+        restart_active = (
+            bool(state.get("restart_active")) and restart_target is not None
+        )
+        restart_cancelled = (
+            requested_acceleration <= 0.0
+            or sumo_next_speed <= self.ackermann_tuning.restart_speed_epsilon
+            or current_speed >= self.ackermann_tuning.restart_release_speed
+        )
+        if restart_cancelled:
+            state.pop("restart_target_speed", None)
+            state["restart_active"] = False
+        else:
+            restart_requested = (
+                current_speed <= self.ackermann_tuning.restart_enter_speed
+                and sumo_next_speed
+                > current_speed + self.ackermann_tuning.restart_speed_epsilon
+            )
+            if restart_requested:
+                if restart_target is None:
+                    restart_target = sumo_next_speed
+                else:
+                    restart_target += requested_acceleration * self.step_length
+                restart_target = min(
+                    self.ackermann_tuning.restart_max_target_speed,
+                    max(0.0, restart_target),
+                )
+                restart_active = True
+                state["restart_target_speed"] = restart_target
+                state["restart_active"] = True
+
+            if restart_active and restart_target is not None:
+                speed_target = max(speed_target, restart_target)
+
+        return speed_target, desired_acceleration
 
     def _current_direct_brake_steer(self, veh_id, vehicle):
         try:

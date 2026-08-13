@@ -3465,7 +3465,7 @@ def _make_ackermann_authority_test_cosim(actor_id):
 
 
 @pytest.mark.parametrize("actor_id", ["AV", "vehicle123"])
-def test_ackermann_target_never_accumulates_above_sumo_action(actor_id):
+def test_ackermann_restart_target_accumulates_to_point3_for_av_and_background(actor_id):
     cosim = _make_ackermann_authority_test_cosim(actor_id)
     veh_info = {
         "speed": 0.092,
@@ -3483,13 +3483,15 @@ def test_ackermann_target_never_accumulates_above_sumo_action(actor_id):
         for _ in range(4)
     ]
 
-    assert targets == pytest.approx([0.092] * 4)
-    assert cosim._ackermann_actor_state[actor_id]["restart_active"] is False
-    assert "restart_target_speed" not in cosim._ackermann_actor_state[actor_id]
+    assert targets == pytest.approx([0.092, 0.184, 0.276, 0.3])
+    assert cosim._ackermann_actor_state[actor_id]["restart_active"] is True
+    assert cosim._ackermann_actor_state[actor_id]["restart_target_speed"] == pytest.approx(
+        0.3
+    )
 
 
 @pytest.mark.parametrize("actor_id", ["AV", "vehicle123"])
-def test_ackermann_stale_restart_target_is_discarded(actor_id):
+def test_ackermann_restart_target_is_held_until_carla_reaches_release_speed(actor_id):
     cosim = _make_ackermann_authority_test_cosim(actor_id)
     cosim._ackermann_actor_state = {
         actor_id: {
@@ -3508,9 +3510,8 @@ def test_ackermann_stale_restart_target_is_discarded(actor_id):
         },
         current_speed=0.1,
     )
-    assert held_target == pytest.approx(0.192)
-    assert cosim._ackermann_actor_state[actor_id]["restart_active"] is False
-    assert "restart_target_speed" not in cosim._ackermann_actor_state[actor_id]
+    assert held_target == pytest.approx(0.276)
+    assert cosim._ackermann_actor_state[actor_id]["restart_active"] is True
 
     released_target, _acceleration = cosim._resolve_ackermann_longitudinal_target(
         actor_id,
