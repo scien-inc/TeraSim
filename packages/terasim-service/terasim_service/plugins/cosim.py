@@ -23,10 +23,10 @@ from ..utils import SimulationState, AgentStateSimplified, SUMOSignal, AgentComm
 from ..utils.sumo_lane_geometry import (
     adapt_lookahead_distances_for_compiled_paths,
     blend_lane_change_lookahead,
+    build_external_state_lateral_action_lookahead,
     compile_lane_shapes,
     extract_next_link_lane_ids,
     find_lookahead_positions_from_compiled_paths,
-    project_position_by_sumo_angle,
     reconstruct_position_from_lane_geometry,
     select_route_aware_lane_projection,
 )
@@ -2191,14 +2191,14 @@ class TeraSimCoSimPlugin(BasePlugin):
             add_timing(profile_ctx, f"{base}.{command_name}_calls", 1.0)
 
     @staticmethod
-    def _profile_detail_python_call(profile_ctx, operation_name, function, *args):
+    def _profile_detail_python_call(profile_ctx, operation_name, function, *args, **kwargs):
         """Call pure Python geometry and time it only while profiling is active."""
         if get_profile(profile_ctx) is None:
-            return function(*args)
+            return function(*args, **kwargs)
 
         start = time.perf_counter()
         try:
-            return function(*args)
+            return function(*args, **kwargs)
         finally:
             elapsed = time.perf_counter() - start
             base = "terasim_internal.state_export.ackermann_detail_breakdown.python"
@@ -2511,62 +2511,41 @@ class TeraSimCoSimPlugin(BasePlugin):
 
         return compiled_path
 
-    def _external_state_lane_change_blend_active(
-        self,
-        vehicle_id,
-        vehicle_state,
-        lateral_speed,
-        lateral_offset,
-    ):
-        """Gate CARLA lane-change steering on SUMO's explicit maneuver intent."""
+    def _external_state_lane_change_maneuver(self, vehicle_id, vehicle_state):
+        """Latch only the source and target explicitly selected by SUMO."""
         maneuvers = getattr(self, "external_state_lane_change_maneuvers", None)
         if maneuvers is None:
             maneuvers = {}
             self.external_state_lane_change_maneuvers = maneuvers
 
         intent = getattr(vehicle_state, "sumo_lane_change_intent", "none")
-        target_lane_id = getattr(
-            vehicle_state, "sumo_lane_change_target_lane_id", ""
-        )
+        target_lane_id = getattr(vehicle_state, "sumo_lane_change_target_lane_id", "")
         current_lane_id = getattr(vehicle_state, "lane_id", "")
+        maneuver = maneuvers.get(vehicle_id)
         if intent in {"left", "right"}:
-            existing_maneuver = maneuvers.get(vehicle_id)
+            if not target_lane_id:
+                return None, "missing_sumo_lane_change_target"
             if (
-                existing_maneuver is not None
-                and existing_maneuver.get("intent") == intent
-                and existing_maneuver.get("target_lane_id") == current_lane_id
+                maneuver is None
+                or maneuver.get("intent") != intent
+                or target_lane_id not in {current_lane_id, maneuver.get("target_lane_id")}
             ):
-                return True
-            if target_lane_id:
-                maneuvers[vehicle_id] = {
+                maneuver = {
                     "intent": intent,
                     "source_lane_id": current_lane_id,
                     "target_lane_id": target_lane_id,
                 }
-            return True
+                maneuvers[vehicle_id] = maneuver
+            return maneuver, ""
 
-        maneuver = maneuvers.get(vehicle_id)
         if maneuver is None:
-            return False
-        maneuver_lanes = {
+            return None, ""
+        if current_lane_id not in {
             maneuver.get("source_lane_id"),
             maneuver.get("target_lane_id"),
-        }
-        if current_lane_id not in maneuver_lanes:
-            maneuvers.pop(vehicle_id, None)
-            return False
-
-        lateral_motion_active = (
-            abs(float(lateral_speed))
-            >= getattr(self, "lookahead_lane_change_speed_start", 0.05)
-            or abs(float(lateral_offset))
-            >= getattr(self, "lookahead_lane_change_offset_start", 0.15)
-        )
-        if lateral_motion_active:
-            return True
-
-        maneuvers.pop(vehicle_id, None)
-        return False
+        }:
+            return maneuver, "maneuver_primary_lane_mismatch"
+        return maneuver, ""
 
     def _populate_vehicle_lookaheads(self, requests, profile_ctx=None):
         if not requests:
@@ -2648,8 +2627,20 @@ class TeraSimCoSimPlugin(BasePlugin):
             effective_distances,
             z_values,
         )
-        for request, lookahead, lookahead_distance, heading_change in zip(
-            requests, lookaheads, effective_distances, heading_changes
+        for (
+            request,
+            compiled_path,
+            current_position,
+            lookahead,
+            lookahead_distance,
+            heading_change,
+        ) in zip(
+            requests,
+            compiled_paths,
+            current_positions,
+            lookaheads,
+            effective_distances,
+            heading_changes,
         ):
             vehicle_id, vehicle_state, context_values = request
             vehicle_state.lookahead_distance = lookahead_distance
@@ -2665,18 +2656,116 @@ class TeraSimCoSimPlugin(BasePlugin):
             if not has_lateral_offset:
                 lateral_offset = getattr(vehicle_state, "lateral_offset", 0.0)
             vehicle_state.lateral_speed = lateral_speed
-            use_external_state_lookahead = self._uses_external_state_route_lookahead(
-                vehicle_id
-            )
-            blend_lane_change = not use_external_state_lookahead
+            use_external_state_lookahead = self._uses_external_state_route_lookahead(vehicle_id)
+
             if use_external_state_lookahead:
-                blend_lane_change = self._external_state_lane_change_blend_active(
+                maneuver, maneuver_error = self._external_state_lane_change_maneuver(
                     vehicle_id,
                     vehicle_state,
-                    lateral_speed,
-                    lateral_offset,
                 )
-            if blend_lane_change:
+                target_lane_shape = None
+                if maneuver is not None and not maneuver_error:
+                    try:
+                        target_lane_shape = self._get_lookahead_lane_shape(
+                            maneuver.get("target_lane_id"),
+                            profile_ctx=profile_ctx,
+                        )
+                    except Exception:
+                        target_lane_shape = None
+
+                if maneuver_error:
+                    action_result = {
+                        "valid": False,
+                        "error": maneuver_error,
+                        "mode": "route",
+                        "lookahead": None,
+                        "route_lookahead": None,
+                        "lateral_displacement": 0.0,
+                        "target_lateral_distance": None,
+                    }
+                else:
+                    previous_lateral_displacement = None
+                    max_lateral_displacement_change = None
+                    if maneuver is not None:
+                        maneuver["max_abs_lateral_speed"] = max(
+                            float(maneuver.get("max_abs_lateral_speed", 0.0)),
+                            abs(float(lateral_speed)),
+                        )
+                        previous_lateral_displacement = float(
+                            maneuver.get("lateral_horizon_displacement", 0.0)
+                        )
+                        max_lateral_displacement_change = (
+                            maneuver["max_abs_lateral_speed"]
+                            * getattr(self, "ackermann_feedback_step_length", 0.05)
+                        )
+                    action_result = self._profile_detail_python_call(
+                        profile_ctx,
+                        "build_external_state_lateral_action_lookahead",
+                        build_external_state_lateral_action_lookahead,
+                        compiled_path,
+                        current_position,
+                        lookahead_distance,
+                        target_lane_shape=target_lane_shape,
+                        lateral_speed=lateral_speed,
+                        desired_speed=vehicle_state.sumo_desired_speed,
+                        maneuver_active=maneuver is not None,
+                        min_forward_speed=0.2,
+                        previous_lateral_displacement=previous_lateral_displacement,
+                        max_lateral_displacement_change=max_lateral_displacement_change,
+                        z=vehicle_state.z,
+                    )
+                    if maneuver is not None and action_result.get("valid", False):
+                        maneuver["lateral_horizon_displacement"] = float(
+                            action_result.get("lateral_displacement", 0.0)
+                        )
+
+                target_lateral_distance = action_result.get("target_lateral_distance")
+                maneuver_settled = (
+                    maneuver is not None
+                    and action_result.get("valid", False)
+                    and vehicle_state.lane_id == maneuver.get("target_lane_id")
+                    and abs(float(lateral_speed))
+                    < getattr(self, "lookahead_lane_change_speed_start", 0.05)
+                    and target_lateral_distance is not None
+                    and target_lateral_distance
+                    < getattr(self, "lookahead_lane_change_offset_start", 0.15)
+                )
+                if maneuver_settled:
+                    self.external_state_lane_change_maneuvers.pop(vehicle_id, None)
+                    settled_distance = target_lateral_distance
+                    action_result = self._profile_detail_python_call(
+                        profile_ctx,
+                        "build_external_state_route_lookahead",
+                        build_external_state_lateral_action_lookahead,
+                        compiled_path,
+                        current_position,
+                        lookahead_distance,
+                        maneuver_active=False,
+                        z=vehicle_state.z,
+                    )
+                    action_result["target_lateral_distance"] = settled_distance
+
+                route_lookahead = action_result.get("route_lookahead")
+                if route_lookahead is not None:
+                    (
+                        vehicle_state.lookahead_route_x,
+                        vehicle_state.lookahead_route_y,
+                        vehicle_state.lookahead_route_z,
+                    ) = route_lookahead
+                vehicle_state.lookahead_action_mode = action_result.get("mode", "route")
+                vehicle_state.lookahead_action_valid = bool(action_result.get("valid", False))
+                vehicle_state.lookahead_action_error = action_result.get("error", "")
+                vehicle_state.lookahead_lateral_horizon_displacement = float(
+                    action_result.get("lateral_displacement", 0.0)
+                )
+                vehicle_state.lookahead_target_lateral_distance = action_result.get(
+                    "target_lateral_distance"
+                )
+                vehicle_state.lookahead_lane_change_blend = 0.0
+                lookahead = action_result.get("lookahead")
+            else:
+                vehicle_state.lookahead_action_mode = "legacy_angle"
+                vehicle_state.lookahead_action_valid = True
                 lookahead, lane_change_blend = self._profile_detail_python_call(
                     profile_ctx,
                     "blend_lane_change_lookahead",
@@ -2696,9 +2785,8 @@ class TeraSimCoSimPlugin(BasePlugin):
                     getattr(self, "lookahead_lane_change_offset_start", 0.15),
                     getattr(self, "lookahead_lane_change_offset_full", 0.75),
                 )
-            else:
-                lane_change_blend = 0.0
-            vehicle_state.lookahead_lane_change_blend = lane_change_blend
+                vehicle_state.lookahead_lane_change_blend = lane_change_blend
+
             if lookahead is None:
                 continue
             vehicle_state.lookahead_x = lookahead[0]

@@ -27,6 +27,14 @@ class AgentStateSimplified(BaseModel):
     lookahead_distance: float = 0.0
     lookahead_heading_change: float = 0.0
     lookahead_lane_change_blend: float = 0.0
+    lookahead_route_x: float = 0.0
+    lookahead_route_y: float = 0.0
+    lookahead_route_z: float = 0.0
+    lookahead_action_mode: str = "route"
+    lookahead_action_valid: bool = True
+    lookahead_action_error: str = ""
+    lookahead_lateral_horizon_displacement: float = 0.0
+    lookahead_target_lateral_distance: float | None = None
     lookahead_origin_x: float = 0.0
     lookahead_origin_y: float = 0.0
     lateral_speed: float = 0.0

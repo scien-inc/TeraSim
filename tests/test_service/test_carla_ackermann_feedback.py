@@ -167,6 +167,132 @@ def test_lane_lookahead_crosses_internal_and_destination_lanes():
     assert point == pytest.approx((15.0, 0.0, 1.5))
 
 
+@pytest.mark.parametrize(("target_y", "expected_lateral"), [(3.2, 0.4), (-3.2, -0.4)])
+def test_external_state_lateral_action_lookahead_uses_target_geometry(
+    target_y,
+    expected_lateral,
+):
+    from terasim_service.utils.sumo_lane_geometry import (
+        build_external_state_lateral_action_lookahead,
+        compile_lane_shapes,
+    )
+
+    result = build_external_state_lateral_action_lookahead(
+        compile_lane_shapes([[(0.0, 0.0), (100.0, 0.0)]]),
+        (5.0, 0.0),
+        10.0,
+        target_lane_shape=[(0.0, target_y), (100.0, target_y)],
+        lateral_speed=0.32,
+        desired_speed=8.0,
+        maneuver_active=True,
+    )
+
+    assert result["valid"] is True
+    assert result["mode"] == "sumo_lateral_velocity"
+    assert result["route_lookahead"] == pytest.approx((15.0, 0.0, 0.0))
+    assert result["lookahead"] == pytest.approx((15.0, expected_lateral, 0.0))
+    assert result["lateral_displacement"] == pytest.approx(0.4)
+    assert result["target_lateral_distance"] == pytest.approx(3.2)
+
+
+def test_external_state_route_lookahead_preserves_carla_offset_through_curve():
+    from terasim_service.utils.sumo_lane_geometry import (
+        build_external_state_lateral_action_lookahead,
+        compile_lane_shapes,
+    )
+
+    result = build_external_state_lateral_action_lookahead(
+        compile_lane_shapes([[(0.0, 0.0), (10.0, 0.0)], [(10.0, 0.0), (10.0, 20.0)]]),
+        (8.0, 0.5),
+        5.0,
+    )
+
+    assert result["valid"] is True
+    assert result["mode"] == "route"
+    assert result["lookahead"] == pytest.approx((10.0, 3.5, 0.0))
+
+
+def test_external_state_lateral_action_defers_without_creep_at_low_speed():
+    from terasim_service.utils.sumo_lane_geometry import (
+        build_external_state_lateral_action_lookahead,
+        compile_lane_shapes,
+    )
+
+    result = build_external_state_lateral_action_lookahead(
+        compile_lane_shapes([[(0.0, 0.0), (100.0, 0.0)]]),
+        (5.0, -0.8),
+        7.0,
+        target_lane_shape=[(0.0, 0.0), (100.0, 0.0)],
+        lateral_speed=0.35,
+        desired_speed=0.2,
+        maneuver_active=True,
+    )
+
+    assert result["valid"] is True
+    assert result["mode"] == "deferred"
+    assert result["lookahead"] == pytest.approx((12.0, -0.8, 0.0))
+    assert result["lateral_displacement"] == pytest.approx(0.0)
+
+
+def test_external_state_lateral_action_rejects_missing_target_geometry():
+    from terasim_service.utils.sumo_lane_geometry import (
+        build_external_state_lateral_action_lookahead,
+        compile_lane_shapes,
+    )
+
+    result = build_external_state_lateral_action_lookahead(
+        compile_lane_shapes([[(0.0, 0.0), (100.0, 0.0)]]),
+        (5.0, 0.0),
+        7.0,
+        target_lane_shape=None,
+        lateral_speed=0.35,
+        desired_speed=5.0,
+        maneuver_active=True,
+    )
+
+    assert result["valid"] is False
+    assert result["error"] == "missing_target_lane_geometry"
+    assert result["lookahead"] is None
+
+
+def test_external_state_lateral_action_preview_does_not_flip_when_sumo_pauses():
+    from terasim_service.utils.sumo_lane_geometry import (
+        build_external_state_lateral_action_lookahead,
+        compile_lane_shapes,
+    )
+
+    compiled_path = compile_lane_shapes(
+        [[(0.0, 0.0), (2.0, 0.0), (9.0, 1.4), (16.0, 3.0)]]
+    )
+    target_lane = [(0.0, -3.2), (20.0, -3.2)]
+    active = build_external_state_lateral_action_lookahead(
+        compiled_path,
+        (0.0, 0.0),
+        7.5,
+        target_lane_shape=target_lane,
+        lateral_speed=-1.0,
+        desired_speed=1.0,
+        maneuver_active=True,
+    )
+    paused = build_external_state_lateral_action_lookahead(
+        compiled_path,
+        (0.05, 0.0),
+        7.5,
+        target_lane_shape=target_lane,
+        lateral_speed=0.0,
+        desired_speed=1.0,
+        maneuver_active=True,
+        previous_lateral_displacement=active["lateral_displacement"],
+        max_lateral_displacement_change=0.05,
+    )
+
+    assert active["lookahead"][1] < 0.0
+    assert paused["lookahead"][1] < 0.0
+    assert paused["lateral_displacement"] == pytest.approx(
+        active["lateral_displacement"] - 0.05
+    )
+
+
 def test_lane_relative_position_preserves_longitudinal_and_lateral_offsets():
     from terasim_service.utils.sumo_lane_geometry import (
         reconstruct_position_from_lane_geometry,
@@ -411,11 +537,18 @@ def test_vehicle_lookahead_exports_phase_aligned_lane_progress_error(monkeypatch
         "lane_change_intent",
         "expected_lookahead",
         "expected_blend",
+        "expected_mode",
     ),
     [
-        ("external_state", "none", (10.0, 1.5), 0.0),
-        ("external_state", "left", (11.5, -0.9), 1.0),
-        ("legacy", "none", (11.5, -0.9), 1.0),
+        ("external_state", "none", (10.0, 0.6), 0.0, "route"),
+        (
+            "external_state",
+            "left",
+            (10.0, 0.6175),
+            0.0,
+            "sumo_lateral_velocity",
+        ),
+        ("legacy", "none", (11.5, -0.9), 1.0, "legacy_angle"),
     ],
 )
 def test_feedback_lookahead_blending_depends_on_assimilation_mode(
@@ -424,6 +557,7 @@ def test_feedback_lookahead_blending_depends_on_assimilation_mode(
     lane_change_intent,
     expected_lookahead,
     expected_blend,
+    expected_mode,
 ):
     from terasim_service.plugins import cosim as plugin_module
     from terasim_service.utils.messages.AgentStateSimplified import (
@@ -432,9 +566,7 @@ def test_feedback_lookahead_blending_depends_on_assimilation_mode(
     from terasim_service.utils.sumo_lane_geometry import compile_lane_shapes
 
     constants = types.SimpleNamespace(VAR_SPEED_LAT=1, VAR_LANEPOSITION_LAT=2)
-    monkeypatch.setattr(
-        plugin_module, "traci", types.SimpleNamespace(constants=constants)
-    )
+    monkeypatch.setattr(plugin_module, "traci", types.SimpleNamespace(constants=constants))
     plugin = plugin_module.TeraSimCoSimPlugin.__new__(plugin_module.TeraSimCoSimPlugin)
     plugin.feedback_observed_positions = {"AV": (8.0, -0.9)}
     plugin.feedback_source_carla_frames = {"AV": 123}
@@ -446,21 +578,22 @@ def test_feedback_lookahead_blending_depends_on_assimilation_mode(
     plugin.lookahead_curve_start_radians = math.radians(5.0)
     plugin.lookahead_curve_full_scale_radians = math.radians(45.0)
     plugin._get_vehicle_lookahead_compiled_path = lambda *args, **kwargs: (
-        compile_lane_shapes(
-            [[(0.0, 0.0), (10.0, 0.0)], [(10.0, 0.0), (10.0, 20.0)]]
-        )
+        compile_lane_shapes([[(0.0, 0.0), (10.0, 0.0)], [(10.0, 0.0), (10.0, 20.0)]])
     )
+    plugin._get_lookahead_lane_shape = lambda *_args, **_kwargs: [
+        (0.0, 0.0),
+        (20.0, 0.0),
+    ]
     state = AgentStateSimplified(
         x=8.0,
         y=-0.9,
         speed=10.0,
+        sumo_desired_speed=10.0,
         sumo_angle=90.0,
         z=0.0,
         lane_id="edge_32_1",
         sumo_lane_change_intent=lane_change_intent,
-        sumo_lane_change_target_lane_id=(
-            "edge_32_2" if lane_change_intent == "left" else ""
-        ),
+        sumo_lane_change_target_lane_id=("edge_32_2" if lane_change_intent == "left" else ""),
     )
 
     plugin._populate_vehicle_lookaheads(
@@ -479,11 +612,13 @@ def test_feedback_lookahead_blending_depends_on_assimilation_mode(
     assert state.lookahead_distance == pytest.approx(3.5)
     assert state.lookahead_heading_change == pytest.approx(math.pi / 2.0)
     assert state.lookahead_lane_change_blend == pytest.approx(expected_blend)
+    assert state.lookahead_action_mode == expected_mode
+    assert state.lookahead_action_valid is True
     assert state.lookahead_x == pytest.approx(expected_lookahead[0])
     assert state.lookahead_y == pytest.approx(expected_lookahead[1])
 
 
-def test_external_state_lane_change_blend_continues_after_primary_lane_switch(
+def test_external_state_lane_change_action_continues_after_primary_lane_switch(
     monkeypatch,
 ):
     from terasim_service.plugins import cosim as plugin_module
@@ -493,9 +628,7 @@ def test_external_state_lane_change_blend_continues_after_primary_lane_switch(
     from terasim_service.utils.sumo_lane_geometry import compile_lane_shapes
 
     constants = types.SimpleNamespace(VAR_SPEED_LAT=1, VAR_LANEPOSITION_LAT=2)
-    monkeypatch.setattr(
-        plugin_module, "traci", types.SimpleNamespace(constants=constants)
-    )
+    monkeypatch.setattr(plugin_module, "traci", types.SimpleNamespace(constants=constants))
     plugin = plugin_module.TeraSimCoSimPlugin.__new__(plugin_module.TeraSimCoSimPlugin)
     plugin.feedback_observed_positions = {"AV": (8.0, -0.9)}
     plugin.feedback_source_carla_frames = {"AV": 123}
@@ -509,11 +642,16 @@ def test_external_state_lane_change_blend_continues_after_primary_lane_switch(
     plugin._get_vehicle_lookahead_compiled_path = lambda *args, **kwargs: (
         compile_lane_shapes([[(0.0, 0.0), (20.0, 0.0)]])
     )
+    plugin._get_lookahead_lane_shape = lambda *_args, **_kwargs: [
+        (0.0, 0.0),
+        (20.0, 0.0),
+    ]
 
     requested = AgentStateSimplified(
         x=8.0,
         y=-0.9,
         speed=10.0,
+        sumo_desired_speed=10.0,
         sumo_angle=90.0,
         lane_id="edge_32_1",
         sumo_lane_change_intent="left",
@@ -527,13 +665,16 @@ def test_external_state_lane_change_blend_continues_after_primary_lane_switch(
             constants.VAR_LANEPOSITION_LAT: -0.9,
         },
     )
-    assert requested.lookahead_lane_change_blend == pytest.approx(1.0)
+    assert requested.lookahead_action_mode == "sumo_lateral_velocity"
+    assert requested.lookahead_lane_change_blend == pytest.approx(0.0)
+    assert requested.lookahead_y > -0.9
 
     switched = AgentStateSimplified(
         x=8.0,
         y=-0.9,
         speed=10.0,
-        sumo_angle=90.0,
+        sumo_desired_speed=10.0,
+        sumo_angle=20.0,
         lane_id="edge_32_2",
     )
     plugin._populate_vehicle_lookahead(
@@ -544,13 +685,15 @@ def test_external_state_lane_change_blend_continues_after_primary_lane_switch(
             constants.VAR_LANEPOSITION_LAT: -0.4,
         },
     )
-    assert switched.lookahead_lane_change_blend > 0.0
+    assert switched.lookahead_action_mode == "sumo_lateral_velocity"
+    assert switched.lookahead_y > -0.9
 
     settled = AgentStateSimplified(
         x=8.0,
         y=0.0,
         speed=10.0,
-        sumo_angle=90.0,
+        sumo_desired_speed=10.0,
+        sumo_angle=200.0,
         lane_id="edge_32_2",
     )
     plugin.feedback_observed_positions["AV"] = (8.0, 0.0)
@@ -562,8 +705,56 @@ def test_external_state_lane_change_blend_continues_after_primary_lane_switch(
             constants.VAR_LANEPOSITION_LAT: 0.0,
         },
     )
+    assert settled.lookahead_action_mode == "route"
     assert settled.lookahead_lane_change_blend == pytest.approx(0.0)
     assert "AV" not in plugin.external_state_lane_change_maneuvers
+
+
+def test_external_state_lane_change_action_missing_target_is_invalid(monkeypatch):
+    from terasim_service.plugins import cosim as plugin_module
+    from terasim_service.utils.messages.AgentStateSimplified import (
+        AgentStateSimplified,
+    )
+    from terasim_service.utils.sumo_lane_geometry import compile_lane_shapes
+
+    constants = types.SimpleNamespace(VAR_SPEED_LAT=1, VAR_LANEPOSITION_LAT=2)
+    monkeypatch.setattr(plugin_module, "traci", types.SimpleNamespace(constants=constants))
+    plugin = plugin_module.TeraSimCoSimPlugin.__new__(plugin_module.TeraSimCoSimPlugin)
+    plugin.feedback_observed_positions = {"AV": (8.0, 0.0)}
+    plugin.feedback_source_carla_frames = {"AV": 123}
+    plugin.ackermann_feedback_assimilation_mode = "external_state"
+    plugin.external_state_route_lookahead_only = True
+    plugin.lookahead_straight_min_distance = 7.0
+    plugin.lookahead_max_distance = 15.0
+    plugin.lookahead_curve_min_distance = 3.5
+    plugin.lookahead_curve_start_radians = math.radians(5.0)
+    plugin.lookahead_curve_full_scale_radians = math.radians(45.0)
+    plugin._get_vehicle_lookahead_compiled_path = lambda *args, **kwargs: (
+        compile_lane_shapes([[(0.0, 0.0), (20.0, 0.0)]])
+    )
+    plugin._get_lookahead_lane_shape = lambda *_args, **_kwargs: None
+    state = AgentStateSimplified(
+        x=8.0,
+        y=0.0,
+        speed=5.0,
+        sumo_desired_speed=5.0,
+        lane_id="edge_32_1",
+        sumo_lane_change_intent="left",
+        sumo_lane_change_target_lane_id="edge_32_2",
+    )
+
+    plugin._populate_vehicle_lookahead(
+        "AV",
+        state,
+        context_values={
+            constants.VAR_SPEED_LAT: 0.35,
+            constants.VAR_LANEPOSITION_LAT: 0.0,
+        },
+    )
+
+    assert state.lookahead_action_valid is False
+    assert state.lookahead_action_error == "missing_target_lane_geometry"
+    assert state.lookahead_position_valid is False
 
 
 def test_external_state_lookahead_stops_before_missing_internal_lane(monkeypatch):
@@ -1128,6 +1319,73 @@ def test_recorded_odaiba_lookahead_reproduces_raw_steer_reversal():
     assert after.raw_steer == pytest.approx(-0.509, abs=0.002)
     assert before.lookahead_local_y > 0.0
     assert after.lookahead_local_y < 0.0
+
+
+def test_vehicle1167_lateral_action_lookahead_stays_continuous_across_angle_jump():
+    from terasim_service.utils.carla.ackermann_control import (
+        compute_ackermann_control_values,
+    )
+    from terasim_service.utils.sumo_lane_geometry import (
+        build_external_state_lateral_action_lookahead,
+        compile_lane_shapes,
+    )
+
+    source_lane = [(89213.943, 43232.894), (89231.769, 43206.308)]
+    target_lane = [(89217.289, 43235.088), (89234.564, 43208.069)]
+    compiled_path = compile_lane_shapes([source_lane])
+    cycles = [
+        (89212.820025, 43230.487820, 98.509377, 4.663307, 203.602434),
+        (89212.786560, 43230.254496, 99.397743, 4.610115, 203.846992),
+        (89212.749553, 43230.024451, 100.242134, 4.555587, 204.076124),
+        (89212.709557, 43229.797963, 101.045158, 4.501242, 204.289076),
+        (89212.666870, 43229.574333, 101.808891, 4.453339, 204.487668),
+        (89212.621536, 43229.353590, 102.535057, 4.412281, 149.442365),
+        (89212.573428, 43229.134806, 103.176521, 4.384785, 148.726397),
+        (89212.523109, 43228.917481, 103.704765, 4.364276, 148.041944),
+        (89212.470760, 43228.701465, 104.116371, 4.351877, 147.387311),
+        (89212.416822, 43228.485611, 104.408768, 4.342227, 146.761098),
+    ]
+
+    raw_steers = []
+    local_targets = []
+    for x, y, carla_yaw, desired_speed, _sumo_angle in cycles:
+        result = build_external_state_lateral_action_lookahead(
+            compiled_path,
+            (x, y),
+            7.0,
+            target_lane_shape=target_lane,
+            lateral_speed=1.0,
+            desired_speed=desired_speed,
+            maneuver_active=True,
+        )
+        assert result["valid"] is True
+        delta_x = result["lookahead"][0] - x
+        delta_y = -(result["lookahead"][1] - y)
+        control = compute_ackermann_control_values(
+            current_x=0.0,
+            current_y=0.0,
+            yaw_degrees=carla_yaw,
+            current_speed=desired_speed,
+            desired_x=0.0,
+            desired_y=0.0,
+            lookahead_x=delta_x,
+            lookahead_y=delta_y,
+            desired_speed=desired_speed,
+            wheel_base=2.86039582489005,
+        )
+        raw_steers.append(control.raw_steer)
+        local_targets.append((control.lookahead_local_x, control.lookahead_local_y))
+
+    sumo_angles = [cycle[-1] for cycle in cycles]
+    angle_steps = [
+        abs((second - first + 180.0) % 360.0 - 180.0)
+        for first, second in zip(sumo_angles, sumo_angles[1:])
+    ]
+    steer_steps = [abs(second - first) for first, second in zip(raw_steers, raw_steers[1:])]
+    assert max(angle_steps) > 50.0
+    assert all(local_x > 0.0 for local_x, _local_y in local_targets)
+    assert all(local_y < 0.0 for _local_x, local_y in local_targets)
+    assert max(steer_steps) < 0.01
 
 
 def test_feedback_wildcard_excludes_av_unless_explicit():
@@ -3681,6 +3939,19 @@ def test_invalid_declared_lookahead_fails_closed_only_for_authoritative_actor():
     from terasim_service.utils.carla.ackermann_control import AckermannTuning
     from terasim_service.utils.carla.cosim import CarlaCosim
 
+    with pytest.raises(ValueError, match="missing_target_lane_geometry"):
+        cosim._resolve_sumo_lookahead_location(
+            "AV",
+            {
+                "lookahead_position_valid": False,
+                "lookahead_action_valid": False,
+                "lookahead_action_error": "missing_target_lane_geometry",
+                "lookahead_action_mode": "route",
+            },
+            [0.0, 0.0, 0.0],
+            90.0,
+        )
+
     legacy = CarlaCosim.__new__(CarlaCosim)
     legacy.ackermann_feedback_apply_enabled = False
     legacy.ackermann_feedback_actor_ids = set()
@@ -4170,6 +4441,12 @@ def test_ackermann_control_trace_records_sumo_command_and_carla_response(capsys)
             "feedback_observed_speed": 6.62,
             "lookahead_distance": 3.5,
             "lookahead_heading_change": 0.8,
+            "lookahead_route_x": 10.0,
+            "lookahead_route_y": 20.0,
+            "lookahead_action_mode": "sumo_lateral_velocity",
+            "lookahead_action_valid": True,
+            "lookahead_lateral_horizon_displacement": 0.7,
+            "lookahead_target_lateral_distance": 2.8,
         },
         vehicle=vehicle,
         current_transform=transform,
@@ -4213,6 +4490,12 @@ def test_ackermann_control_trace_records_sumo_command_and_carla_response(capsys)
     assert record["carla_applied_steer"] == pytest.approx(0.1)
     assert record["lookahead_distance"] == pytest.approx(3.5)
     assert record["lookahead_heading_change"] == pytest.approx(0.8)
+    assert record["sumo_route_lookahead_x"] == pytest.approx(10.0)
+    assert record["sumo_route_lookahead_y"] == pytest.approx(20.0)
+    assert record["lookahead_action_mode"] == "sumo_lateral_velocity"
+    assert record["lookahead_action_valid"] is True
+    assert record["lookahead_lateral_horizon_displacement"] == pytest.approx(0.7)
+    assert record["lookahead_target_lateral_distance"] == pytest.approx(2.8)
     assert record["wheel_base_m"] == pytest.approx(2.85)
     assert record["rear_axle_local_x_m"] == pytest.approx(-1.4)
     assert record["pure_pursuit_raw_steer"] == pytest.approx(0.7)

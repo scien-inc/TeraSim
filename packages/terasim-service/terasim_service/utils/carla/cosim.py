@@ -1880,6 +1880,13 @@ class CarlaCosim(object):
         )
 
     def _resolve_sumo_lookahead_location(self, veh_id, veh_info, sumo_location, sumo_angle):
+        authoritative_feedback = bool(
+            getattr(self, "ackermann_feedback_apply_enabled", False)
+        ) and self._is_ackermann_feedback_apply_actor(veh_id)
+        if authoritative_feedback and veh_info.get("lookahead_action_valid") is False:
+            reason = veh_info.get("lookahead_action_error") or "invalid_action_geometry"
+            raise ValueError(f"invalid authoritative SUMO lookahead for actor {veh_id}: {reason}")
+
         if bool(veh_info.get("lookahead_position_valid", False)):
             lookahead = [
                 self._as_finite_float(veh_info.get("lookahead_x")),
@@ -1893,9 +1900,14 @@ class CarlaCosim(object):
             if bool(
                 getattr(self, "ackermann_feedback_apply_enabled", False)
             ) and self._is_ackermann_feedback_apply_actor(veh_id):
-                raise ValueError(
-                    f"invalid authoritative SUMO lookahead for actor {veh_id}"
-                )
+                raise ValueError(f"invalid authoritative SUMO lookahead for actor {veh_id}")
+
+        if authoritative_feedback and veh_info.get("lookahead_action_mode") in {
+            "route",
+            "sumo_lateral_velocity",
+            "deferred",
+        }:
+            raise ValueError(f"missing authoritative SUMO lookahead for actor {veh_id}")
 
         desired_speed = self._resolve_ackermann_desired_speed(veh_id, veh_info)
         lookahead_distance = min(15.0, max(7.0, desired_speed))
@@ -3548,6 +3560,17 @@ class CarlaCosim(object):
             ),
             "sumo_lookahead_x": self._as_finite_float(veh_info.get("lookahead_x")),
             "sumo_lookahead_y": self._as_finite_float(veh_info.get("lookahead_y")),
+            "sumo_route_lookahead_x": self._as_finite_float(veh_info.get("lookahead_route_x")),
+            "sumo_route_lookahead_y": self._as_finite_float(veh_info.get("lookahead_route_y")),
+            "lookahead_action_mode": veh_info.get("lookahead_action_mode"),
+            "lookahead_action_valid": bool(veh_info.get("lookahead_action_valid", True)),
+            "lookahead_action_error": veh_info.get("lookahead_action_error", ""),
+            "lookahead_lateral_horizon_displacement": self._as_finite_float(
+                veh_info.get("lookahead_lateral_horizon_displacement")
+            ),
+            "lookahead_target_lateral_distance": self._as_finite_float(
+                veh_info.get("lookahead_target_lateral_distance")
+            ),
             "lookahead_origin_x": self._as_finite_float(
                 veh_info.get("lookahead_origin_x")
             ),
