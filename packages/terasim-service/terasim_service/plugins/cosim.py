@@ -212,7 +212,7 @@ class TeraSimCoSimPlugin(BasePlugin):
             configured_assimilation_mode = "legacy"
         self.ackermann_feedback_assimilation_mode = configured_assimilation_mode
         self.ackermann_feedback_external_state_strict_lane_hint = self._parse_bool_env(
-            "CARLA_COSIM_ACKERMANN_FEEDBACK_EXTERNAL_STATE_STRICT_LANE_HINT", False
+            "CARLA_COSIM_ACKERMANN_FEEDBACK_EXTERNAL_STATE_STRICT_LANE_HINT", True
         )
         self.external_state_route_lookahead_only = self._parse_bool_env(
             "TERASIM_COSIM_EXTERNAL_STATE_ROUTE_LOOKAHEAD_ONLY", True
