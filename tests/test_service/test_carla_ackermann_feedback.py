@@ -1849,6 +1849,7 @@ def test_feedback_batches_valid_actors_and_isolates_invalid_shape(monkeypatch):
     actor = types.SimpleNamespace(
         get_transform=lambda: FakeTransform(FakeLocation(10.0, 20.0, 3.0), FakeRotation()),
         get_velocity=lambda: types.SimpleNamespace(x=3.0, y=4.0, z=12.0),
+        get_acceleration=lambda: types.SimpleNamespace(x=1.25, y=-9.0, z=0.0),
     )
     batches = []
     monkeypatch.setattr(
@@ -1885,6 +1886,7 @@ def test_feedback_batches_valid_actors_and_isolates_invalid_shape(monkeypatch):
     assert command["data"]["position"] == pytest.approx([12.0, -20.0])
     assert command["data"]["rear_axle_position"] == pytest.approx([8.6, -20.0])
     assert command["data"]["speed"] == pytest.approx(5.0)
+    assert command["data"]["acceleration"] == pytest.approx(1.25)
     assert command["data"]["source_carla_frame"] == 101
     assert cosim._ackermann_feedback_state["good"]["feedback_status"] == "queued"
     assert (
@@ -2115,6 +2117,11 @@ def _external_state_handler_plugin(plugin_module):
     plugin = plugin_module.TeraSimCoSimPlugin.__new__(plugin_module.TeraSimCoSimPlugin)
     plugin.controlled_agents_each_step = set()
     plugin.feedback_observed_speeds = {}
+    plugin.feedback_observed_accelerations = {}
+    plugin.feedback_observed_positions = {}
+    plugin.feedback_observed_angles = {}
+    plugin.feedback_observed_lane_ids = {}
+    plugin.feedback_phase_a_sumo_times = {}
     plugin.feedback_observed_rear_axle_positions = {}
     plugin.feedback_source_carla_frames = {}
     plugin.feedback_observed_lane_progress = {}
@@ -2147,6 +2154,7 @@ def test_external_state_feedback_is_immediate_and_does_not_step(monkeypatch, act
         "position": (0.0, 0.0),
         "angle": 0.0,
         "speed": 0.0,
+        "acceleration": 0.0,
     }
     command = types.SimpleNamespace(
         agent_id=actor_id,
@@ -2166,6 +2174,7 @@ def test_external_state_feedback_is_immediate_and_does_not_step(monkeypatch, act
         state["position"] = (args[3], args[4])
         state["angle"] = args[5]
         state["speed"] = args[6]
+        state["acceleration"] = args[7]
 
     def unexpected_previous_speed(*_args):
         raise AssertionError("setPreviousSpeed must not follow setExternalState")
@@ -2176,6 +2185,7 @@ def test_external_state_feedback_is_immediate_and_does_not_step(monkeypatch, act
         getPosition=lambda _actor_id: state["position"],
         getAngle=lambda _actor_id: state["angle"],
         getSpeed=lambda _actor_id: state["speed"],
+        getAcceleration=lambda _actor_id: state["acceleration"],
         getLaneID=lambda _actor_id: "road_0",
     )
     fake_simulation = types.SimpleNamespace(
@@ -2230,9 +2240,105 @@ def test_external_state_feedback_is_immediate_and_does_not_step(monkeypatch, act
         "position": (41.0, 2.0),
         "angle": 90.0,
         "speed": 8.5,
+        "acceleration": -1.25,
     }
     assert plugin.feedback_observed_speeds == {actor_id: 8.5}
+    assert plugin.feedback_observed_accelerations == {actor_id: -1.25}
+    assert plugin.feedback_observed_positions == {actor_id: (41.0, 2.0)}
+    assert plugin.feedback_observed_angles == {actor_id: 90.0}
+    assert plugin.feedback_observed_lane_ids == {actor_id: "road_0"}
+    assert plugin.feedback_phase_a_sumo_times == {actor_id: 12.5}
     assert plugin.feedback_source_carla_frames == {actor_id: 101}
+
+
+def test_external_state_feedback_requires_acceleration_before_api_call(monkeypatch):
+    from terasim_service.plugins import cosim as plugin_module
+
+    command = types.SimpleNamespace(
+        agent_id="AV",
+        agent_type="vehicle",
+        command_type="set_state",
+        data={
+            "position": [41.0, 2.0],
+            "sumo_angle": 90.0,
+            "speed": 8.5,
+            "source_carla_frame": 101,
+        },
+    )
+    fake_vehicle = types.SimpleNamespace(
+        setExternalState=lambda *_args: (_ for _ in ()).throw(
+            AssertionError("invalid Phase A input must not reach SUMO")
+        )
+    )
+    monkeypatch.setattr(
+        plugin_module,
+        "traci",
+        types.SimpleNamespace(vehicle=fake_vehicle),
+    )
+    monkeypatch.setattr(
+        plugin_module.AgentCommand,
+        "model_validate_json",
+        staticmethod(lambda _payload: command),
+    )
+    plugin = _external_state_handler_plugin(plugin_module)
+    plugin._project_ackermann_feedback_external_state_current_lane = (
+        lambda *_args, **_kwargs: {
+            "lane_id": "road_0",
+            "edge_id": "road",
+            "lane_index": 0,
+            "lane_position": 41.0,
+        }
+    )
+
+    assert plugin._handle_agent_command(b"{}") is False
+    assert plugin.last_agent_command_failure["reason"] == (
+        "ackermann_feedback_external_state_invalid_acceleration"
+    )
+
+
+@pytest.mark.parametrize(
+    ("position", "angle", "speed", "acceleration", "reason"),
+    [
+        ((math.nan, 2.0), 90.0, 8.5, 0.0, "invalid_position"),
+        ((41.0, 2.0), math.inf, 8.5, 0.0, "invalid_angle"),
+        ((41.0, 2.0), 90.0, math.nan, 0.0, "invalid_speed"),
+        ((41.0, 2.0), 90.0, 8.5, -math.inf, "invalid_acceleration"),
+    ],
+)
+def test_external_state_non_finite_input_fails_before_partial_apply(
+    monkeypatch,
+    position,
+    angle,
+    speed,
+    acceleration,
+    reason,
+):
+    from terasim_service.plugins import cosim as plugin_module
+
+    calls = []
+    monkeypatch.setattr(
+        plugin_module,
+        "traci",
+        types.SimpleNamespace(
+            vehicle=types.SimpleNamespace(
+                setExternalState=lambda *_args: calls.append("setExternalState")
+            )
+        ),
+    )
+    plugin = _external_state_handler_plugin(plugin_module)
+
+    assert not plugin._apply_ackermann_feedback_external_state(
+        "AV",
+        position,
+        angle,
+        speed,
+        acceleration,
+        {"lane_id": "road_0", "edge_id": "road", "lane_index": 0},
+    )
+    assert calls == []
+    assert plugin.last_agent_command_failure["reason"] == (
+        f"ackermann_feedback_external_state_{reason}"
+    )
 
 
 def test_external_state_validation_accepts_geometry_rounding(monkeypatch):
@@ -2244,6 +2350,7 @@ def test_external_state_validation_accepts_geometry_rounding(monkeypatch):
         getPosition=lambda _actor_id: (41.0005, 2.0),
         getAngle=lambda _actor_id: 90.0,
         getSpeed=lambda _actor_id: 8.5,
+        getAcceleration=lambda _actor_id: -1.25,
         getLaneID=lambda _actor_id: "road_0",
     )
     monkeypatch.setattr(
@@ -2274,6 +2381,7 @@ def test_external_state_validation_fails_closed_on_lane_mismatch(monkeypatch):
         getPosition=lambda _actor_id: (41.0, 2.0),
         getAngle=lambda _actor_id: 90.0,
         getSpeed=lambda _actor_id: 8.5,
+        getAcceleration=lambda _actor_id: -1.25,
         getLaneID=lambda _actor_id: "road_1",
     )
     monkeypatch.setattr(
@@ -2311,6 +2419,7 @@ def test_external_state_mode_fails_closed_without_dedicated_api(monkeypatch):
             "position": [41.0, 2.0],
             "sumo_angle": 90.0,
             "speed": 8.5,
+            "acceleration": 0.0,
             "source_carla_frame": 101,
         },
     )

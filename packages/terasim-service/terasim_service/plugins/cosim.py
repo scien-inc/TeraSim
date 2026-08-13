@@ -168,7 +168,11 @@ class TeraSimCoSimPlugin(BasePlugin):
         # Maintain controlled agents in each step, assuming each agent can be controlled by only one command
         self.controlled_agents_each_step = set()
         self.feedback_observed_speeds = {}
+        self.feedback_observed_accelerations = {}
         self.feedback_observed_positions = {}
+        self.feedback_observed_angles = {}
+        self.feedback_observed_lane_ids = {}
+        self.feedback_phase_a_sumo_times = {}
         self.feedback_observed_rear_axle_positions = {}
         self.feedback_observed_lane_progress = {}
         self.feedback_source_carla_frames = {}
@@ -1050,12 +1054,19 @@ class TeraSimCoSimPlugin(BasePlugin):
             )
             return False
 
+        position_x = self._as_finite_float(position[0])
+        position_y = self._as_finite_float(position[1])
+        sumo_angle = self._as_finite_float(sumo_angle)
         speed = self._as_finite_float(speed)
         acceleration = self._as_finite_float(acceleration)
         edge_id = projection.get("edge_id", "")
         lane_index = projection.get("lane_index", -1)
         lane_id = projection.get("lane_id", "")
-        if speed is None or speed < 0.0:
+        if position_x is None or position_y is None:
+            failure_reason = "ackermann_feedback_external_state_invalid_position"
+        elif sumo_angle is None:
+            failure_reason = "ackermann_feedback_external_state_invalid_angle"
+        elif speed is None or speed < 0.0:
             failure_reason = "ackermann_feedback_external_state_invalid_speed"
         elif acceleration is None:
             failure_reason = "ackermann_feedback_external_state_invalid_acceleration"
@@ -1086,7 +1097,7 @@ class TeraSimCoSimPlugin(BasePlugin):
             "ackermann_feedback_validate_external_state",
             True,
         )
-        phase_a_time = traci.simulation.getTime() if validate else None
+        phase_a_time = traci.simulation.getTime()
         try:
             self._profile_feedback_command_call(
                 profile_ctx,
@@ -1096,8 +1107,8 @@ class TeraSimCoSimPlugin(BasePlugin):
                 actor_id,
                 edge_id,
                 lane_index,
-                position[0],
-                position[1],
+                position_x,
+                position_y,
                 sumo_angle,
                 speed,
                 acceleration,
@@ -1119,19 +1130,18 @@ class TeraSimCoSimPlugin(BasePlugin):
             )
             return False
 
-        if not validate:
-            return True
-
         observed_time = traci.simulation.getTime()
         observed_position = traci.vehicle.getPosition(actor_id)
         observed_angle = traci.vehicle.getAngle(actor_id)
         observed_speed = traci.vehicle.getSpeed(actor_id)
+        observed_acceleration = traci.vehicle.getAcceleration(actor_id)
         observed_lane_id = traci.vehicle.getLaneID(actor_id)
         position_error = math.hypot(
-            observed_position[0] - position[0],
-            observed_position[1] - position[1],
+            observed_position[0] - position_x,
+            observed_position[1] - position_y,
         )
         angle_error = abs((observed_angle - sumo_angle + 180.0) % 360.0 - 180.0)
+        acceleration_error = abs(observed_acceleration - acceleration)
         position_tolerance = getattr(
             self,
             "ackermann_feedback_external_state_position_tolerance",
@@ -1142,9 +1152,10 @@ class TeraSimCoSimPlugin(BasePlugin):
             and position_error <= position_tolerance
             and angle_error <= 1e-6
             and abs(observed_speed - speed) <= 1e-6
+            and acceleration_error <= 1e-6
             and observed_lane_id == lane_id
         )
-        if not state_matches:
+        if validate and not state_matches:
             self.last_agent_command_failure = {
                 "actor_id": actor_id,
                 "reason": "ackermann_feedback_external_state_validation_failed",
@@ -1155,23 +1166,31 @@ class TeraSimCoSimPlugin(BasePlugin):
                 "position_tolerance": position_tolerance,
                 "angle_error": angle_error,
                 "speed_error": abs(observed_speed - speed),
+                "acceleration_error": acceleration_error,
                 "requested_lane_id": lane_id,
                 "observed_lane_id": observed_lane_id,
             }
             self.logger.error(
                 "Ackermann feedback external_state validation failed actor=%s "
                 "time=%s->%s positionError=%.9f angleError=%.9f "
-                "speedError=%.9f lane=%s->%s",
+                "speedError=%.9f accelerationError=%.9f lane=%s->%s",
                 actor_id,
                 phase_a_time,
                 observed_time,
                 position_error,
                 angle_error,
                 abs(observed_speed - speed),
+                acceleration_error,
                 lane_id,
                 observed_lane_id,
             )
             return False
+        self.feedback_observed_speeds[actor_id] = observed_speed
+        self.feedback_observed_accelerations[actor_id] = observed_acceleration
+        self.feedback_observed_positions[actor_id] = tuple(observed_position[:2])
+        self.feedback_observed_angles[actor_id] = observed_angle
+        self.feedback_observed_lane_ids[actor_id] = observed_lane_id
+        self.feedback_phase_a_sumo_times[actor_id] = phase_a_time
         return True
 
     def _move_ackermann_feedback_actor(
@@ -2585,7 +2604,11 @@ class TeraSimCoSimPlugin(BasePlugin):
         )
         for feedback_cache in (
             self.feedback_observed_speeds,
+            self.feedback_observed_accelerations,
             self.feedback_observed_positions,
+            self.feedback_observed_angles,
+            self.feedback_observed_lane_ids,
+            self.feedback_phase_a_sumo_times,
             self.feedback_observed_rear_axle_positions,
             self.feedback_observed_lane_progress,
             self.feedback_source_carla_frames,
@@ -3130,7 +3153,7 @@ class TeraSimCoSimPlugin(BasePlugin):
                                             (x, y),
                                             command.data.get("sumo_angle", 0),
                                             command.data.get("speed"),
-                                            command.data.get("acceleration", 0.0),
+                                            command.data.get("acceleration"),
                                             projection,
                                             profile_ctx=profile_ctx,
                                         )
@@ -3236,12 +3259,13 @@ class TeraSimCoSimPlugin(BasePlugin):
                                     command.agent_id, command.data["speed"]
                                 )
                             if "source_carla_frame" in command.data:
-                                self.feedback_observed_speeds[command.agent_id] = command.data[
-                                    "speed"
-                                ]
-                                if not hasattr(self, "feedback_observed_positions"):
-                                    self.feedback_observed_positions = {}
-                                self.feedback_observed_positions[command.agent_id] = (x, y)
+                                if not external_state_applied:
+                                    self.feedback_observed_speeds[command.agent_id] = (
+                                        command.data["speed"]
+                                    )
+                                    if not hasattr(self, "feedback_observed_positions"):
+                                        self.feedback_observed_positions = {}
+                                    self.feedback_observed_positions[command.agent_id] = (x, y)
                                 rear_axle_position = command.data.get(
                                     "rear_axle_position"
                                 )
