@@ -1500,6 +1500,61 @@ def test_ackermann_reference_transform_round_trips_physical_front_and_rear_axle(
     assert state["sumo_angle"] == pytest.approx(90.0)
 
 
+@pytest.mark.parametrize(
+    "carla_yaw",
+    [
+        -180.0,
+        -179.999,
+        -135.0,
+        -90.0,
+        -1.0,
+        0.0,
+        1.0,
+        45.0,
+        90.0,
+        135.0,
+        179.999,
+        180.0,
+    ],
+)
+def test_authority_contract_yaw_round_trip_all_quadrants(carla_yaw):
+    """Phase A and Phase B use one explicit SUMO/CARLA yaw convention."""
+    install_fake_carla()
+    from terasim_service.utils.carla.ackermann_control import AckermannTuning
+    from terasim_service.utils.carla.cosim import CarlaCosim
+
+    cosim = CarlaCosim.__new__(CarlaCosim)
+    cosim._coord_transformer = None
+    cosim.sumo_carla_offset = [0.0, 0.0, 0.0]
+    cosim.ackermann_tuning = AckermannTuning(wheel_base=2.8)
+    shape = [5.0, 1.8, 1.5]
+    source = FakeTransform(
+        location=FakeLocation(x=12.0, y=-7.0, z=0.5),
+        rotation=FakeRotation(yaw=carla_yaw),
+    )
+
+    phase_a = cosim._carla_transform_to_sumo_feedback_state(source, shape)
+    expected_sumo_angle = (carla_yaw + 90.0) % 360.0
+    assert phase_a["sumo_angle"] == pytest.approx(expected_sumo_angle)
+
+    phase_b_target = cosim._sumo_front_to_carla_transform(
+        [*phase_a["position"], phase_a["position_z"]],
+        [0.0, phase_a["sumo_angle"], 0.0],
+        shape,
+        [0.0, 0.0, 0.0],
+    )
+    yaw_error = (phase_b_target.rotation.yaw - carla_yaw + 180.0) % 360.0 - 180.0
+    assert yaw_error == pytest.approx(0.0, abs=1e-12)
+
+
+def test_authority_contract_pipeline_priorities_surround_decision_and_sumo_step():
+    from terasim_service.plugins.cosim import DEFAULT_COSIM_PLUGIN_CONFIG
+
+    priorities = DEFAULT_COSIM_PLUGIN_CONFIG["priority"]
+    assert priorities["before_env"]["step"] == -90
+    assert 0 < 10 < priorities["after_env"]["step"]
+
+
 def test_ackermann_physics_initializes_velocity_from_sumo_state():
     install_fake_carla()
     from terasim_service.utils.carla.ackermann_control import AckermannControllerTuning
