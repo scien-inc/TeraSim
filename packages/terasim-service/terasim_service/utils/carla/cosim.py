@@ -1248,6 +1248,7 @@ class CarlaCosim(object):
         try:
             transform = actor.get_transform()
             velocity = actor.get_velocity()
+            acceleration = actor.get_acceleration()
         except Exception as exc:
             feedback["feedback_reason"] = f"carla_state_error:{type(exc).__name__}"
             return None, feedback
@@ -1273,7 +1274,20 @@ class CarlaCosim(object):
             ),
         )
         speed = self._as_finite_float(horizontal_speed(velocity))
-        if sumo_state is None or speed is None:
+        acceleration_x = self._as_finite_float(getattr(acceleration, "x", None))
+        acceleration_y = self._as_finite_float(getattr(acceleration, "y", None))
+        if acceleration_x is None or acceleration_y is None:
+            longitudinal_acceleration = None
+        else:
+            yaw = math.radians(float(transform.rotation.yaw))
+            longitudinal_acceleration = self._as_finite_float(
+                acceleration_x * math.cos(yaw) + acceleration_y * math.sin(yaw)
+            )
+        if (
+            sumo_state is None
+            or speed is None
+            or longitudinal_acceleration is None
+        ):
             feedback["source_carla_frame"] = carla_frame
             feedback["feedback_reason"] = "non_finite_feedback_state"
             return None, feedback
@@ -1286,6 +1300,7 @@ class CarlaCosim(object):
                 "position": sumo_state["position"],
                 "position_z": sumo_state["position_z"],
                 "speed": speed,
+                "acceleration": longitudinal_acceleration,
                 "sumo_angle": sumo_state["sumo_angle"],
                 "rear_axle_position": sumo_state["rear_axle_position"],
                 "source_carla_frame": carla_frame,
@@ -1295,6 +1310,7 @@ class CarlaCosim(object):
             {
                 "source_carla_frame": carla_frame,
                 "carla_speed": speed,
+                "carla_longitudinal_acceleration": longitudinal_acceleration,
                 "feedback_sumo_x": sumo_state["position"][0],
                 "feedback_sumo_y": sumo_state["position"][1],
                 "feedback_sumo_z": sumo_state["position_z"],

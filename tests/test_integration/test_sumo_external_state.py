@@ -331,6 +331,7 @@ def test_external_state_assimilation_and_single_step_progression(tmp_path: Path)
         )
         target_angle = traci.vehicle.getAngle("ego")
         target_speed = 10.0
+        target_acceleration = 0.25
         previous_phase_b = None
         observed_speeds = []
         observed_angles = []
@@ -355,20 +356,25 @@ def test_external_state_assimilation_and_single_step_progression(tmp_path: Path)
                 target_position[1],
                 target_angle,
                 target_speed,
-                0.0,
+                target_acceleration,
                 keepRoute=1,
                 matchThreshold=10.0,
+                strictLaneHint=True,
             )
 
             phase_a_position = traci.vehicle.getPosition("ego")
             phase_a_angle = traci.vehicle.getAngle("ego")
             phase_a_speed = traci.vehicle.getSpeed("ego")
+            phase_a_acceleration = traci.vehicle.getAcceleration("ego")
             phase_a_lane_position = traci.vehicle.getLanePosition("ego")
 
             assert traci.simulation.getTime() == phase_a_time
             assert math.dist(phase_a_position, target_position) < POSITION_TOLERANCE
             assert _angle_difference(phase_a_angle, target_angle) < ANGLE_TOLERANCE
             assert abs(phase_a_speed - target_speed) < SPEED_TOLERANCE
+            assert phase_a_acceleration == pytest.approx(
+                target_acceleration, abs=SPEED_TOLERANCE
+            )
 
             traci.simulationStep()
 
@@ -1051,6 +1057,37 @@ def test_strict_external_state_keeps_edge426_lane0_and_lookahead(
         assert_strict_rejected(99, 10.0, "Invalid strict external-state lane index")
         assert_strict_rejected(1, 10.0, "does not match")
         assert_strict_rejected(0, 0.5, "within threshold")
+        finite_state = {
+            "x": first_target[0],
+            "y": first_target[1],
+            "angle": traci.vehicle.getAngle(vehicle_id),
+            "speed": 9.0,
+            "acceleration": 0.0,
+            "matchThreshold": 10.0,
+        }
+        for field, invalid_value in (
+            ("x", math.nan),
+            ("y", math.inf),
+            ("angle", math.nan),
+            ("speed", math.inf),
+            ("acceleration", -math.inf),
+            ("matchThreshold", math.nan),
+        ):
+            invalid_state = {**finite_state, field: invalid_value}
+            with pytest.raises(Exception, match="requires finite"):
+                traci.vehicle.setExternalState(
+                    vehicle_id,
+                    "edge_426",
+                    0,
+                    invalid_state["x"],
+                    invalid_state["y"],
+                    invalid_state["angle"],
+                    invalid_state["speed"],
+                    invalid_state["acceleration"],
+                    keepRoute=1,
+                    matchThreshold=invalid_state["matchThreshold"],
+                    strictLaneHint=True,
+                )
         assert traci.simulation.getTime() == original_time
         assert traci.vehicle.getLaneID(vehicle_id) == "edge_426_0"
         assert traci.vehicle.getPosition(vehicle_id) == original_position
@@ -1409,7 +1446,11 @@ def _new_external_state_cosim_plugin(plugin_module, simulator):
     plugin.simulator = simulator
     plugin.controlled_agents_each_step = set()
     plugin.feedback_observed_speeds = {}
+    plugin.feedback_observed_accelerations = {}
     plugin.feedback_observed_positions = {}
+    plugin.feedback_observed_angles = {}
+    plugin.feedback_observed_lane_ids = {}
+    plugin.feedback_phase_a_sumo_times = {}
     plugin.feedback_observed_rear_axle_positions = {}
     plugin.feedback_observed_lane_progress = {}
     plugin.feedback_source_carla_frames = {}
