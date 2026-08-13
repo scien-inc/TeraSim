@@ -1,4 +1,4 @@
-"""One-vehicle gate for the dedicated SUMO setExternalState build."""
+"""One-vehicle gate for the dedicated SUMO moveToXYImmediate build."""
 
 import math
 import os
@@ -14,6 +14,36 @@ STEP_LENGTH = 0.05
 POSITION_TOLERANCE = 1e-6
 ANGLE_TOLERANCE = 1e-6
 SPEED_TOLERANCE = 1e-6
+
+
+def _set_external_motion_state(
+    traci,
+    veh_id,
+    edge_id,
+    lane_index,
+    x,
+    y,
+    angle,
+    speed,
+    acceleration,
+    keepRoute=1,
+    matchThreshold=100,
+    strictLaneHint=False,
+):
+    """Apply Phase A pose first, then motion through stock TraCI APIs."""
+    traci.vehicle.moveToXYImmediate(
+        veh_id,
+        edge_id,
+        lane_index,
+        x,
+        y,
+        angle,
+        keepRoute,
+        matchThreshold,
+        strictLaneHint,
+    )
+    traci.vehicle.setSpeed(veh_id, -1)
+    traci.vehicle.setPreviousSpeed(veh_id, speed, acceleration)
 
 
 def _find_binary(name: str) -> str:
@@ -40,7 +70,11 @@ def _signed_lateral_offset(position, lane_start, direction) -> float:
 
 
 def _write_straight_network(
-    tmp_path: Path, netconvert: str, *, lefthand: bool = False
+    tmp_path: Path,
+    netconvert: str,
+    *,
+    lefthand: bool = False,
+    num_lanes: int = 1,
 ) -> tuple[Path, Path]:
     nodes_path = tmp_path / "straight.nod.xml"
     edges_path = tmp_path / "straight.edg.xml"
@@ -60,9 +94,9 @@ def _write_straight_network(
     )
     edges_path.write_text(
         textwrap.dedent(
-            """\
+            f"""\
             <edges>
-                <edge id="road" from="start" to="end" numLanes="1" speed="30"/>
+                <edge id="road" from="start" to="end" numLanes="{num_lanes}" speed="30"/>
             </edges>
             """
         ),
@@ -76,7 +110,7 @@ def _write_straight_network(
                        length="5" maxSpeed="30"/>
                 <route id="route" edges="road"/>
                 <vehicle id="ego" type="car" route="route" depart="0"
-                         departPos="20" departSpeed="10"/>
+                         departLane="0" departPos="20" departSpeed="10"/>
             </routes>
             """
         ),
@@ -326,10 +360,10 @@ def _write_junction_network(
 def test_external_state_assimilation_and_single_step_progression(tmp_path: Path) -> None:
     """Phase A is immediate and Phase B is one normal 0.05-second step."""
     traci = pytest.importorskip("traci")
-    if not hasattr(traci.vehicle, "setExternalState"):
-        pytest.skip("requires the dedicated SUMO setExternalState build")
+    if not hasattr(traci.vehicle, "moveToXYImmediate"):
+        pytest.skip("requires the dedicated SUMO moveToXYImmediate build")
 
-    assert traci.constants.VAR_EXTERNAL_STATE == 0xF8
+    assert traci.constants.MOVE_TO_XY_IMMEDIATE == 0xF8
     sumo = _find_binary("sumo")
     netconvert = _find_binary("netconvert")
     network_path, routes_path = _write_straight_network(tmp_path, netconvert)
@@ -365,6 +399,39 @@ def test_external_state_assimilation_and_single_step_progression(tmp_path: Path)
         target_angle = traci.vehicle.getAngle("ego")
         target_speed = 10.0
         target_acceleration = 0.25
+        pose_only_time = traci.simulation.getTime()
+        pose_only_speed = traci.vehicle.getSpeed("ego")
+        pose_only_acceleration = traci.vehicle.getAcceleration("ego")
+        traci.vehicle.moveToXYImmediate(
+            "ego",
+            "road",
+            0,
+            target_position[0],
+            target_position[1],
+            target_angle,
+            1,
+            10.0,
+            False,
+        )
+        assert traci.simulation.getTime() == pose_only_time
+        assert (
+            math.dist(traci.vehicle.getPosition("ego"), target_position)
+            < POSITION_TOLERANCE
+        )
+        assert traci.vehicle.getSpeed("ego") == pytest.approx(
+            pose_only_speed, abs=SPEED_TOLERANCE
+        )
+        assert traci.vehicle.getAcceleration("ego") == pytest.approx(
+            pose_only_acceleration, abs=SPEED_TOLERANCE
+        )
+        traci.vehicle.setSpeed("ego", -1)
+        traci.vehicle.setPreviousSpeed("ego", target_speed, target_acceleration)
+        assert traci.vehicle.getSpeed("ego") == pytest.approx(
+            target_speed, abs=SPEED_TOLERANCE
+        )
+        assert traci.vehicle.getAcceleration("ego") == pytest.approx(
+            target_acceleration, abs=SPEED_TOLERANCE
+        )
         previous_phase_b = None
         observed_speeds = []
         observed_angles = []
@@ -381,7 +448,8 @@ def test_external_state_assimilation_and_single_step_progression(tmp_path: Path)
                 assert math.dist(target_position, previous_position) < 0.02
 
             phase_a_time = traci.simulation.getTime()
-            traci.vehicle.setExternalState(
+            _set_external_motion_state(
+                traci,
                 "ego",
                 "road",
                 0,
@@ -443,11 +511,131 @@ def test_external_state_assimilation_and_single_step_progression(tmp_path: Path)
 
 @pytest.mark.integration
 @pytest.mark.requires_sumo
+def test_immediate_move_to_xy_applies_all_yaw_quadrants_without_time_or_motion_change(
+    tmp_path: Path,
+) -> None:
+    """Pose-only Phase A preserves motion state and normalizes yaw immediately."""
+    traci = pytest.importorskip("traci")
+    if not hasattr(traci.vehicle, "moveToXYImmediate"):
+        pytest.skip("requires the dedicated SUMO moveToXYImmediate build")
+
+    sumo = _find_binary("sumo")
+    netconvert = _find_binary("netconvert")
+    network_path, routes_path = _write_straight_network(tmp_path, netconvert)
+    traci.start(
+        [
+            sumo,
+            "--net-file",
+            str(network_path),
+            "--route-files",
+            str(routes_path),
+            "--step-length",
+            str(STEP_LENGTH),
+            "--no-step-log",
+            "true",
+            "--duration-log.disable",
+            "true",
+        ],
+        numRetries=5,
+    )
+    try:
+        traci.simulationStep()
+        position = traci.vehicle.getPosition("ego")
+        speed = traci.vehicle.getSpeed("ego")
+        acceleration = traci.vehicle.getAcceleration("ego")
+        route = traci.vehicle.getRoute("ego")
+
+        for requested_angle in (0.0, 45.0, 90.0, 180.0, 270.0, 359.999, -180.0):
+            phase_a_time = traci.simulation.getTime()
+            traci.vehicle.moveToXYImmediate(
+                "ego",
+                "road",
+                0,
+                position[0],
+                position[1],
+                requested_angle,
+                1,
+                10.0,
+                False,
+            )
+            assert traci.simulation.getTime() == phase_a_time
+            assert math.dist(traci.vehicle.getPosition("ego"), position) < POSITION_TOLERANCE
+            assert _angle_difference(
+                traci.vehicle.getAngle("ego"), requested_angle
+            ) < ANGLE_TOLERANCE
+            assert traci.vehicle.getSpeed("ego") == pytest.approx(
+                speed, abs=SPEED_TOLERANCE
+            )
+            assert traci.vehicle.getAcceleration("ego") == pytest.approx(
+                acceleration, abs=SPEED_TOLERANCE
+            )
+            assert traci.vehicle.getRoute("ego") == route
+    finally:
+        traci.close()
+
+
+@pytest.mark.integration
+@pytest.mark.requires_sumo
+def test_standard_immediate_mapping_matches_upstream_move_to_xy(tmp_path: Path) -> None:
+    """Standard immediate mode delegates lane and route selection to moveToXY."""
+    traci = pytest.importorskip("traci")
+    if not hasattr(traci.vehicle, "moveToXYImmediate"):
+        pytest.skip("requires the dedicated SUMO moveToXYImmediate build")
+
+    sumo = _find_binary("sumo")
+    netconvert = _find_binary("netconvert")
+    network_path, routes_path = _write_straight_network(
+        tmp_path, netconvert, num_lanes=2
+    )
+
+    def map_with_api(immediate: bool):
+        traci.start(
+            [
+                sumo,
+                "--net-file",
+                str(network_path),
+                "--route-files",
+                str(routes_path),
+                "--step-length",
+                str(STEP_LENGTH),
+                "--no-step-log",
+                "true",
+                "--duration-log.disable",
+                "true",
+            ],
+            numRetries=5,
+        )
+        try:
+            traci.simulationStep()
+            lane_shape = traci.lane.getShape("road_1")
+            target = _position_at_declared_lane_offset(
+                lane_shape, traci.lane.getLength("road_1"), 40.0
+            )
+            phase_a_time = traci.simulation.getTime()
+            if immediate:
+                traci.vehicle.moveToXYImmediate(
+                    "ego", "road", 0, target[0], target[1], 90.0, 1, 10.0, False
+                )
+                assert traci.simulation.getTime() == phase_a_time
+            else:
+                traci.vehicle.moveToXY(
+                    "ego", "road", 0, target[0], target[1], 90.0, 1, 10.0
+                )
+                traci.simulationStep()
+            return traci.vehicle.getLaneID("ego"), traci.vehicle.getRoute("ego")
+        finally:
+            traci.close()
+
+    assert map_with_api(True) == map_with_api(False)
+
+
+@pytest.mark.integration
+@pytest.mark.requires_sumo
 def test_external_state_releases_stale_traci_speed_latch(tmp_path: Path) -> None:
     """Phase B must start from the assimilated speed, not an older setSpeed."""
     traci = pytest.importorskip("traci")
-    if not hasattr(traci.vehicle, "setExternalState"):
-        pytest.skip("requires the dedicated SUMO setExternalState build")
+    if not hasattr(traci.vehicle, "moveToXYImmediate"):
+        pytest.skip("requires the dedicated SUMO moveToXYImmediate build")
 
     sumo = _find_binary("sumo")
     netconvert = _find_binary("netconvert")
@@ -493,7 +681,8 @@ def test_external_state_releases_stale_traci_speed_latch(tmp_path: Path) -> None
         target_speed = 0.065
         phase_a_time = traci.simulation.getTime()
 
-        traci.vehicle.setExternalState(
+        _set_external_motion_state(
+            traci,
             "ego",
             "road",
             0,
@@ -531,8 +720,8 @@ def test_external_state_preserves_off_center_side_on_left_hand_network(
 ) -> None:
     """Releasing the remote latch must not mirror the lateral position."""
     traci = pytest.importorskip("traci")
-    if not hasattr(traci.vehicle, "setExternalState"):
-        pytest.skip("requires the dedicated SUMO setExternalState build")
+    if not hasattr(traci.vehicle, "moveToXYImmediate"):
+        pytest.skip("requires the dedicated SUMO moveToXYImmediate build")
 
     sumo = _find_binary("sumo")
     netconvert = _find_binary("netconvert")
@@ -577,7 +766,8 @@ def test_external_state_preserves_off_center_side_on_left_hand_network(
         for _cycle in range(6):
             target_lateral = _signed_lateral_offset(target, lane_start, direction)
             phase_a_time = traci.simulation.getTime()
-            traci.vehicle.setExternalState(
+            _set_external_motion_state(
+                traci,
                 "ego",
                 "road",
                 0,
@@ -628,8 +818,8 @@ def test_external_state_edge426_lane_boundary_has_no_phase_b_warp(
 ) -> None:
     """A left-hand primary-lane switch must preserve the assimilated x/y state."""
     traci = pytest.importorskip("traci")
-    if not hasattr(traci.vehicle, "setExternalState"):
-        pytest.skip("requires the dedicated SUMO setExternalState build")
+    if not hasattr(traci.vehicle, "moveToXYImmediate"):
+        pytest.skip("requires the dedicated SUMO moveToXYImmediate build")
 
     sumo = _find_binary("sumo")
     network_path, routes_path = _write_odaiba_edge426_route(tmp_path)
@@ -697,7 +887,8 @@ def test_external_state_edge426_lane_boundary_has_no_phase_b_warp(
                     math.dist(previous_phase_b_position, target)
                 )
             phase_a_time = traci.simulation.getTime()
-            traci.vehicle.setExternalState(
+            _set_external_motion_state(
+                traci,
                 "ego",
                 "edge_426",
                 lane_hint,
@@ -740,13 +931,13 @@ def _current_lane_hint(traci, vehicle_id: str) -> tuple[str, int, str]:
 @pytest.mark.parametrize("vehicle_id", ["AV", "BV"])
 @pytest.mark.integration
 @pytest.mark.requires_sumo
-def test_strict_external_state_preserves_strategic_lane_change_until_gap_opens(
+def test_strict_immediate_move_to_xy_preserves_strategic_lane_change_until_gap_opens(
     tmp_path: Path, vehicle_id: str
 ) -> None:
     """A blocked route-required lane change completes after its gap opens."""
     traci = pytest.importorskip("traci")
-    if not hasattr(traci.vehicle, "setExternalState"):
-        pytest.skip("requires the dedicated SUMO setExternalState build")
+    if not hasattr(traci.vehicle, "moveToXYImmediate"):
+        pytest.skip("requires the dedicated SUMO moveToXYImmediate build")
 
     sumo = _find_binary("sumo")
     network_path, routes_path = _write_odaiba_edge32_lane_change_route(
@@ -795,7 +986,8 @@ def test_strict_external_state_preserves_strategic_lane_change_until_gap_opens(
 
         for _cycle in range(20):
             phase_a_time = traci.simulation.getTime()
-            traci.vehicle.setExternalState(
+            _set_external_motion_state(
+                traci,
                 vehicle_id,
                 "edge_32",
                 1,
@@ -835,7 +1027,8 @@ def test_strict_external_state_preserves_strategic_lane_change_until_gap_opens(
         for release_cycle in range(80):
             edge_id, lane_index, lane_id = _current_lane_hint(traci, vehicle_id)
             phase_a_time = traci.simulation.getTime()
-            traci.vehicle.setExternalState(
+            _set_external_motion_state(
+                traci,
                 vehicle_id,
                 edge_id,
                 lane_index,
@@ -877,7 +1070,8 @@ def test_strict_external_state_preserves_strategic_lane_change_until_gap_opens(
         }
 
         phase_a_time = traci.simulation.getTime()
-        traci.vehicle.setExternalState(
+        _set_external_motion_state(
+            traci,
             vehicle_id,
             "edge_32",
             2,
@@ -907,13 +1101,13 @@ def test_strict_external_state_preserves_strategic_lane_change_until_gap_opens(
 @pytest.mark.parametrize("vehicle_id", ["AV", "BV"])
 @pytest.mark.integration
 @pytest.mark.requires_sumo
-def test_strict_external_state_has_no_junction_predecessor_bounce(
+def test_strict_immediate_move_to_xy_has_no_junction_predecessor_bounce(
     tmp_path: Path, vehicle_id: str
 ) -> None:
     """A predecessor-side pose must not rematch an internal primary lane."""
     traci = pytest.importorskip("traci")
-    if not hasattr(traci.vehicle, "setExternalState"):
-        pytest.skip("requires the dedicated SUMO setExternalState build")
+    if not hasattr(traci.vehicle, "moveToXYImmediate"):
+        pytest.skip("requires the dedicated SUMO moveToXYImmediate build")
 
     sumo = _find_binary("sumo")
     netconvert = _find_binary("netconvert")
@@ -973,7 +1167,8 @@ def test_strict_external_state_has_no_junction_predecessor_bounce(
                 assert previous_phase_b[3] == lane_id
 
             phase_a_time = traci.simulation.getTime()
-            traci.vehicle.setExternalState(
+            _set_external_motion_state(
+                traci,
                 vehicle_id,
                 edge_id,
                 lane_index,
@@ -987,7 +1182,10 @@ def test_strict_external_state_has_no_junction_predecessor_bounce(
                 strictLaneHint=True,
             )
             assert traci.simulation.getTime() == phase_a_time
-            assert math.dist(traci.vehicle.getPosition(vehicle_id), target) < POSITION_TOLERANCE
+            assert (
+                math.dist(traci.vehicle.getPosition(vehicle_id), target)
+                < POSITION_TOLERANCE
+            )
             assert _angle_difference(
                 traci.vehicle.getAngle(vehicle_id), target_angle
             ) < ANGLE_TOLERANCE
@@ -1023,8 +1221,8 @@ def test_strict_external_state_keeps_edge426_lane0_and_lookahead(
 ) -> None:
     """Lane-1-side CARLA poses keep lane 0 as the primary lookahead corridor."""
     traci = pytest.importorskip("traci")
-    if not hasattr(traci.vehicle, "setExternalState"):
-        pytest.skip("requires the dedicated SUMO setExternalState build")
+    if not hasattr(traci.vehicle, "moveToXYImmediate"):
+        pytest.skip("requires the dedicated SUMO moveToXYImmediate build")
 
     from terasim.simulator import Simulator
     from terasim_service.plugins import cosim as plugin_module
@@ -1065,11 +1263,13 @@ def test_strict_external_state_keeps_edge426_lane0_and_lookahead(
         )
         original_position = traci.vehicle.getPosition(vehicle_id)
         original_time = traci.simulation.getTime()
+
         def assert_strict_rejected(
             lane_index: int, match_threshold: float, message: str
         ) -> None:
             try:
-                traci.vehicle.setExternalState(
+                _set_external_motion_state(
+                    traci,
                     vehicle_id,
                     "edge_426",
                     lane_index,
@@ -1085,9 +1285,9 @@ def test_strict_external_state_keeps_edge426_lane0_and_lookahead(
             except BaseException as exc:
                 assert message in str(exc)
             else:
-                pytest.fail("strict setExternalState unexpectedly accepted invalid input")
+                pytest.fail("strict moveToXYImmediate unexpectedly accepted invalid input")
 
-        assert_strict_rejected(99, 10.0, "Invalid strict external-state lane index")
+        assert_strict_rejected(99, 10.0, "Invalid strict immediate moveToXY lane index")
         assert_strict_rejected(1, 10.0, "does not match")
         assert_strict_rejected(0, 0.5, "within threshold")
         finite_state = {
@@ -1102,13 +1302,12 @@ def test_strict_external_state_keeps_edge426_lane0_and_lookahead(
             ("x", math.nan),
             ("y", math.inf),
             ("angle", math.nan),
-            ("speed", math.inf),
-            ("acceleration", -math.inf),
             ("matchThreshold", math.nan),
         ):
             invalid_state = {**finite_state, field: invalid_value}
             with pytest.raises(Exception, match="requires finite"):
-                traci.vehicle.setExternalState(
+                _set_external_motion_state(
+                    traci,
                     vehicle_id,
                     "edge_426",
                     0,
@@ -1153,7 +1352,8 @@ def test_strict_external_state_keeps_edge426_lane0_and_lookahead(
                 assert previous_phase_b[3] == "edge_426_0"
 
             phase_a_time = traci.simulation.getTime()
-            traci.vehicle.setExternalState(
+            _set_external_motion_state(
+                traci,
                 vehicle_id,
                 "edge_426",
                 0,
@@ -1212,8 +1412,8 @@ def test_strict_external_state_preserves_longitudinal_edge99_overrun(
 ) -> None:
     """An edge-end overrun stays longitudinal and advances to the successor."""
     traci = pytest.importorskip("traci")
-    if not hasattr(traci.vehicle, "setExternalState"):
-        pytest.skip("requires the dedicated SUMO setExternalState build")
+    if not hasattr(traci.vehicle, "moveToXYImmediate"):
+        pytest.skip("requires the dedicated SUMO moveToXYImmediate build")
 
     sumo = _find_binary("sumo")
     network_path, routes_path = _write_odaiba_edge99_route(
@@ -1265,7 +1465,8 @@ def test_strict_external_state_preserves_longitudinal_edge99_overrun(
             successor_shape, successor_length, 9.0
         )
         with pytest.raises(Exception, match="within threshold"):
-            traci.vehicle.setExternalState(
+            _set_external_motion_state(
+                traci,
                 vehicle_id,
                 "edge_99",
                 0,
@@ -1283,7 +1484,8 @@ def test_strict_external_state_preserves_longitudinal_edge99_overrun(
         assert traci.vehicle.getPosition(vehicle_id) == original_position
 
         phase_a_time = traci.simulation.getTime()
-        traci.vehicle.setExternalState(
+        _set_external_motion_state(
+            traci,
             vehicle_id,
             "edge_99",
             0,
@@ -1338,7 +1540,8 @@ def test_strict_external_state_preserves_longitudinal_edge99_overrun(
                 traci, vehicle_id
             )
             next_phase_a_time = traci.simulation.getTime()
-            traci.vehicle.setExternalState(
+            _set_external_motion_state(
+                traci,
                 vehicle_id,
                 edge_id,
                 lane_index,
@@ -1390,8 +1593,8 @@ def test_strict_external_state_advances_from_repaired_edge1603(
 ) -> None:
     """The field-run edge transition survives planning after strict Phase A."""
     traci = pytest.importorskip("traci")
-    if not hasattr(traci.vehicle, "setExternalState"):
-        pytest.skip("requires the dedicated SUMO setExternalState build")
+    if not hasattr(traci.vehicle, "moveToXYImmediate"):
+        pytest.skip("requires the dedicated SUMO moveToXYImmediate build")
 
     sumo = _find_binary("sumo")
     network_path, routes_path = _write_odaiba_edge1603_route(
@@ -1437,7 +1640,8 @@ def test_strict_external_state_advances_from_repaired_edge1603(
         ) % 360.0
 
         phase_a_time = traci.simulation.getTime()
-        traci.vehicle.setExternalState(
+        _set_external_motion_state(
+            traci,
             vehicle_id,
             "edge_1603",
             0,
@@ -1488,8 +1692,8 @@ def test_strict_external_state_reaches_edge3_from_edge0_lane0(
 ) -> None:
     """Strict Phase A never diverts the edge_0 lane-0 route into lane 1."""
     traci = pytest.importorskip("traci")
-    if not hasattr(traci.vehicle, "setExternalState"):
-        pytest.skip("requires the dedicated SUMO setExternalState build")
+    if not hasattr(traci.vehicle, "moveToXYImmediate"):
+        pytest.skip("requires the dedicated SUMO moveToXYImmediate build")
 
     sumo = _find_binary("sumo")
     network_path, routes_path = _write_odaiba_edge0_route(
@@ -1527,7 +1731,8 @@ def test_strict_external_state_reaches_edge3_from_edge0_lane0(
                 traci, vehicle_id
             )
             phase_a_time = traci.simulation.getTime()
-            traci.vehicle.setExternalState(
+            _set_external_motion_state(
+                traci,
                 vehicle_id,
                 edge_id,
                 lane_index,
@@ -1619,8 +1824,8 @@ def test_terasim_pipeline_assimilates_then_plans_then_steps_once(
 ) -> None:
     """The real TeraSim priorities execute Phase A, planning, then one step."""
     traci = pytest.importorskip("traci")
-    if not hasattr(traci.vehicle, "setExternalState"):
-        pytest.skip("requires the dedicated SUMO setExternalState build")
+    if not hasattr(traci.vehicle, "moveToXYImmediate"):
+        pytest.skip("requires the dedicated SUMO moveToXYImmediate build")
 
     from terasim import simulator as simulator_module
     from terasim.pipeline import Pipeline, PipelineElement
