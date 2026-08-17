@@ -1,4 +1,4 @@
-ARG TERASIM_BASE_IMAGE=terasim-service:ackermann-feedback-gui
+ARG TERASIM_BASE_IMAGE=terasim-service:inprocess-20260810-local
 
 FROM ${TERASIM_BASE_IMAGE} AS sumo-builder
 

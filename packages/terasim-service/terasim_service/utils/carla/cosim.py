@@ -9,6 +9,14 @@ import xml.etree.ElementTree as ET
 import yaml
 import statistics
 
+from .ackermann_control import (
+    AckermannControllerTuning,
+    AckermannEmergencyBrakeTuning,
+    AckermannTuning,
+    compute_ackermann_control_values,
+    compute_direct_brake_value,
+    horizontal_speed,
+)
 from .tools import (
     carla_to_sumo,
     create_bike_blueprint,
@@ -21,12 +29,15 @@ from .tools import (
     draw_text,
     get_actor_id_from_attribute,
     log_spawn_actor_failure,
+    sumo_point_to_carla,
     sumo_to_carla,
     spawn_actor,
 )
 
 AV_SUMO_ID = "AV"
 SUMO_CARLA_TLS_LINK_PREFIX = "linkSignalID:"
+VEHICLE_CONTROL_MODE_TELEPORT = "teleport"
+VEHICLE_CONTROL_MODE_ACKERMANN_PHYSICS = "ackermann_physics"
 
 
 def _env_float(name, default):
@@ -35,6 +46,17 @@ def _env_float(name, default):
         return default
     try:
         return float(value)
+    except ValueError:
+        print(f"Warning: invalid {name}={value!r}; using {default}.", flush=True)
+        return default
+
+
+def _env_int(name, default):
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    try:
+        return int(value)
     except ValueError:
         print(f"Warning: invalid {name}={value!r}; using {default}.", flush=True)
         return default
@@ -93,6 +115,167 @@ class CarlaCosim(object):
         # process paces SUMO on a step_length wall-clock grid (_tick_async).
         self.tick_async = bool(getattr(args, "tick_async", False))
         # Catch-up cap: a late cycle runs at most this many SUMO steps in one
+        requested_vehicle_control_mode = os.environ.get(
+            "CARLA_COSIM_VEHICLE_CONTROL_MODE", VEHICLE_CONTROL_MODE_TELEPORT
+        )
+        self.vehicle_control_mode = str(requested_vehicle_control_mode).strip().lower()
+        if self.vehicle_control_mode not in {
+            VEHICLE_CONTROL_MODE_TELEPORT,
+            VEHICLE_CONTROL_MODE_ACKERMANN_PHYSICS,
+        }:
+            raise ValueError(
+                "CARLA_COSIM_VEHICLE_CONTROL_MODE must be teleport or ackermann_physics"
+            )
+        self.ackermann_physics_enabled = (
+            self.vehicle_control_mode == VEHICLE_CONTROL_MODE_ACKERMANN_PHYSICS
+        )
+        feedback_mode = os.environ.get(
+            "CARLA_COSIM_ACKERMANN_FEEDBACK_MODE", "off"
+        ).strip().lower()
+        if feedback_mode not in {"off", "shadow", "apply"}:
+            raise ValueError(
+                "CARLA_COSIM_ACKERMANN_FEEDBACK_MODE must be off, shadow, or apply"
+            )
+        feedback_actor_value = os.environ.get(
+            "CARLA_COSIM_ACKERMANN_FEEDBACK_ACTORS", ""
+        )
+        self.ackermann_feedback_actor_ids = {
+            actor_id.strip()
+            for actor_id in feedback_actor_value.split(",")
+            if actor_id.strip()
+        }
+        self.ackermann_feedback_apply_enabled = bool(
+            self.ackermann_physics_enabled
+            and feedback_mode == "apply"
+            and self.ackermann_feedback_actor_ids
+        )
+        if self.ackermann_feedback_apply_enabled:
+            if not self.tick_master:
+                raise ValueError(
+                    "physical co-sim requires --tick_mode master so Phase A/B "
+                    "and CARLA frames remain serial"
+                )
+            if AV_SUMO_ID in self.ackermann_feedback_actor_ids:
+                raise ValueError(
+                    "Autoware owns the AV; physical feedback actors must be "
+                    "background SUMO IDs or '*'"
+                )
+        self._ackermann_actor_state = {}
+        self._physics_feedback_frames = {}
+        self._ackermann_fail_closed_reasons = {}
+        self.ackermann_tuning = AckermannTuning(
+            wheel_base=max(
+                0.1, _env_float("CARLA_COSIM_ACKERMANN_WHEEL_BASE", 2.8)
+            ),
+            max_steer_rad=max(
+                0.0, _env_float("CARLA_COSIM_ACKERMANN_MAX_STEER_RAD", 0.6)
+            ),
+            max_steer_rate_rad_s=max(
+                0.0,
+                _env_float(
+                    "CARLA_COSIM_ACKERMANN_MAX_STEER_RATE_RAD_S", 0.6
+                ),
+            ),
+            kp_speed=_env_float("CARLA_COSIM_ACKERMANN_KP_SPEED", 0.8),
+            kp_position=_env_float("CARLA_COSIM_ACKERMANN_KP_POSITION", 0.15),
+            max_accel=max(
+                0.0, _env_float("CARLA_COSIM_ACKERMANN_MAX_ACCEL", 3.0)
+            ),
+            max_decel=max(
+                0.0, _env_float("CARLA_COSIM_ACKERMANN_MAX_DECEL", 6.0)
+            ),
+        )
+        self.ackermann_controller_tuning = AckermannControllerTuning(
+            speed_kp=max(
+                0.0,
+                _env_float(
+                    "CARLA_COSIM_ACKERMANN_CONTROLLER_SPEED_KP", 1.0
+                ),
+            ),
+            speed_ki=max(
+                0.0,
+                _env_float(
+                    "CARLA_COSIM_ACKERMANN_CONTROLLER_SPEED_KI", 0.0
+                ),
+            ),
+            speed_kd=max(
+                0.0,
+                _env_float(
+                    "CARLA_COSIM_ACKERMANN_CONTROLLER_SPEED_KD", 0.0
+                ),
+            ),
+            accel_kp=max(
+                0.0,
+                _env_float(
+                    "CARLA_COSIM_ACKERMANN_CONTROLLER_ACCEL_KP", 0.05
+                ),
+            ),
+            accel_ki=max(
+                0.0,
+                _env_float(
+                    "CARLA_COSIM_ACKERMANN_CONTROLLER_ACCEL_KI", 0.0
+                ),
+            ),
+            accel_kd=max(
+                0.0,
+                _env_float(
+                    "CARLA_COSIM_ACKERMANN_CONTROLLER_ACCEL_KD", 0.0
+                ),
+            ),
+        )
+        emergency_engage_decel = max(
+            0.0,
+            _env_float(
+                "CARLA_COSIM_ACKERMANN_EMERGENCY_BRAKE_ENGAGE_DECEL", 4.0
+            ),
+        )
+        self.ackermann_emergency_brake_tuning = AckermannEmergencyBrakeTuning(
+            enabled=_env_bool(
+                "CARLA_COSIM_ACKERMANN_EMERGENCY_BRAKE_ENABLED", True
+            ),
+            engage_decel=emergency_engage_decel,
+            release_decel=min(
+                emergency_engage_decel,
+                max(
+                    0.0,
+                    _env_float(
+                        "CARLA_COSIM_ACKERMANN_EMERGENCY_BRAKE_RELEASE_DECEL",
+                        1.0,
+                    ),
+                ),
+            ),
+            release_ticks=max(
+                1,
+                _env_int(
+                    "CARLA_COSIM_ACKERMANN_EMERGENCY_BRAKE_RELEASE_TICKS", 3
+                ),
+            ),
+            stop_speed=max(
+                0.0,
+                _env_float(
+                    "CARLA_COSIM_ACKERMANN_EMERGENCY_BRAKE_STOP_SPEED", 0.2
+                ),
+            ),
+            min_brake=min(
+                1.0,
+                max(
+                    0.0,
+                    _env_float(
+                        "CARLA_COSIM_ACKERMANN_EMERGENCY_BRAKE_MIN_BRAKE", 0.5
+                    ),
+                ),
+            ),
+        )
+        self.ackermann_fail_closed_error_m = max(
+            0.1, _env_float("CARLA_COSIM_ACKERMANN_FAIL_CLOSED_ERROR_M", 8.0)
+        )
+        if self.ackermann_feedback_apply_enabled:
+            print(
+                "CARLA physical co-sim enabled for SUMO background actors "
+                f"{sorted(self.ackermann_feedback_actor_ids)!r}; "
+                "Autoware ego remains externally owned.",
+                flush=True,
+            )
         # go; debt beyond it is dropped (SUMO slow motion, never a long step
         # burst) and reported as dropped= in [async-timing].
         self._async_catchup_max_steps = 5
@@ -128,7 +311,8 @@ class CarlaCosim(object):
         self._invalid_location_warnings = set()
         self.use_lane_relative_position = _env_bool(
             "CARLA_COSIM_USE_LANE_RELATIVE_POSITION",
-            bool(getattr(args, "use_lane_relative_position", False)),
+            bool(getattr(args, "use_lane_relative_position", False))
+            or self.ackermann_feedback_apply_enabled,
         )
         if self.use_lane_relative_position:
             print("CARLA co-sim lane-relative reconstructed positions enabled.", flush=True)
@@ -417,6 +601,342 @@ class CarlaCosim(object):
         print(f"Empirical calibration from {len(dxs)} matching roads")
         return [offset_x, offset_y]
 
+    def _is_ackermann_feedback_actor(self, actor_id):
+        return bool(
+            self.ackermann_feedback_apply_enabled
+            and actor_id != AV_SUMO_ID
+            and (
+                actor_id in self.ackermann_feedback_actor_ids
+                or "*" in self.ackermann_feedback_actor_ids
+            )
+        )
+
+    def _uses_ackermann_physics(self, actor_id):
+        return self._is_ackermann_feedback_actor(actor_id)
+
+    def _carla_actor_to_sumo_feedback(self, actor, vehicle_info):
+        transform = actor.get_transform()
+        shape = [
+            float(vehicle_info.get("length", 5.0)),
+            float(vehicle_info.get("width", 1.8)),
+            float(vehicle_info.get("height", 1.5)),
+        ]
+        if self._coord_transformer is not None:
+            xodr_x = transform.location.x
+            xodr_y = -transform.location.y
+            sumo_x, sumo_y = self._transform_xodr_to_sumo(xodr_x, xodr_y)
+            yaw = math.radians(-transform.rotation.yaw)
+            sumo_x += math.cos(yaw) * shape[0] / 2.0
+            sumo_y += math.sin(yaw) * shape[0] / 2.0
+            sumo_location = [sumo_x, sumo_y, transform.location.z]
+            sumo_angle = transform.rotation.yaw + 90.0
+        else:
+            sumo_location, sumo_rotation = carla_to_sumo(
+                transform.location,
+                transform.rotation,
+                shape,
+                [self.sumo_carla_offset[0], self.sumo_carla_offset[1], 0.0],
+            )
+            sumo_angle = sumo_rotation[1]
+
+        velocity = actor.get_velocity()
+        speed = horizontal_speed(velocity)
+        acceleration_vector = actor.get_acceleration()
+        forward = transform.get_forward_vector()
+        longitudinal_acceleration = (
+            acceleration_vector.x * forward.x
+            + acceleration_vector.y * forward.y
+        )
+        return {
+            "position": [sumo_location[0], sumo_location[1]],
+            "z": sumo_location[2],
+            "speed": speed,
+            "acceleration": longitudinal_acceleration,
+            "sumo_angle": sumo_angle,
+        }
+
+    def _build_physics_feedback_commands(self):
+        if not self.ackermann_feedback_apply_enabled:
+            return []
+        state = self._inproc_prev_state
+        if not isinstance(state, dict):
+            return []
+        vehicles = state.get("agent_details", {}).get("vehicle", {})
+        frame = self._last_world_frame
+        if not isinstance(frame, int):
+            return []
+
+        commands = []
+        for actor_id, vehicle_info in vehicles.items():
+            if not self._is_ackermann_feedback_actor(actor_id):
+                continue
+            actor = self._vehicle_actor_index.get(actor_id)
+            if actor is None:
+                continue
+            try:
+                feedback = self._carla_actor_to_sumo_feedback(actor, vehicle_info)
+            except Exception as exc:
+                print(
+                    f"Warning: physical feedback collection failed for "
+                    f"{actor_id}: {exc}",
+                    flush=True,
+                )
+                continue
+            feedback["source_carla_frame"] = frame
+            commands.append(
+                {
+                    "agent_id": actor_id,
+                    "agent_type": "vehicle",
+                    "command_type": "set_state",
+                    "data": feedback,
+                }
+            )
+            self._physics_feedback_frames[actor_id] = frame
+        return commands
+
+    @staticmethod
+    def _full_brake_control(steer=0.0):
+        return carla.VehicleControl(
+            throttle=0.0,
+            steer=max(-1.0, min(1.0, float(steer))),
+            brake=1.0,
+            hand_brake=False,
+            reverse=False,
+        )
+
+    def _set_ackermann_fail_closed_reason(self, actor_id, reason):
+        reasons = getattr(self, "_ackermann_fail_closed_reasons", None)
+        if reasons is None:
+            reasons = {}
+            self._ackermann_fail_closed_reasons = reasons
+        reason_key = reason.partition(":")[0]
+        previous_key = reasons.get(actor_id)
+        if previous_key == reason_key:
+            return
+        reasons[actor_id] = reason_key
+        print(
+            f"Physical co-sim actor={actor_id} fail-closed: {reason}",
+            flush=True,
+        )
+
+    def _clear_ackermann_fail_closed_reason(self, actor_id):
+        reasons = getattr(self, "_ackermann_fail_closed_reasons", None)
+        if not reasons:
+            return
+        previous = reasons.pop(actor_id, None)
+        if previous is not None:
+            print(
+                f"Physical co-sim actor={actor_id} control recovered",
+                flush=True,
+            )
+
+    def _apply_physics_fail_closed_brake(self, reason):
+        count = 0
+        for actor_id, actor in list(self._vehicle_actor_index.items()):
+            if actor is None or not self._is_ackermann_feedback_actor(actor_id):
+                continue
+            try:
+                actor.apply_control(self._full_brake_control())
+                count += 1
+            except Exception:
+                pass
+        if count:
+            print(
+                f"Physical co-sim fail-closed brake: actors={count} reason={reason}",
+                flush=True,
+            )
+
+    def _configure_ackermann_actor(self, actor):
+        try:
+            settings = actor.get_ackermann_controller_settings()
+            tuning = self.ackermann_controller_tuning
+            settings.speed_kp = tuning.speed_kp
+            settings.speed_ki = tuning.speed_ki
+            settings.speed_kd = tuning.speed_kd
+            settings.accel_kp = tuning.accel_kp
+            settings.accel_ki = tuning.accel_ki
+            settings.accel_kd = tuning.accel_kd
+            actor.apply_ackermann_controller_settings(settings)
+        except Exception as exc:
+            print(
+                f"Warning: Ackermann controller tuning unavailable for "
+                f"actor={actor.id}: {exc}",
+                flush=True,
+            )
+
+    def _initialize_ackermann_actor(self, actor, actor_id, transform, speed):
+        state = self._ackermann_actor_state.setdefault(actor_id, {})
+        current_frame = self._last_world_frame
+        if not state.get("initialization_pending"):
+            # A freshly spawned vehicle must first be registered at its ground
+            # transform with physics disabled. CARLA must complete one frame
+            # before physics is enabled for the body and wheels.
+            actor.set_simulate_physics(False)
+            actor.set_transform(transform)
+            state["initialization_pending"] = True
+            state["transform_applied_frame"] = current_frame
+            state["initial_transform"] = transform
+            state["initial_speed"] = speed
+            state["initialized"] = False
+            return False
+
+        applied_frame = state.get("transform_applied_frame")
+        if applied_frame is None or current_frame is None:
+            state["transform_applied_frame"] = current_frame
+            return False
+        if current_frame <= applied_frame:
+            return False
+
+        initial_transform = state.get("initial_transform", transform)
+        initial_speed = state.get("initial_speed", speed)
+        actor.set_simulate_physics(True)
+        forward = initial_transform.get_forward_vector()
+        actor.set_target_velocity(
+            carla.Vector3D(
+                x=forward.x * max(0.0, float(initial_speed)),
+                y=forward.y * max(0.0, float(initial_speed)),
+                z=0.0,
+            )
+        )
+        self._configure_ackermann_actor(actor)
+        state["initialized"] = True
+        state["initialization_pending"] = False
+        state["steer"] = 0.0
+        return True
+
+    def _build_ackermann_control(
+        self,
+        actor_id,
+        vehicle_info,
+        actor,
+        desired_transform,
+        sumo_location,
+    ):
+        expected_frame = self._physics_feedback_frames.get(actor_id)
+        action_frame = vehicle_info.get("feedback_source_carla_frame")
+        position_valid = vehicle_info.get("lookahead_position_valid", False)
+        action_valid = vehicle_info.get("lookahead_action_valid", False)
+        action_error = vehicle_info.get("lookahead_action_error", "")
+        if (
+            expected_frame is None
+            or action_frame != expected_frame
+            or not position_valid
+            or not action_valid
+        ):
+            self._set_ackermann_fail_closed_reason(
+                actor_id,
+                "invalid-action: "
+                f"expected_frame={expected_frame!r} action_frame={action_frame!r} "
+                f"lookahead_position_valid={position_valid!r} "
+                f"lookahead_action_valid={action_valid!r} "
+                f"lookahead_action_error={action_error!r}",
+            )
+            return self._full_brake_control(), True
+
+        try:
+            current_transform = actor.get_transform()
+            current_velocity = actor.get_velocity()
+        except Exception as exc:
+            self._set_ackermann_fail_closed_reason(
+                actor_id, f"actor-state: CARLA actor state unavailable: {exc}"
+            )
+            return self._full_brake_control(), True
+        current_speed = horizontal_speed(current_velocity)
+        desired_speed_raw = vehicle_info.get("sumo_desired_speed")
+        requested_acceleration_raw = vehicle_info.get("acceleration")
+        desired_speed = self._as_finite_float(desired_speed_raw)
+        requested_acceleration = self._as_finite_float(
+            requested_acceleration_raw
+        )
+        if desired_speed is None or requested_acceleration is None:
+            self._set_ackermann_fail_closed_reason(
+                actor_id,
+                "invalid-longitudinal: "
+                f"desired_speed={desired_speed_raw!r} "
+                f"acceleration={requested_acceleration_raw!r}",
+            )
+            return self._full_brake_control(), True
+        desired_speed = max(0.0, desired_speed)
+
+        lookahead_sumo = [
+            vehicle_info["lookahead_x"],
+            vehicle_info["lookahead_y"],
+            vehicle_info.get("lookahead_z", sumo_location[2]),
+        ]
+        lookahead_offset = self._get_carla_offset(lookahead_sumo, 0.0)
+        lookahead_location = sumo_point_to_carla(
+            lookahead_sumo, lookahead_offset
+        )
+        state = self._ackermann_actor_state.setdefault(actor_id, {})
+        values = compute_ackermann_control_values(
+            current_x=current_transform.location.x,
+            current_y=current_transform.location.y,
+            yaw_degrees=current_transform.rotation.yaw,
+            current_speed=current_speed,
+            desired_x=desired_transform.location.x,
+            desired_y=desired_transform.location.y,
+            lookahead_x=lookahead_location.x,
+            lookahead_y=lookahead_location.y,
+            desired_speed=desired_speed,
+            previous_steer=state.get("steer"),
+            dt=self.step_length,
+            tuning=self.ackermann_tuning,
+        )
+        state["steer"] = values.steer
+        if (
+            values.position_error > self.ackermann_fail_closed_error_m
+            or values.lookahead_local_x <= 0.1
+        ):
+            self._set_ackermann_fail_closed_reason(
+                actor_id,
+                f"geometry: position_error={values.position_error:.3f}m "
+                f"limit={self.ackermann_fail_closed_error_m:.3f}m "
+                f"lookahead_local_x={values.lookahead_local_x:.3f}m",
+            )
+            return self._full_brake_control(), True
+
+        max_decel = self._as_finite_float(
+            vehicle_info.get("sumo_emergency_decel")
+        )
+        if max_decel is None or max_decel <= 0.0:
+            max_decel = self.ackermann_tuning.max_decel
+        requested_acceleration = max(
+            -max_decel,
+            min(self.ackermann_tuning.max_accel, requested_acceleration),
+        )
+        emergency = self.ackermann_emergency_brake_tuning
+        if (
+            emergency.enabled
+            and requested_acceleration <= -emergency.engage_decel
+            and current_speed > emergency.stop_speed
+        ):
+            self._clear_ackermann_fail_closed_reason(actor_id)
+            brake = compute_direct_brake_value(
+                requested_acceleration,
+                max_decel,
+                emergency.min_brake,
+            )
+            normalized_steer = (
+                0.0
+                if self.ackermann_tuning.max_steer_rad <= 0.0
+                else values.steer / self.ackermann_tuning.max_steer_rad
+            )
+            return carla.VehicleControl(
+                throttle=0.0,
+                steer=max(-1.0, min(1.0, normalized_steer)),
+                brake=brake,
+                hand_brake=False,
+                reverse=False,
+            ), True
+
+        self._clear_ackermann_fail_closed_reason(actor_id)
+        return carla.VehicleAckermannControl(
+            steer=values.steer,
+            speed=desired_speed,
+            acceleration=requested_acceleration,
+            jerk=0.0,
+        ), False
+
     def tick(self):
         """One co-sim step. Dispatches on the tick mode (design: stage 3a/3b docs).
 
@@ -483,15 +1003,18 @@ class CarlaCosim(object):
             av_command = self._build_av_command()
             if av_command is not None:
                 commands.append(av_command)
+        commands.extend(self._build_physics_feedback_commands())
 
         handle = self.inprocess_plugin.tick_async(commands)
         try:
             result = handle.result(timeout=300.0)
         except TimeoutError as e:
             print(f"TeraSim in-process tick failed: {e}. Exiting...")
+            self._apply_physics_fail_closed_brake(str(e))
             return False
         if result.status in ("finished", "error"):
             print(f"TeraSim ended (status={result.status}). Exiting...")
+            self._apply_physics_fail_closed_brake(result.status)
             return False
         if result.state is not None:
             self._inproc_prev_state = result.state
@@ -956,6 +1479,7 @@ class CarlaCosim(object):
         vrus = terasim_states["agent_details"]["vru"]
         vehicles, vrus = self._filter_actor_details_by_radius(vehicles, vrus)
         transform_batch = []
+        ackermann_batch = []
         spawn_requests = []
 
         for veh_id, veh_info in vehicles.items():
@@ -980,6 +1504,7 @@ class CarlaCosim(object):
                 actor_index=vehicle_actor_index,
                 current_frame=current_frame,
                 transform_batch=transform_batch,
+                ackermann_batch=ackermann_batch,
                 spawn_requests=spawn_requests,
             )
         
@@ -1002,6 +1527,7 @@ class CarlaCosim(object):
 
         self._flush_actor_spawn_batch(spawn_requests, transform_batch)
         self._flush_actor_transform_batch(transform_batch)
+        self._flush_actor_ackermann_batch(ackermann_batch)
         self._cleanup_stale_actors(cosim_id_record)
         self._prune_spawn_failures(vehicles.keys(), vrus.keys())
 
@@ -1187,11 +1713,21 @@ class CarlaCosim(object):
             actor_index = request.get("actor_index")
             if actor_index is not None:
                 actor_index[actor_id] = actor
-            self._queue_actor_transform(
-                actor, request["post_spawn_transform"], transform_batch, cosim_id=actor_id
-            )
-            if actor_type == "vru":
-                self._apply_vru_walker_control(request["actor_info"], request["sumo_angle"], actor)
+            if actor_type == "vehicle" and request.get("ackermann_physics"):
+                self._initialize_ackermann_actor(
+                    actor,
+                    actor_id,
+                    request["post_spawn_transform"],
+                    request["actor_info"].get("speed", 0.0),
+                )
+            else:
+                self._queue_actor_transform(
+                    actor, request["post_spawn_transform"], transform_batch, cosim_id=actor_id
+                )
+                if actor_type == "vru":
+                    self._apply_vru_walker_control(
+                        request["actor_info"], request["sumo_angle"], actor
+                    )
 
         stats["spawn_total"] = time.perf_counter() - total_start
         stats["spawn_max"] = stats["spawn_total"]
@@ -1239,6 +1775,28 @@ class CarlaCosim(object):
                 # it so the next state entry re-spawns instead of erroring.
                 self._drop_actor_from_indexes(cosim_id)
         return responses
+
+    def _queue_actor_ackermann_control(
+        self, actor, control, ackermann_batch=None, direct_vehicle_control=False
+    ):
+        command_name = (
+            "ApplyVehicleControl"
+            if direct_vehicle_control
+            else "ApplyVehicleAckermannControl"
+        )
+        command_type = getattr(carla.command, command_name, None)
+        if ackermann_batch is not None and command_type is not None:
+            ackermann_batch.append(command_type(actor.id, control))
+            return
+        if direct_vehicle_control:
+            actor.apply_control(control)
+        else:
+            actor.apply_ackermann_control(control)
+
+    def _flush_actor_ackermann_batch(self, ackermann_batch):
+        if not ackermann_batch:
+            return []
+        return self.client.apply_batch_sync(ackermann_batch, False)
 
     def _build_actor_role_indexes(self):
         """Full world scan seeding the persistent role_name -> actor indexes.
@@ -1294,6 +1852,18 @@ class CarlaCosim(object):
             for cosim_id in stale_ids:
                 actor = index.pop(cosim_id)
                 destroy_commands.append(carla.command.DestroyActor(actor.id))
+        active_vehicle_ids = set(self._vehicle_actor_index)
+        for cache in (
+            self._ackermann_actor_state,
+            self._physics_feedback_frames,
+            self._ackermann_fail_closed_reasons,
+        ):
+            for stale_id in [
+                actor_id
+                for actor_id in cache
+                if actor_id not in active_vehicle_ids
+            ]:
+                cache.pop(stale_id, None)
         if destroy_commands:
             self.client.apply_batch_sync(destroy_commands, False)
 
@@ -1447,10 +2017,12 @@ class CarlaCosim(object):
         actor_index=None,
         current_frame=None,
         transform_batch=None,
+        ackermann_batch=None,
         spawn_requests=None,
     ):
-        """Process a vehicle actor."""
+        """Process one SUMO vehicle as teleport or physical Ackermann actor."""
         cosim_id_record.add(veh_id)
+        uses_physics = self._uses_ackermann_physics(veh_id)
 
         sumo_location = self._resolve_sumo_location(
             "vehicle",
@@ -1460,24 +2032,33 @@ class CarlaCosim(object):
         )
         if sumo_location is None:
             return
-        sumo_angle = self._resolve_sumo_angle("vehicle", veh_id, veh_info, carla_actor)
+        sumo_angle = self._resolve_sumo_angle(
+            "vehicle", veh_id, veh_info, carla_actor
+        )
         if sumo_angle is None:
             return
         sumo_rotation = [0.0, sumo_angle, 0.0]
         shape = [veh_info["length"], veh_info["width"], veh_info["height"]]
+        correct_offset = self._get_carla_offset(sumo_location, 0.0)
+        desired_transform = sumo_to_carla(
+            sumo_location, sumo_rotation, shape, correct_offset
+        )
 
         vehicle = carla_actor
         if vehicle is None:
             if current_frame is None:
                 current_frame = self.world.get_snapshot().frame
-            if not self._should_retry_spawn("vehicle", veh_id, sumo_location, current_frame):
+            if not self._should_retry_spawn(
+                "vehicle", veh_id, sumo_location, current_frame
+            ):
                 return
             blueprint = self._select_vehicle_blueprint(veh_id, veh_info)
-            # Spawn elevated to avoid collision with road geometry, then set correct transform
-            sumo_offset = self._get_carla_offset(sumo_location, self.spawn_z_clearance)
-            spawn_transform = sumo_to_carla(sumo_location, sumo_rotation, shape, sumo_offset)
-            sumo_offset_correct = self._get_carla_offset(sumo_location, 0.0)
-            carla_trasform = sumo_to_carla(sumo_location, sumo_rotation, shape, sumo_offset_correct)
+            spawn_offset = self._get_carla_offset(
+                sumo_location, self.spawn_z_clearance
+            )
+            spawn_transform = sumo_to_carla(
+                sumo_location, sumo_rotation, shape, spawn_offset
+            )
             if self._queue_actor_spawn(
                 spawn_requests,
                 {
@@ -1486,11 +2067,12 @@ class CarlaCosim(object):
                     "actor_info": veh_info,
                     "blueprint": blueprint,
                     "spawn_transform": spawn_transform,
-                    "post_spawn_transform": carla_trasform,
+                    "post_spawn_transform": desired_transform,
                     "sumo_location": sumo_location,
                     "current_frame": current_frame,
                     "actor_index": actor_index,
                     "sumo_angle": sumo_angle,
+                    "ackermann_physics": uses_physics,
                 },
             ):
                 return
@@ -1501,22 +2083,62 @@ class CarlaCosim(object):
                 world=self.world,
                 actor_role=veh_id,
             )
-            if carla_id > 0:
-                self._clear_spawn_failure("vehicle", veh_id)
-                vehicle = self.world.get_actor(carla_id)
-                if vehicle is None:
-                    self._record_spawn_failure("vehicle", veh_id, sumo_location, current_frame)
-                    return
-                if actor_index is not None:
-                    actor_index[veh_id] = vehicle
-                # Immediately set the correct road-level transform
-                vehicle.set_transform(carla_trasform)
+            if carla_id <= 0:
+                self._record_spawn_failure(
+                    "vehicle", veh_id, sumo_location, current_frame
+                )
+                return
+            self._clear_spawn_failure("vehicle", veh_id)
+            vehicle = self.world.get_actor(carla_id)
+            if vehicle is None:
+                self._record_spawn_failure(
+                    "vehicle", veh_id, sumo_location, current_frame
+                )
+                return
+            if actor_index is not None:
+                actor_index[veh_id] = vehicle
+            if uses_physics:
+                self._initialize_ackermann_actor(
+                    vehicle,
+                    veh_id,
+                    desired_transform,
+                    veh_info.get("speed", 0.0),
+                )
             else:
-                self._record_spawn_failure("vehicle", veh_id, sumo_location, current_frame)
-        else:
-            sumo_offset = self._get_carla_offset(sumo_location, 0.0)
-            carla_trasform = sumo_to_carla(sumo_location, sumo_rotation, shape, sumo_offset)
-            self._queue_actor_transform(vehicle, carla_trasform, transform_batch, cosim_id=veh_id)
+                vehicle.set_transform(desired_transform)
+            return
+
+        if uses_physics:
+            actor_state = self._ackermann_actor_state.setdefault(veh_id, {})
+            if not actor_state.get("initialized"):
+                self._initialize_ackermann_actor(
+                    vehicle,
+                    veh_id,
+                    desired_transform,
+                    veh_info.get("speed", 0.0),
+                )
+                return
+            control, direct_vehicle_control = self._build_ackermann_control(
+                veh_id,
+                veh_info,
+                vehicle,
+                desired_transform,
+                sumo_location,
+            )
+            self._queue_actor_ackermann_control(
+                vehicle,
+                control,
+                ackermann_batch,
+                direct_vehicle_control=direct_vehicle_control,
+            )
+            return
+
+        self._queue_actor_transform(
+            vehicle,
+            desired_transform,
+            transform_batch,
+            cosim_id=veh_id,
+        )
 
     def _process_vru(
         self,

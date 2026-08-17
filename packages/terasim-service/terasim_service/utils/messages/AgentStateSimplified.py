@@ -19,6 +19,22 @@ class AgentStateSimplified(BaseModel):
     reconstructed_z: float = 0.0
     reconstructed_position_valid: bool = False
 
+    # Phase-B path target consumed by CARLA's Ackermann controller.
+    lookahead_x: float = 0.0
+    lookahead_y: float = 0.0
+    lookahead_z: float = 0.0
+    lookahead_position_valid: bool = False
+    lookahead_distance: float = 0.0
+    lookahead_heading_change: float = 0.0
+    lookahead_action_mode: str = "route"
+    lookahead_action_valid: bool = True
+    lookahead_action_error: str = ""
+    lookahead_lateral_horizon_displacement: float = 0.0
+    lookahead_target_lateral_distance: float | None = None
+    lookahead_origin_x: float = 0.0
+    lookahead_origin_y: float = 0.0
+    lateral_speed: float = 0.0
+
     ## longitude of the agent (degrees)
     lon: float = 0.0
     ## latitude of the agent (degrees)
@@ -37,6 +53,20 @@ class AgentStateSimplified(BaseModel):
 
     # Speed
     speed: float = 0.0
+
+    # Phase-aligned SUMO action and the CARLA observation assimilated in Phase A.
+    sumo_desired_speed: float | None = None
+    sumo_emergency_decel: float | None = None
+    sumo_lane_change_intent: str = "none"
+    sumo_lane_change_target_lane_id: str = ""
+    feedback_observed_x: float | None = None
+    feedback_observed_y: float | None = None
+    feedback_observed_sumo_angle: float | None = None
+    feedback_observed_speed: float | None = None
+    feedback_observed_acceleration: float | None = None
+    feedback_observed_lane_id: str | None = None
+    feedback_phase_a_sumo_time: float | None = None
+    feedback_source_carla_frame: int | None = None
 
     # Orientation
     orientation: float = 0.0

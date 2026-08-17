@@ -44,7 +44,14 @@ from terasim_nde_nade.adversity import ConstructionAdversity
 
 from .base import BasePlugin
 from ..utils import SimulationState, SUMOSignal, AgentCommand
-from ..utils.sumo_lane_geometry import reconstruct_position_from_lane_geometry
+from ..utils.sumo_lane_geometry import (
+    adapt_lookahead_distances_for_compiled_paths,
+    build_external_state_lateral_action_lookahead,
+    compile_lane_shapes,
+    extract_next_link_lane_ids,
+    reconstruct_position_from_lane_geometry,
+    select_route_aware_lane_projection,
+)
 
 
 def interpolate_by_distance(points, step):
@@ -215,6 +222,71 @@ class TeraSimCoSimInProcessPlugin(BasePlugin):
         # Maintain controlled agents in each step, assuming each agent can be controlled by only one command
         self.controlled_agents_each_step = set()
 
+        # Physical co-simulation is opt-in. Phase A assimilates CARLA pose and
+        # motion immediately; the normal priority-10 SUMO step is the only
+        # Phase B time advance.
+        feedback_actor_value = os.getenv("CARLA_COSIM_ACKERMANN_FEEDBACK_ACTORS", "")
+        self.physics_feedback_actor_ids = {
+            actor_id.strip()
+            for actor_id in feedback_actor_value.split(",")
+            if actor_id.strip()
+        }
+        self.physics_feedback_mode = os.getenv(
+            "CARLA_COSIM_ACKERMANN_FEEDBACK_MODE", "off"
+        ).strip().lower()
+        self.physics_assimilation_mode = os.getenv(
+            "CARLA_COSIM_ACKERMANN_FEEDBACK_ASSIMILATION_MODE", "legacy"
+        ).strip().lower()
+        self.physics_external_state_enabled = (
+            self.physics_feedback_mode == "apply"
+            and self.physics_assimilation_mode == "external_state"
+            and bool(self.physics_feedback_actor_ids)
+        )
+        self.physics_step_length = max(
+            0.0, float(os.getenv("CARLA_COSIM_STEP_LENGTH", "0.05"))
+        )
+        self.physics_strict_lane_hint = self._parse_bool_env(
+            "CARLA_COSIM_ACKERMANN_FEEDBACK_EXTERNAL_STATE_STRICT_LANE_HINT", True
+        )
+        self.physics_validate_external_state = self._parse_bool_env(
+            "CARLA_COSIM_ACKERMANN_FEEDBACK_VALIDATE_EXTERNAL_STATE", True
+        )
+        self.physics_match_threshold = max(
+            0.0,
+            float(
+                os.getenv(
+                    "CARLA_COSIM_ACKERMANN_FEEDBACK_BACKGROUND_MOVE_TO_MAX_DISTANCE",
+                    "8.0",
+                )
+            ),
+        )
+        self.physics_position_tolerance = max(
+            0.0,
+            float(
+                os.getenv(
+                    "CARLA_COSIM_ACKERMANN_FEEDBACK_EXTERNAL_STATE_POSITION_TOLERANCE",
+                    "0.001",
+                )
+            ),
+        )
+        self.physics_feedback_observations = {}
+        self.physics_lane_geometry_cache = {}
+        self.physics_lookahead_path_cache = {}
+        self.physics_lane_change_maneuvers = {}
+        self.physics_lookahead_min_distance = max(
+            0.1, float(os.getenv("CARLA_COSIM_ACKERMANN_LOOKAHEAD_MIN_DISTANCE", "7.0"))
+        )
+        self.physics_lookahead_max_distance = max(
+            self.physics_lookahead_min_distance,
+            float(os.getenv("CARLA_COSIM_ACKERMANN_LOOKAHEAD_MAX_DISTANCE", "15.0")),
+        )
+        if self.physics_external_state_enabled:
+            self.logger.info(
+                "Physical co-sim Phase A enabled: actors=%s strict_lane=%s",
+                sorted(self.physics_feedback_actor_ids),
+                self.physics_strict_lane_hint,
+            )
+
         # Cache construction zone shapes
         self.construction_zone_shapes = None
 
@@ -240,7 +312,8 @@ class TeraSimCoSimInProcessPlugin(BasePlugin):
             )
 
         self.lane_relative_position_enabled = self._parse_bool_env(
-            "TERASIM_COSIM_LANE_RELATIVE_POSITION", False
+            "TERASIM_COSIM_LANE_RELATIVE_POSITION",
+            self.physics_external_state_enabled,
         )
         if self.lane_relative_position_enabled:
             self.logger.info(
@@ -447,6 +520,10 @@ class TeraSimCoSimInProcessPlugin(BasePlugin):
         with self._lock:
             commands = self._pending_commands
             self._pending_commands = []
+        # Phase A observations are valid only for the current SUMO step.
+        # A filtered actor may disappear from one exported state and reappear
+        # later; never let its previous observation pass Phase B validation.
+        self.physics_feedback_observations.clear()
         self.controlled_agents_each_step.clear()
         for command in commands:
             self._apply_agent_command(command)
@@ -560,6 +637,373 @@ class TeraSimCoSimInProcessPlugin(BasePlugin):
                 self.logger.warning("State filter failed; writing all vehicles: %s", e)
                 self.state_filter_error_logged = True
             return vehicle_ids, {}
+
+    @staticmethod
+    def _as_finite_float(value):
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return None
+        return value if math.isfinite(value) else None
+
+    def _is_physics_feedback_actor(self, actor_id):
+        return bool(
+            self.physics_external_state_enabled
+            and actor_id != "AV"
+            and (
+                actor_id in self.physics_feedback_actor_ids
+                or "*" in self.physics_feedback_actor_ids
+            )
+        )
+
+    @staticmethod
+    def _physics_lane_index(lane_id):
+        try:
+            return int(lane_id.rsplit("_", 1)[1])
+        except (AttributeError, IndexError, ValueError):
+            return -1
+
+    def _physics_lane_geometry(self, lane_id):
+        geometry = self.physics_lane_geometry_cache.get(lane_id)
+        if geometry is not None:
+            return geometry
+        edge_id = traci.lane.getEdgeID(lane_id)
+        geometry = {
+            "lane_id": lane_id,
+            "edge_id": edge_id,
+            "lane_index": self._physics_lane_index(lane_id),
+            "shape": tuple(tuple(point) for point in traci.lane.getShape(lane_id)),
+            "length": traci.lane.getLength(lane_id),
+        }
+        self.physics_lane_geometry_cache[lane_id] = geometry
+        return geometry
+
+    def _apply_physics_external_state(self, command, x, y):
+        """Phase A: assimilate a CARLA state without advancing SUMO time."""
+        actor_id = command.agent_id
+        data = command.data
+        immediate_move = getattr(traci.vehicle, "moveToXYImmediate", None)
+        if not callable(immediate_move):
+            raise RuntimeError(
+                "physical co-sim requires patched SUMO moveToXYImmediate"
+            )
+
+        position = (self._as_finite_float(x), self._as_finite_float(y))
+        sumo_angle = self._as_finite_float(data.get("sumo_angle"))
+        speed = self._as_finite_float(data.get("speed"))
+        acceleration = self._as_finite_float(data.get("acceleration"))
+        source_frame = data.get("source_carla_frame")
+        position_z = self._as_finite_float(data.get("z"))
+        if (
+            None in position
+            or sumo_angle is None
+            or speed is None
+            or speed < 0.0
+            or acceleration is None
+            or not isinstance(source_frame, int)
+        ):
+            raise RuntimeError(
+                f"invalid physical feedback state actor={actor_id} frame={source_frame}"
+            )
+
+        lane_id = traci.vehicle.getLaneID(actor_id)
+        if not lane_id:
+            raise RuntimeError(
+                f"physical feedback actor has no current SUMO lane actor={actor_id}"
+            )
+        geometry = self._physics_lane_geometry(lane_id)
+        projection = select_route_aware_lane_projection(
+            position,
+            sumo_angle,
+            [geometry],
+            position_z=position_z,
+            current_lane_id=lane_id,
+            max_distance=self.physics_match_threshold,
+            max_heading_error=180.0,
+            prefer_current_lane=True,
+        )
+        if projection is None:
+            raise RuntimeError(
+                "physical feedback current-lane mapping failed "
+                f"actor={actor_id} lane={lane_id} position={position}"
+            )
+
+        requested_route = tuple(traci.vehicle.getRoute(actor_id))
+        phase_a_time = traci.simulation.getTime()
+        immediate_move(
+            actor_id,
+            projection["edge_id"],
+            projection["lane_index"],
+            position[0],
+            position[1],
+            sumo_angle,
+            1,
+            self.physics_match_threshold,
+            self.physics_strict_lane_hint,
+        )
+        traci.vehicle.setSpeed(actor_id, -1)
+        traci.vehicle.setPreviousSpeed(actor_id, speed, acceleration)
+
+        observed_position = traci.vehicle.getPosition(actor_id)
+        observed_angle = traci.vehicle.getAngle(actor_id)
+        observed_speed = traci.vehicle.getSpeed(actor_id)
+        observed_acceleration = traci.vehicle.getAcceleration(actor_id)
+        observed_lane_id = traci.vehicle.getLaneID(actor_id)
+        observed_time = traci.simulation.getTime()
+        observed_route = tuple(traci.vehicle.getRoute(actor_id))
+        position_error = math.hypot(
+            observed_position[0] - position[0],
+            observed_position[1] - position[1],
+        )
+        angle_error = abs((observed_angle - sumo_angle + 180.0) % 360.0 - 180.0)
+        valid = bool(
+            abs(observed_time - phase_a_time) <= 1e-9
+            and position_error <= self.physics_position_tolerance
+            and angle_error <= 1e-6
+            and abs(observed_speed - speed) <= 1e-6
+            and abs(observed_acceleration - acceleration) <= 1e-6
+            and observed_route == requested_route
+            and (
+                not self.physics_strict_lane_hint
+                or observed_lane_id == projection["lane_id"]
+            )
+        )
+        if self.physics_validate_external_state and not valid:
+            raise RuntimeError(
+                "physical feedback validation failed "
+                f"actor={actor_id} lane={projection['lane_id']}->{observed_lane_id} "
+                f"position_error={position_error:.6g} angle_error={angle_error:.6g}"
+            )
+
+        lane_length = None
+        lane_position = None
+        try:
+            lane_position = traci.vehicle.getLanePosition(actor_id)
+            lane_length = traci.lane.getLength(observed_lane_id)
+        except Exception:
+            pass
+        self.physics_feedback_observations[actor_id] = {
+            "position": tuple(observed_position[:2]),
+            "sumo_angle": observed_angle,
+            "speed": observed_speed,
+            "acceleration": observed_acceleration,
+            "lane_id": observed_lane_id,
+            "lane_position": lane_position,
+            "lane_length": lane_length,
+            "phase_a_time": phase_a_time,
+            "source_carla_frame": source_frame,
+        }
+        return True
+
+    @staticmethod
+    def _physics_lane_change_target_lane_id(current_lane_id, current_lane_index, direction):
+        if not current_lane_id or direction not in {-1, 1}:
+            return ""
+        target_index = current_lane_index + direction
+        if target_index < 0:
+            return ""
+        prefix, separator, suffix = current_lane_id.rpartition("_")
+        if not separator or not prefix or not suffix.isdigit():
+            return ""
+        return f"{prefix}_{target_index}"
+
+    def _physics_lane_change_action(self, vehicle_id, current_lane_id):
+        try:
+            left_state = traci.vehicle.getLaneChangeState(vehicle_id, 1)[1]
+            right_state = traci.vehicle.getLaneChangeState(vehicle_id, -1)[1]
+            current_index = traci.vehicle.getLaneIndex(vehicle_id)
+        except Exception:
+            return "none", ""
+        wants_left = bool(left_state & traci.constants.LCA_LEFT)
+        wants_right = bool(right_state & traci.constants.LCA_RIGHT)
+        if wants_left == wants_right:
+            return "none", ""
+        direction = 1 if wants_left else -1
+        return (
+            "left" if wants_left else "right",
+            self._physics_lane_change_target_lane_id(
+                current_lane_id, current_index, direction
+            ),
+        )
+
+    def _physics_compiled_lookahead_path(self, vehicle_id, current_lane_id):
+        lane_ids = [current_lane_id]
+        try:
+            next_links = traci.vehicle.getNextLinks(vehicle_id)
+        except Exception:
+            next_links = ()
+        for lane_id in extract_next_link_lane_ids(next_links):
+            if lane_id and lane_id not in lane_ids:
+                lane_ids.append(lane_id)
+        key = tuple(lane_ids)
+        if key in self.physics_lookahead_path_cache:
+            return self.physics_lookahead_path_cache[key]
+        shapes = []
+        valid_ids = []
+        for lane_id in lane_ids:
+            try:
+                geometry = self._physics_lane_geometry(lane_id)
+            except Exception:
+                continue
+            if len(geometry["shape"]) >= 2:
+                shapes.append(geometry["shape"])
+                valid_ids.append(lane_id)
+        compiled = compile_lane_shapes(shapes)
+        self.physics_lookahead_path_cache[key] = compiled
+        if tuple(valid_ids) != key:
+            self.physics_lookahead_path_cache.setdefault(tuple(valid_ids), compiled)
+        return compiled
+
+    def _populate_physics_action_state(self, vehicle_id, vehicle_state):
+        """Export the Phase-B SUMO action consumed by CARLA in the next frame."""
+        if not self._is_physics_feedback_actor(vehicle_id):
+            return
+        observation = self.physics_feedback_observations.get(vehicle_id)
+        if observation is None:
+            return
+
+        phase_b_time = traci.simulation.getTime()
+        phase_delta = phase_b_time - observation["phase_a_time"]
+        if abs(phase_delta - self.physics_step_length) > 1e-9:
+            raise RuntimeError(
+                "physical co-sim Phase B time mismatch "
+                f"actor={vehicle_id} delta={phase_delta} "
+                f"expected={self.physics_step_length}"
+            )
+
+        vehicle_state["feedback_observed_x"] = observation["position"][0]
+        vehicle_state["feedback_observed_y"] = observation["position"][1]
+        vehicle_state["feedback_observed_sumo_angle"] = observation["sumo_angle"]
+        vehicle_state["feedback_observed_speed"] = observation["speed"]
+        vehicle_state["feedback_observed_acceleration"] = observation["acceleration"]
+        vehicle_state["feedback_observed_lane_id"] = observation["lane_id"]
+        vehicle_state["feedback_phase_a_sumo_time"] = observation["phase_a_time"]
+        vehicle_state["feedback_source_carla_frame"] = observation[
+            "source_carla_frame"
+        ]
+        try:
+            vehicle_state["sumo_desired_speed"] = traci.vehicle.getSpeedWithoutTraCI(
+                vehicle_id
+            )
+        except Exception:
+            vehicle_state["sumo_desired_speed"] = vehicle_state["speed"]
+        try:
+            vehicle_state["sumo_emergency_decel"] = traci.vehicle.getEmergencyDecel(
+                vehicle_id
+            )
+        except Exception:
+            vehicle_state["sumo_emergency_decel"] = None
+
+        current_lane_id = vehicle_state.get("lane_id") or traci.vehicle.getLaneID(
+            vehicle_id
+        )
+        intent, target_lane_id = self._physics_lane_change_action(
+            vehicle_id, current_lane_id
+        )
+        vehicle_state["sumo_lane_change_intent"] = intent
+        vehicle_state["sumo_lane_change_target_lane_id"] = target_lane_id
+        try:
+            lateral_speed = traci.vehicle.getLateralSpeed(vehicle_id)
+        except Exception:
+            lateral_speed = 0.0
+        vehicle_state["lateral_speed"] = lateral_speed
+
+        compiled_path = self._physics_compiled_lookahead_path(
+            vehicle_id, current_lane_id
+        )
+        base_distance = min(
+            self.physics_lookahead_max_distance,
+            max(self.physics_lookahead_min_distance, vehicle_state["speed"]),
+        )
+        effective_distances, heading_changes = (
+            adapt_lookahead_distances_for_compiled_paths(
+                [compiled_path],
+                [observation["position"]],
+                [base_distance],
+            )
+        )
+        lookahead_distance = effective_distances[0]
+        vehicle_state["lookahead_distance"] = lookahead_distance
+        vehicle_state["lookahead_heading_change"] = heading_changes[0]
+        vehicle_state["lookahead_origin_x"] = observation["position"][0]
+        vehicle_state["lookahead_origin_y"] = observation["position"][1]
+
+        maneuver = self.physics_lane_change_maneuvers.get(vehicle_id)
+        if intent in {"left", "right"} and target_lane_id:
+            if (
+                maneuver is None
+                or maneuver.get("intent") != intent
+                or maneuver.get("target_lane_id") != target_lane_id
+            ):
+                maneuver = {
+                    "intent": intent,
+                    "source_lane_id": current_lane_id,
+                    "target_lane_id": target_lane_id,
+                    "lateral_horizon_displacement": 0.0,
+                    "max_abs_lateral_speed": 0.0,
+                }
+                self.physics_lane_change_maneuvers[vehicle_id] = maneuver
+
+        target_lane_shape = None
+        previous_lateral_displacement = None
+        max_lateral_change = None
+        if maneuver is not None:
+            try:
+                target_lane_shape = self._physics_lane_geometry(
+                    maneuver["target_lane_id"]
+                )["shape"]
+            except Exception:
+                target_lane_shape = None
+            maneuver["max_abs_lateral_speed"] = max(
+                maneuver["max_abs_lateral_speed"], abs(float(lateral_speed))
+            )
+            previous_lateral_displacement = maneuver[
+                "lateral_horizon_displacement"
+            ]
+            max_lateral_change = (
+                maneuver["max_abs_lateral_speed"] * self.physics_step_length
+            )
+
+        action = build_external_state_lateral_action_lookahead(
+            compiled_path,
+            observation["position"],
+            lookahead_distance,
+            target_lane_shape=target_lane_shape,
+            lateral_speed=lateral_speed,
+            desired_speed=vehicle_state["sumo_desired_speed"],
+            maneuver_active=maneuver is not None,
+            previous_lateral_displacement=previous_lateral_displacement,
+            max_lateral_displacement_change=max_lateral_change,
+            z=vehicle_state["z"],
+        )
+        if maneuver is not None and action.get("valid", False):
+            maneuver["lateral_horizon_displacement"] = float(
+                action.get("lateral_displacement", 0.0)
+            )
+            settled = (
+                current_lane_id == maneuver["target_lane_id"]
+                and abs(float(lateral_speed)) < 0.05
+                and action.get("target_lateral_distance") is not None
+                and action["target_lateral_distance"] < 0.15
+            )
+            if settled:
+                self.physics_lane_change_maneuvers.pop(vehicle_id, None)
+
+        vehicle_state["lookahead_action_mode"] = action.get("mode", "route")
+        vehicle_state["lookahead_action_valid"] = bool(action.get("valid", False))
+        vehicle_state["lookahead_action_error"] = action.get("error", "")
+        vehicle_state["lookahead_lateral_horizon_displacement"] = float(
+            action.get("lateral_displacement", 0.0)
+        )
+        vehicle_state["lookahead_target_lateral_distance"] = action.get(
+            "target_lateral_distance"
+        )
+        lookahead = action.get("lookahead")
+        if lookahead is not None:
+            vehicle_state["lookahead_x"] = lookahead[0]
+            vehicle_state["lookahead_y"] = lookahead[1]
+            vehicle_state["lookahead_z"] = lookahead[2]
+            vehicle_state["lookahead_position_valid"] = True
 
     def _populate_lane_relative_position(self, vehicle_id, vehicle_state):
         """Fill the lane-relative fields of a vehicle-state dict (opt-in path)."""
@@ -682,6 +1126,7 @@ class TeraSimCoSimInProcessPlugin(BasePlugin):
             }
             if self.lane_relative_position_enabled:
                 self._populate_lane_relative_position(vid, vehicle_state)
+            self._populate_physics_action_state(vid, vehicle_state)
             vehicles[vid] = vehicle_state
 
         simulation_state.agent_details["vehicle"] = vehicles
@@ -869,6 +1314,12 @@ class TeraSimCoSimInProcessPlugin(BasePlugin):
                     elif "lonlat" in command.data:
                         lon, lat = command.data["lonlat"]
                         x, y = traci.simulation.convertGeo(lon, lat, fromGeo=True)
+                    if (
+                        command.agent_type == "vehicle"
+                        and "source_carla_frame" in command.data
+                        and self._is_physics_feedback_actor(command.agent_id)
+                    ):
+                        return self._apply_physics_external_state(command, x, y)
                     if command.agent_type == "vehicle":
                         # 3-cosim fix: keepRoute=0 (snap to closest lane in the network),
                         # not 2 (free / off-road). With keepRoute=2 an externally-driven
@@ -943,6 +1394,12 @@ class TeraSimCoSimInProcessPlugin(BasePlugin):
 
         except Exception as e:
             self.logger.error(f"Error handling agent command: {e}")
+            if (
+                command.agent_type == "vehicle"
+                and "source_carla_frame" in command.data
+                and self._is_physics_feedback_actor(command.agent_id)
+            ):
+                raise
             return False
 
     # ------------------------------------------------------------------
