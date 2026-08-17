@@ -23,6 +23,39 @@ SOURCE_LANELET_IDS = {
     "incoming_left_turn": "2224169",
     "left_turn_connector": "2224170",
     "repeated_point_lane": "2118445",
+    "node_205_incoming_0": "2224361",
+    "node_205_incoming_1": "2224360",
+    "node_205_incoming_2": "2224359",
+    "node_205_to_1363_0": "2224364",
+    "node_205_to_1368_0": "2224363",
+    "node_205_to_1368_1": "2224388",
+    "node_205_to_1369_0": "2224387",
+    "node_205_to_1368_2": "2224362",
+    "node_205_outgoing_1363_0": "2224365",
+    "node_205_outgoing_1368_0": "2224374",
+    "node_205_outgoing_1368_1": "2224381",
+    "node_205_outgoing_1368_2": "2224380",
+    "node_205_outgoing_1369_0": "2224375",
+}
+
+NODE_205_INCOMING_LANELETS = {
+    "edge_1384_0": "node_205_incoming_0",
+    "edge_1384_1": "node_205_incoming_1",
+    "edge_1384_2": "node_205_incoming_2",
+}
+NODE_205_OUTGOING_LANELETS = {
+    "edge_1363_0": "node_205_outgoing_1363_0",
+    "edge_1368_0": "node_205_outgoing_1368_0",
+    "edge_1368_1": "node_205_outgoing_1368_1",
+    "edge_1368_2": "node_205_outgoing_1368_2",
+    "edge_1369_0": "node_205_outgoing_1369_0",
+}
+NODE_205_CONNECTION_LANELETS: dict[ConnectionKey, tuple[str, str]] = {
+    ("edge_1384", "0", "edge_1363", "0"): ("node_205_to_1363_0", ":node_205_0_0"),
+    ("edge_1384", "1", "edge_1368", "0"): ("node_205_to_1368_0", ":node_205_1_0"),
+    ("edge_1384", "1", "edge_1368", "1"): ("node_205_to_1368_1", ":node_205_1_1"),
+    ("edge_1384", "1", "edge_1369", "0"): ("node_205_to_1369_0", ":node_205_3_0"),
+    ("edge_1384", "2", "edge_1368", "2"): ("node_205_to_1368_2", ":node_205_4_0"),
 }
 
 # These shapes were already corrected from lanelets 2224165, 2224178 and
@@ -69,6 +102,44 @@ def _parse_shape(shape: str | None) -> list[Point]:
         values.extend([0.0] * (3 - len(values)))
         points.append((values[0], values[1], values[2]))
     return points
+
+
+def _replace_shape_suffix(
+    points: list[Point], replacement: list[Point], max_distance: float = 0.002
+) -> list[Point]:
+    """Replace the generated tail beginning at an authoritative source point."""
+
+    if len(points) < 2 or len(replacement) < 2:
+        raise ValueError("source-backed lane shapes need at least two points")
+    match_index = min(
+        range(len(points)),
+        key=lambda index: _point_distance(points[index], replacement[0]),
+    )
+    distance = _point_distance(points[match_index], replacement[0])
+    if distance > max_distance:
+        raise ValueError(
+            f"source geometry start is {distance:.3f} m from the generated lane"
+        )
+    return [*points[:match_index], *replacement]
+
+
+def _replace_shape_prefix(
+    points: list[Point], replacement: list[Point], max_distance: float = 1.0
+) -> list[Point]:
+    """Replace a generated head while retaining the remaining edge geometry."""
+
+    if len(points) < 2 or len(replacement) < 2:
+        raise ValueError("source-backed lane shapes need at least two points")
+    match_index = min(
+        range(len(points)),
+        key=lambda index: _point_distance(points[index], replacement[-1]),
+    )
+    distance = _point_distance(points[match_index], replacement[-1])
+    if distance > max_distance:
+        raise ValueError(
+            f"source geometry end is {distance:.3f} m from the generated lane"
+        )
+    return [*replacement, *points[match_index + 1 :]]
 
 
 def _interpolate(first: Point, second: Point, fraction: float) -> Point:
@@ -207,6 +278,23 @@ def _repair_plain_edges(edge_file: Path, centerlines: dict[str, list[Point]]) ->
     # this repair remains stable even if the input net is regenerated differently.
     repeated_edge.set("shape", _format_shape(source_repeated_shape))
 
+    for lane_id, source_name in NODE_205_INCOMING_LANELETS.items():
+        edge_id, lane_index = lane_id.rsplit("_", 1)
+        _, lane = _edge_lane(root, edge_id, lane_index)
+        source = centerlines[SOURCE_LANELET_IDS[source_name]]
+        repaired = _replace_shape_suffix(_parse_shape(lane.get("shape")), source)
+        lane.set("shape", _format_shape(repaired))
+
+    for lane_id, source_name in NODE_205_OUTGOING_LANELETS.items():
+        edge_id, lane_index = lane_id.rsplit("_", 1)
+        _, lane = _edge_lane(root, edge_id, lane_index)
+        source = centerlines[SOURCE_LANELET_IDS[source_name]]
+        repaired = _replace_shape_prefix(
+            _parse_shape(lane.get("shape")),
+            source,
+        )
+        lane.set("shape", _format_shape(repaired))
+
     _write_xml(tree, edge_file)
 
 
@@ -276,7 +364,10 @@ def _repair_plain_connections(
         _connection_key(connection): connection for connection in root.findall("connection")
     }
 
-    missing = (PRESERVED_CONNECTIONS | {TARGET_CONNECTION}) - connections.keys()
+    required = PRESERVED_CONNECTIONS | {TARGET_CONNECTION} | set(
+        NODE_205_CONNECTION_LANELETS
+    )
+    missing = required - connections.keys()
     if missing:
         raise ValueError(f"required connections were not found: {sorted(missing)}")
 
@@ -300,6 +391,12 @@ def _repair_plain_connections(
     turn_points = centerlines[SOURCE_LANELET_IDS["left_turn_connector"]]
     connections[TARGET_CONNECTION].set("shape", _format_shape(turn_points))
     connections[TARGET_CONNECTION].set("length", f"{_polyline_length(turn_points):.3f}")
+
+    for key, (source_name, _) in NODE_205_CONNECTION_LANELETS.items():
+        points = centerlines[SOURCE_LANELET_IDS[source_name]]
+        connection = connections[key]
+        connection.set("shape", _format_shape(points))
+        connection.set("length", f"{_polyline_length(points):.3f}")
 
     _write_xml(tree, connection_file)
     print(f"regenerating {len(regenerated_keys)} discontinuous connection shapes")
@@ -350,6 +447,53 @@ def _net_connection(
 def _set_shape(element: ET.Element, points: list[Point]) -> None:
     element.set("shape", _format_shape(points))
     element.set("length", f"{_polyline_length(points):.3f}")
+
+
+def _restore_node_205_source_chains(
+    root: ET.Element,
+    source_root: ET.Element,
+    centerlines: dict[str, list[Point]],
+) -> None:
+    """Undo netconvert's asymmetric clipping at the edge_1384 junction."""
+
+    for lane_id, source_name in NODE_205_INCOMING_LANELETS.items():
+        source_lane = _net_lane(source_root, lane_id)
+        source = centerlines[SOURCE_LANELET_IDS[source_name]]
+        repaired = _replace_shape_suffix(
+            _parse_shape(source_lane.get("shape")),
+            source,
+        )
+        _set_shape(_net_lane(root, lane_id), repaired)
+
+    for lane_id, source_name in NODE_205_OUTGOING_LANELETS.items():
+        source = centerlines[SOURCE_LANELET_IDS[source_name]]
+        source_lane = _net_lane(source_root, lane_id)
+        repaired = _replace_shape_prefix(
+            _parse_shape(source_lane.get("shape")),
+            source,
+        )
+        _set_shape(_net_lane(root, lane_id), repaired)
+
+    for key, (source_name, expected_via) in NODE_205_CONNECTION_LANELETS.items():
+        from_edge, from_lane, to_edge, to_lane = key
+        connection = _net_connection(root, from_edge, from_lane, to_edge, to_lane)
+        if connection.get("via") != expected_via:
+            raise RuntimeError(
+                f"{from_edge}_{from_lane}->{to_edge}_{to_lane} via changed from "
+                f"{expected_via} to {connection.get('via')}"
+            )
+
+        connector = centerlines[SOURCE_LANELET_IDS[source_name]]
+        _set_shape(connection, connector)
+        _set_shape(_net_lane(root, expected_via), connector)
+
+        internal_edge, internal_lane = expected_via.rsplit("_", 1)
+        downstream = _net_connection(
+            root, internal_edge, internal_lane, to_edge, to_lane
+        )
+        outgoing = _parse_shape(_net_lane(root, f"{to_edge}_{to_lane}").get("shape"))
+        second_point, _ = _point_at_distance(outgoing, 0.25)
+        _set_shape(downstream, [outgoing[0], second_point])
 
 
 def _cubic_bezier(
@@ -623,6 +767,7 @@ def _postprocess_rebuilt_net(
 
     smoothed, restored = _smooth_internal_lane_hooks(root, source_root)
     short_restored = _restore_reversed_short_internal_lanes(root, source_root)
+    _restore_node_205_source_chains(root, source_root, centerlines)
     print(f"smoothed {smoothed} internal lane hooks; restored {restored} ambiguous hooks")
     print(
         f"restored {short_restored} reversed or degenerate short direct internal lanes"
@@ -713,6 +858,39 @@ def _assert_repaired_geometry(output_net: Path, centerlines: dict[str, list[Poin
             raise RuntimeError(f"{lane_id} does not start at the Lanelet2 source point")
         if actual_points[-1] != expected_end:
             raise RuntimeError(f"{lane_id} does not end at the Lanelet2 source point")
+
+    for lane_id, source_name in NODE_205_INCOMING_LANELETS.items():
+        actual = _parse_shape(_net_lane(root, lane_id).get("shape"))
+        source = centerlines[SOURCE_LANELET_IDS[source_name]]
+        expected_end = tuple(round(value, 3) for value in source[-1])
+        if actual[-1] != expected_end:
+            raise RuntimeError(f"{lane_id} does not end at its Lanelet2 source point")
+
+    for lane_id, source_name in NODE_205_OUTGOING_LANELETS.items():
+        actual = _parse_shape(_net_lane(root, lane_id).get("shape"))
+        source = centerlines[SOURCE_LANELET_IDS[source_name]]
+        expected_start = tuple(round(value, 3) for value in source[0])
+        if actual[0] != expected_start:
+            raise RuntimeError(f"{lane_id} does not start at its Lanelet2 source point")
+
+    for key, (source_name, expected_via) in NODE_205_CONNECTION_LANELETS.items():
+        from_edge, from_lane, to_edge, to_lane = key
+        connection = _net_connection(root, from_edge, from_lane, to_edge, to_lane)
+        expected_shape = [
+            tuple(round(value, 3) for value in point)
+            for point in centerlines[SOURCE_LANELET_IDS[source_name]]
+        ]
+        if connection.get("via") != expected_via:
+            raise RuntimeError(
+                f"{from_edge}_{from_lane}->{to_edge}_{to_lane} via is not "
+                f"{expected_via}"
+            )
+        if _parse_shape(connection.get("shape")) != expected_shape:
+            raise RuntimeError(
+                f"{from_edge}_{from_lane}->{to_edge}_{to_lane} is not source-backed"
+            )
+        if _parse_shape(_net_lane(root, expected_via).get("shape")) != expected_shape:
+            raise RuntimeError(f"{expected_via} is not source-backed")
 
 
 def main() -> None:

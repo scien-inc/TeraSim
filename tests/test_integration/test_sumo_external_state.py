@@ -237,6 +237,34 @@ def _write_odaiba_edge432_route(
 
     return network_path, routes_path
 
+
+def _write_odaiba_edge1384_route(
+    tmp_path: Path,
+    *,
+    vehicle_id: str,
+    depart_lane: int = 1,
+    depart_pos: float = 310.0,
+) -> tuple[Path, Path]:
+    network_path = _odaiba_repaired_network_path()
+    routes_path = tmp_path / f"edge1384-{vehicle_id}.rou.xml"
+    routes_path.write_text(
+        textwrap.dedent(
+            f"""\
+            <routes>
+                <vType id="car" accel="2.6" decel="4.5" emergencyDecel="9"
+                       sigma="0" length="5" width="1.8" maxSpeed="16.667"
+                       laneChangeModel="SL2015"/>
+                <route id="route" edges="edge_1384 edge_1368"/>
+                <vehicle id="{vehicle_id}" type="car" route="route" depart="0"
+                         departLane="{depart_lane}" departPos="{depart_pos}" departSpeed="0"/>
+            </routes>
+            """
+        ),
+        encoding="utf-8",
+    )
+    return network_path, routes_path
+
+
 def _write_odaiba_edge0_route(
     tmp_path: Path, *, vehicle_id: str
 ) -> tuple[Path, Path]:
@@ -1025,6 +1053,227 @@ def test_external_state_edge426_lane_boundary_has_no_phase_b_warp(
         assert max(phase_b_displacements) < 1.2
         assert max(phase_a_corrections) < 1.2
         assert all(lane in {"edge_426_1", "edge_426_2"} for lane in phase_b_lanes)
+    finally:
+        traci.close()
+
+
+@pytest.mark.parametrize("vehicle_id", ["AV", "BV"])
+@pytest.mark.parametrize(
+    "strict_lane_hint", [False, True], ids=["standard", "strict"]
+)
+@pytest.mark.integration
+@pytest.mark.requires_sumo
+def test_edge1384_source_aligned_lane_change_does_not_warp_phase_b(
+    tmp_path: Path, vehicle_id: str, strict_lane_hint: bool
+) -> None:
+    """A SUMO-authorized lane change must stay continuous at the source boundary."""
+    traci = pytest.importorskip("traci")
+    if not hasattr(traci.vehicle, "moveToXYImmediate"):
+        pytest.skip("requires the dedicated SUMO moveToXYImmediate build")
+
+    sumo = _find_binary("sumo")
+    network_path, routes_path = _write_odaiba_edge1384_route(tmp_path, vehicle_id=vehicle_id)
+    traci.start(
+        [
+            sumo,
+            "--net-file",
+            str(network_path),
+            "--route-files",
+            str(routes_path),
+            "--step-length",
+            str(STEP_LENGTH),
+            "--lateral-resolution",
+            "0.2",
+            "--no-step-log",
+            "true",
+            "--duration-log.disable",
+            "true",
+        ],
+        numRetries=5,
+    )
+    try:
+        traci.simulationStep()
+        assert traci.vehicle.getIDList() == (vehicle_id,)
+        assert traci.vehicle.getLaneID(vehicle_id) == "edge_1384_1"
+        original_route = tuple(traci.vehicle.getRoute(vehicle_id))
+
+        lane_1_shape = traci.lane.getShape("edge_1384_1")
+        lane_2_shape = traci.lane.getShape("edge_1384_2")
+        lane_1_length = traci.lane.getLength("edge_1384_1")
+        lane_2_length = traci.lane.getLength("edge_1384_2")
+        assert abs(lane_1_length - 323.170) < 1e-3
+        assert abs(lane_2_length - 323.323) < 1e-3
+        assert abs(lane_1_length - lane_2_length) < 0.5
+
+        traci.vehicle.changeLane(vehicle_id, 2, 10.0)
+        traci.simulation.executeMove()
+        assert traci.vehicle.getLaneID(vehicle_id) == "edge_1384_1"
+
+        phase_b_lanes = []
+        phase_b_displacements = []
+        for cycle in range(16):
+            lane_offset = 312.0 + 0.15 * cycle
+            lane_1_center = _position_at_declared_lane_offset(
+                lane_1_shape, lane_1_length, lane_offset
+            )
+            lane_2_center = _position_at_declared_lane_offset(
+                lane_2_shape, lane_2_length, lane_offset
+            )
+            lane_2_fraction = 0.15 + 0.85 * cycle / 15.0
+            target = (
+                lane_1_center[0]
+                + lane_2_fraction * (lane_2_center[0] - lane_1_center[0]),
+                lane_1_center[1]
+                + lane_2_fraction * (lane_2_center[1] - lane_1_center[1]),
+            )
+            next_lane_1_center = _position_at_declared_lane_offset(
+                lane_1_shape, lane_1_length, lane_offset + 0.1
+            )
+            target_angle = math.degrees(
+                math.atan2(
+                    next_lane_1_center[0] - lane_1_center[0],
+                    next_lane_1_center[1] - lane_1_center[1],
+                )
+            ) % 360.0
+            current_lane = traci.vehicle.getLaneID(vehicle_id)
+            lane_hint = int(current_lane.rsplit("_", 1)[1])
+
+            phase_a_time = traci.simulation.getTime()
+            _set_external_motion_state(
+                traci,
+                vehicle_id,
+                "edge_1384",
+                lane_hint,
+                target[0],
+                target[1],
+                target_angle,
+                3.0,
+                0.0,
+                keepRoute=1,
+                matchThreshold=8.0,
+                strictLaneHint=strict_lane_hint,
+            )
+            assert traci.simulation.getTime() == phase_a_time
+            assert math.dist(traci.vehicle.getPosition(vehicle_id), target) < 1e-5
+
+            traci.simulationStep()
+            phase_b_position = traci.vehicle.getPosition(vehicle_id)
+            phase_b_displacements.append(math.dist(phase_b_position, target))
+            phase_b_lanes.append(traci.vehicle.getLaneID(vehicle_id))
+            assert tuple(traci.vehicle.getRoute(vehicle_id)) == original_route
+
+        assert max(phase_b_displacements) < 1.2
+        assert set(phase_b_lanes) <= {"edge_1384_1", "edge_1384_2"}
+        assert phase_b_lanes[-1] == "edge_1384_2"
+        assert abs(traci.vehicle.getLateralLanePosition(vehicle_id)) < 0.2
+
+        previous = traci.vehicle.getPosition(vehicle_id)
+        downstream_lanes = []
+        downstream_displacements = []
+        for _ in range(400):
+            traci.simulationStep()
+            current = traci.vehicle.getPosition(vehicle_id)
+            downstream_displacements.append(math.dist(previous, current))
+            downstream_lanes.append(traci.vehicle.getLaneID(vehicle_id))
+            previous = current
+            if downstream_lanes[-1] == "edge_1368_2":
+                break
+
+        assert ":node_205_4_0" in downstream_lanes
+        assert downstream_lanes[-1] == "edge_1368_2"
+        assert max(downstream_displacements) < 1.2
+        assert tuple(traci.vehicle.getRoute(vehicle_id)) == original_route
+    finally:
+        traci.close()
+
+
+@pytest.mark.integration
+@pytest.mark.requires_sumo
+def test_edge1384_recorded_vehicle2991_pose_reaches_internal_connector(
+    tmp_path: Path,
+) -> None:
+    """Replay the field poses that previously failed current-lane mapping."""
+    traci = pytest.importorskip("traci")
+    if not hasattr(traci.vehicle, "moveToXYImmediate"):
+        pytest.skip("requires the dedicated SUMO moveToXYImmediate build")
+
+    recorded_poses = (
+        (89646.48917061201, 42225.10097877495, 326.2417907714844),
+        (89646.01978620724, 42225.794145375025, 326.12034606933594),
+        (89645.54895481182, 42226.492114125285, 326.0061492919922),
+        (89645.0773770173, 42227.18557231082, 325.85677337646484),
+        (89644.58887217002, 42227.87225037115, 325.64928436279297),
+        (89644.10806762538, 42228.553593029734, 325.42415618896484),
+        (89643.63399133907, 42229.23098312458, 325.1883544921875),
+        (89643.15744891617, 42229.89106969908, 324.96517181396484),
+        (89642.68346784334, 42230.536054660566, 324.5761489868164),
+        (89642.18869820435, 42231.15137303481, 323.7374954223633),
+        (89641.66610158945, 42231.72990996251, 322.37047576904297),
+        (89641.13103695033, 42232.281355231535, 320.7629852294922),
+    )
+
+    sumo = _find_binary("sumo")
+    network_path, routes_path = _write_odaiba_edge1384_route(
+        tmp_path, vehicle_id="vehicle2991", depart_lane=2, depart_pos=318.0
+    )
+    traci.start(
+        [
+            sumo,
+            "--net-file",
+            str(network_path),
+            "--route-files",
+            str(routes_path),
+            "--step-length",
+            str(STEP_LENGTH),
+            "--lateral-resolution",
+            "0.2",
+            "--no-step-log",
+            "true",
+            "--duration-log.disable",
+            "true",
+        ],
+        numRetries=5,
+    )
+    try:
+        traci.simulationStep()
+        vehicle_id = "vehicle2991"
+        original_route = tuple(traci.vehicle.getRoute(vehicle_id))
+        phase_a_lanes = []
+        phase_b_lanes = []
+        phase_b_displacements = []
+        for x, y, angle in recorded_poses:
+            current_lane_id = traci.vehicle.getLaneID(vehicle_id)
+            current_edge_id = traci.lane.getEdgeID(current_lane_id)
+            current_lane_index = int(current_lane_id.rsplit("_", 1)[1])
+            phase_a_lanes.append(current_lane_id)
+
+            _set_external_motion_state(
+                traci,
+                vehicle_id,
+                current_edge_id,
+                current_lane_index,
+                x,
+                y,
+                angle,
+                16.0,
+                0.0,
+                keepRoute=1,
+                matchThreshold=8.0,
+                strictLaneHint=True,
+            )
+            assert math.dist(traci.vehicle.getPosition(vehicle_id), (x, y)) < 1e-5
+
+            traci.simulationStep()
+            phase_b_position = traci.vehicle.getPosition(vehicle_id)
+            phase_b_displacements.append(math.dist(phase_b_position, (x, y)))
+            phase_b_lanes.append(traci.vehicle.getLaneID(vehicle_id))
+            assert tuple(traci.vehicle.getRoute(vehicle_id)) == original_route
+
+        assert phase_a_lanes[-1] == ":node_205_4_0"
+        assert ":node_205_4_0" in phase_b_lanes
+        assert max(phase_b_displacements) < 8.0
+        assert max(phase_b_displacements[2:]) < 1.2
+        assert tuple(traci.vehicle.getRoute(vehicle_id)) == original_route
     finally:
         traci.close()
 
