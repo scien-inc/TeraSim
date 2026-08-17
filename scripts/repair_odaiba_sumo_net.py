@@ -457,6 +457,117 @@ def _smooth_internal_lane_hooks(
     return smoothed, restored
 
 
+def _restore_reversed_short_internal_lanes(
+    root: ET.Element, source_root: ET.Element
+) -> int:
+    """Restore malformed direct via stubs from the Lanelet2-derived source net."""
+
+    lanes = {
+        lane.get("id", ""): lane
+        for edge in root.findall("edge")
+        for lane in edge.findall("lane")
+    }
+    source_lanes = {
+        lane.get("id", ""): lane
+        for edge in source_root.findall("edge")
+        for lane in edge.findall("lane")
+    }
+    connections = list(root.findall("connection"))
+    source_connections: dict[ConnectionKey, list[ET.Element]] = {}
+    for connection in source_root.findall("connection"):
+        source_connections.setdefault(_connection_key(connection), []).append(connection)
+
+    restored = 0
+    for owner in connections:
+        from_edge = owner.get("from", "")
+        to_edge = owner.get("to", "")
+        via = owner.get("via")
+        if not via or from_edge.startswith(":") or to_edge.startswith(":"):
+            continue
+        try:
+            internal_edge, internal_lane_index = via.rsplit("_", 1)
+        except ValueError:
+            continue
+
+        downstream = [
+            connection
+            for connection in connections
+            if connection.get("from") == internal_edge
+            and connection.get("fromLane") == internal_lane_index
+        ]
+        if len(downstream) != 1 or downstream[0].get("via"):
+            # Split-junction movements have another internal via and do not own
+            # the complete source connection shape.
+            continue
+        if (
+            downstream[0].get("to") != to_edge
+            or downstream[0].get("toLane") != owner.get("toLane")
+        ):
+            continue
+
+        internal_lane = lanes.get(via)
+        if internal_lane is None:
+            continue
+        owner_shape = _parse_shape(owner.get("shape"))
+        rebuilt_shape = _parse_shape(internal_lane.get("shape"))
+        if len(owner_shape) != 2 or len(rebuilt_shape) != 2:
+            continue
+        try:
+            owner_length = float(owner.get("length", "nan"))
+            rebuilt_length = float(internal_lane.get("length", "nan"))
+        except ValueError:
+            continue
+        if not (
+            math.isclose(owner_length, 0.250, abs_tol=1e-9)
+            and math.isclose(rebuilt_length, 0.250, abs_tol=1e-9)
+        ):
+            continue
+
+        owner_vectors = _shape_vectors(owner_shape)
+        rebuilt_vectors = _shape_vectors(rebuilt_shape)
+        malformed = _polyline_length(rebuilt_shape) <= 1e-9 or (
+            owner_vectors
+            and rebuilt_vectors
+            and _heading_change(owner_vectors[0], rebuilt_vectors[0]) > 90.0
+        )
+        if not malformed:
+            continue
+
+        source_owner_candidates = source_connections.get(_connection_key(owner), [])
+        source_lane = source_lanes.get(via)
+        if len(source_owner_candidates) != 1 or source_lane is None:
+            raise RuntimeError(f"{via} has no unique Lanelet2-derived source geometry")
+        source_owner = source_owner_candidates[0]
+        source_owner_shape = _parse_shape(source_owner.get("shape"))
+        source_lane_shape = _parse_shape(source_lane.get("shape"))
+        try:
+            source_owner_length = float(source_owner.get("length", "nan"))
+            source_lane_length = float(source_lane.get("length", "nan"))
+        except ValueError as error:
+            raise RuntimeError(f"{via} has invalid source length") from error
+
+        safe_source = (
+            source_owner.get("via") == via
+            and len(source_owner_shape) == 2
+            and len(source_lane_shape) == 2
+            and source_owner_shape == owner_shape
+            and source_lane_shape == owner_shape
+            and math.isclose(source_owner_length, 0.250, abs_tol=1e-9)
+            and math.isclose(source_lane_length, 0.250, abs_tol=1e-9)
+            and _point_distance(rebuilt_shape[0], source_lane_shape[0]) <= 0.002
+            and bool(_shape_vectors(source_lane_shape))
+        )
+        if not safe_source:
+            raise RuntimeError(
+                f"{via} is malformed but its Lanelet2-derived source is ambiguous"
+            )
+
+        internal_lane.set("shape", source_lane.get("shape", ""))
+        internal_lane.set("length", source_lane.get("length", ""))
+        restored += 1
+    return restored
+
+
 def _postprocess_rebuilt_net(
     net_file: Path, source_net: Path, centerlines: dict[str, list[Point]]
 ) -> None:
@@ -511,7 +622,11 @@ def _postprocess_rebuilt_net(
     )
 
     smoothed, restored = _smooth_internal_lane_hooks(root, source_root)
+    short_restored = _restore_reversed_short_internal_lanes(root, source_root)
     print(f"smoothed {smoothed} internal lane hooks; restored {restored} ambiguous hooks")
+    print(
+        f"restored {short_restored} reversed or degenerate short direct internal lanes"
+    )
 
     _write_xml(tree, net_file)
 
