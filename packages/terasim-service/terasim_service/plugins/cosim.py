@@ -2511,8 +2511,152 @@ class TeraSimCoSimPlugin(BasePlugin):
 
         return compiled_path
 
-    def _external_state_lane_change_maneuver(self, vehicle_id, vehicle_state):
-        """Latch only the source and target explicitly selected by SUMO."""
+    @staticmethod
+    def _lanes_share_edge(source_lane_id, target_lane_id):
+        source_edge, source_separator, source_index = source_lane_id.rpartition("_")
+        target_edge, target_separator, target_index = target_lane_id.rpartition("_")
+        return bool(
+            source_separator
+            and target_separator
+            and source_edge
+            and source_edge == target_edge
+            and source_index.isdigit()
+            and target_index.isdigit()
+        )
+
+    def _unique_internal_downstream_lane_ids(
+        self,
+        lane_id,
+        profile_ctx=None,
+    ):
+        if not lane_id or not lane_id.startswith(":"):
+            return ()
+        try:
+            links = self._profile_detail_traci_call(
+                profile_ctx,
+                "lane_get_links_for_maneuver",
+                traci.lane.getLinks,
+                lane_id,
+                True,
+            )
+        except Exception:
+            return ()
+        links = tuple(links or ())
+        if len(links) != 1:
+            return ()
+        lane_ids = tuple(extract_next_link_lane_ids(links))
+        destination_lane_id = links[0][0] if links[0] else ""
+        if (
+            not isinstance(destination_lane_id, str)
+            or not destination_lane_id
+            or not lane_ids
+            or lane_ids[-1] != destination_lane_id
+            or lane_id in lane_ids
+        ):
+            return ()
+        return lane_ids
+
+    def _immediate_downstream_lane_ids(
+        self,
+        vehicle_id,
+        context_values=None,
+        profile_ctx=None,
+    ):
+        context_values = context_values or {}
+        has_next_links, next_links = self._context_vehicle_value(
+            context_values, "VAR_NEXT_LINKS"
+        )
+        if not has_next_links:
+            try:
+                next_links = self._profile_detail_traci_call(
+                    profile_ctx,
+                    "vehicle_get_next_links_for_maneuver",
+                    traci.vehicle.getNextLinks,
+                    vehicle_id,
+                )
+            except Exception:
+                next_links = ()
+        first_link = tuple(next_links or ())[:1]
+        return tuple(extract_next_link_lane_ids(first_link))
+
+    def _update_external_state_maneuver_downstream(
+        self,
+        vehicle_id,
+        maneuver,
+        current_lane_id,
+        context_values=None,
+        profile_ctx=None,
+    ):
+        if current_lane_id not in {
+            maneuver.get("source_lane_id"),
+            maneuver.get("target_lane_id"),
+        }:
+            return
+        if maneuver.get("downstream_from_lane_id") == current_lane_id:
+            return
+        maneuver.pop("downstream_progress_index", None)
+        maneuver["downstream_from_lane_id"] = current_lane_id
+        if current_lane_id.startswith(":"):
+            downstream_lane_ids = self._unique_internal_downstream_lane_ids(
+                current_lane_id,
+                profile_ctx=profile_ctx,
+            )
+        else:
+            downstream_lane_ids = self._immediate_downstream_lane_ids(
+                vehicle_id,
+                context_values=context_values,
+                profile_ctx=profile_ctx,
+            )
+
+        maneuver["immediate_downstream_lane_ids"] = downstream_lane_ids
+
+    def _expand_external_state_maneuver_internal_downstream(
+        self,
+        maneuver,
+        progress_index,
+        profile_ctx=None,
+    ):
+        ordered_lane_ids = tuple(
+            maneuver.get("immediate_downstream_lane_ids", ())
+        )
+        try:
+            current_lane_id = ordered_lane_ids[progress_index]
+        except (IndexError, TypeError):
+            return ordered_lane_ids
+        if (
+            not current_lane_id.startswith(":")
+            or progress_index >= len(ordered_lane_ids) - 1
+        ):
+            return ordered_lane_ids
+        direct_lane_ids = self._unique_internal_downstream_lane_ids(
+            current_lane_id,
+            profile_ctx=profile_ctx,
+        )
+        verified_lane_ids = ordered_lane_ids[: progress_index + 1]
+        if (
+            not direct_lane_ids
+            or direct_lane_ids[-1] != ordered_lane_ids[-1]
+            or current_lane_id in direct_lane_ids
+        ):
+            maneuver["immediate_downstream_lane_ids"] = verified_lane_ids
+            return verified_lane_ids
+        expanded_lane_ids = (
+            ordered_lane_ids[: progress_index + 1] + direct_lane_ids
+        )
+        if len(set(expanded_lane_ids)) != len(expanded_lane_ids):
+            maneuver["immediate_downstream_lane_ids"] = verified_lane_ids
+            return verified_lane_ids
+        maneuver["immediate_downstream_lane_ids"] = expanded_lane_ids
+        return expanded_lane_ids
+
+    def _external_state_lane_change_maneuver(
+        self,
+        vehicle_id,
+        vehicle_state,
+        context_values=None,
+        profile_ctx=None,
+    ):
+        """Latch only the source, target, and immediate downstream link chosen by SUMO."""
         maneuvers = getattr(self, "external_state_lane_change_maneuvers", None)
         if maneuvers is None:
             maneuvers = {}
@@ -2536,16 +2680,80 @@ class TeraSimCoSimPlugin(BasePlugin):
                     "target_lane_id": target_lane_id,
                 }
                 maneuvers[vehicle_id] = maneuver
+            self._update_external_state_maneuver_downstream(
+                vehicle_id,
+                maneuver,
+                current_lane_id,
+                context_values=context_values,
+                profile_ctx=profile_ctx,
+            )
             return maneuver, ""
 
         if maneuver is None:
             return None, ""
-        if current_lane_id not in {
-            maneuver.get("source_lane_id"),
-            maneuver.get("target_lane_id"),
-        }:
+        source_lane_id = maneuver.get("source_lane_id", "")
+        target_lane_id = maneuver.get("target_lane_id", "")
+        maneuver_lane_ids = {source_lane_id, target_lane_id}
+        ordered_downstream_lane_ids = tuple(
+            maneuver.get("immediate_downstream_lane_ids", ())
+        )
+        progress_index = maneuver.get("downstream_progress_index")
+        if progress_index is not None:
+            try:
+                previous_lane_id = ordered_downstream_lane_ids[progress_index]
+            except (IndexError, TypeError):
+                return maneuver, "maneuver_primary_lane_mismatch"
+            if current_lane_id == previous_lane_id:
+                return None, ""
+            next_index = progress_index + 1
+            if (
+                next_index < len(ordered_downstream_lane_ids)
+                and current_lane_id == ordered_downstream_lane_ids[next_index]
+            ):
+                if next_index == len(ordered_downstream_lane_ids) - 1:
+                    maneuvers.pop(vehicle_id, None)
+                else:
+                    self._expand_external_state_maneuver_internal_downstream(
+                        maneuver,
+                        next_index,
+                        profile_ctx=profile_ctx,
+                    )
+                    maneuver["downstream_progress_index"] = next_index
+                return None, ""
             return maneuver, "maneuver_primary_lane_mismatch"
-        return maneuver, ""
+
+        if current_lane_id in maneuver_lane_ids:
+            self._update_external_state_maneuver_downstream(
+                vehicle_id,
+                maneuver,
+                current_lane_id,
+                context_values=context_values,
+                profile_ctx=profile_ctx,
+            )
+            return maneuver, ""
+
+        normal_downstream_authority = (
+            self._lanes_share_edge(source_lane_id, target_lane_id)
+            and maneuver.get("downstream_from_lane_id") in maneuver_lane_ids
+            and bool(ordered_downstream_lane_ids)
+        )
+        if normal_downstream_authority:
+            destination_lane_id = ordered_downstream_lane_ids[-1]
+            if current_lane_id == destination_lane_id:
+                maneuvers.pop(vehicle_id, None)
+                return None, ""
+            if (
+                len(ordered_downstream_lane_ids) > 1
+                and current_lane_id == ordered_downstream_lane_ids[0]
+            ):
+                self._expand_external_state_maneuver_internal_downstream(
+                    maneuver,
+                    0,
+                    profile_ctx=profile_ctx,
+                )
+                maneuver["downstream_progress_index"] = 0
+                return None, ""
+        return maneuver, "maneuver_primary_lane_mismatch"
 
     def _populate_vehicle_lookaheads(self, requests, profile_ctx=None):
         if not requests:
@@ -2662,7 +2870,16 @@ class TeraSimCoSimPlugin(BasePlugin):
                 maneuver, maneuver_error = self._external_state_lane_change_maneuver(
                     vehicle_id,
                     vehicle_state,
+                    context_values=context_values,
+                    profile_ctx=profile_ctx,
                 )
+                if maneuver is not None:
+                    vehicle_state.external_state_maneuver_source_lane_id = (
+                        maneuver.get("source_lane_id", "")
+                    )
+                    vehicle_state.external_state_maneuver_target_lane_id = (
+                        maneuver.get("target_lane_id", "")
+                    )
                 target_lane_shape = None
                 if maneuver is not None and not maneuver_error:
                     try:

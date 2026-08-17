@@ -710,6 +710,775 @@ def test_external_state_lane_change_action_continues_after_primary_lane_switch(
     assert "AV" not in plugin.external_state_lane_change_maneuvers
 
 
+@pytest.mark.parametrize(
+    "downstream_lane_id", [":node_1045_0_0", "edge_432_1"], ids=["internal", "successor"]
+)
+def test_external_state_lane_change_action_ends_on_ordered_downstream_progression(
+    monkeypatch,
+    downstream_lane_id,
+):
+    from terasim_service.plugins import cosim as plugin_module
+    from terasim_service.utils.messages.AgentStateSimplified import (
+        AgentStateSimplified,
+    )
+    from terasim_service.utils.sumo_lane_geometry import compile_lane_shapes
+
+    constants = types.SimpleNamespace(
+        VAR_SPEED_LAT=1,
+        VAR_LANEPOSITION_LAT=2,
+        VAR_NEXT_LINKS=3,
+    )
+    monkeypatch.setattr(
+        plugin_module,
+        "traci",
+        types.SimpleNamespace(
+            constants=constants,
+            lane=types.SimpleNamespace(
+                getLinks=lambda lane_id, extended=True: [
+                    (
+                        "edge_432_1",
+                        True,
+                        True,
+                        False,
+                        "",
+                        "G",
+                        "s",
+                        0.0,
+                    )
+                ]
+            ),
+        ),
+    )
+    plugin = plugin_module.TeraSimCoSimPlugin.__new__(plugin_module.TeraSimCoSimPlugin)
+    plugin.feedback_observed_positions = {"AV": (8.0, 0.0)}
+    plugin.feedback_source_carla_frames = {"AV": 123}
+    plugin.ackermann_feedback_assimilation_mode = "external_state"
+    plugin.external_state_route_lookahead_only = True
+    plugin.lookahead_straight_min_distance = 7.0
+    plugin.lookahead_max_distance = 15.0
+    plugin.lookahead_curve_min_distance = 3.5
+    plugin.lookahead_curve_start_radians = math.radians(5.0)
+    plugin.lookahead_curve_full_scale_radians = math.radians(45.0)
+    plugin._get_vehicle_lookahead_compiled_path = lambda *args, **kwargs: (
+        compile_lane_shapes([[(0.0, 0.0), (30.0, 0.0)]])
+    )
+    plugin._get_lookahead_lane_shape = lambda *_args, **_kwargs: [
+        (0.0, 0.0),
+        (30.0, 0.0),
+    ]
+    source_next_links = [
+        (
+            "edge_432_1",
+            ":node_1045_0_0",
+            True,
+            True,
+            False,
+            "G",
+            "s",
+            2.0,
+        )
+    ]
+
+    requested = AgentStateSimplified(
+        x=8.0,
+        y=0.0,
+        speed=9.8,
+        sumo_desired_speed=9.8,
+        lane_id="edge_426_0",
+        sumo_lane_change_intent="left",
+        sumo_lane_change_target_lane_id="edge_426_1",
+    )
+    plugin._populate_vehicle_lookahead(
+        "AV",
+        requested,
+        context_values={
+            constants.VAR_SPEED_LAT: 1.0,
+            constants.VAR_LANEPOSITION_LAT: 0.0,
+            constants.VAR_NEXT_LINKS: source_next_links,
+        },
+    )
+    assert requested.lookahead_action_valid is True
+    assert "AV" in plugin.external_state_lane_change_maneuvers
+
+    intent_cleared = requested.model_copy(
+        update={
+            "sumo_lane_change_intent": "none",
+            "sumo_lane_change_target_lane_id": "",
+        }
+    )
+    plugin._populate_vehicle_lookahead("AV", intent_cleared, context_values={})
+    assert intent_cleared.lookahead_action_valid is True
+    assert "AV" in plugin.external_state_lane_change_maneuvers
+
+    internal = AgentStateSimplified(
+        x=10.0,
+        y=0.0,
+        speed=9.9,
+        sumo_desired_speed=9.9,
+        lane_id=downstream_lane_id,
+    )
+    plugin.feedback_observed_positions["AV"] = (10.0, 0.0)
+    plugin._populate_vehicle_lookahead(
+        "AV",
+        internal,
+        context_values={
+            constants.VAR_SPEED_LAT: 0.0,
+            constants.VAR_LANEPOSITION_LAT: 0.0,
+        },
+    )
+    assert internal.lookahead_action_valid is True
+    assert internal.lookahead_action_error == ""
+    if downstream_lane_id.startswith(":"):
+        assert "AV" in plugin.external_state_lane_change_maneuvers
+        repeated_internal = internal.model_copy()
+        plugin._populate_vehicle_lookahead(
+            "AV",
+            repeated_internal,
+            context_values={
+                constants.VAR_SPEED_LAT: 0.0,
+                constants.VAR_LANEPOSITION_LAT: 0.0,
+            },
+        )
+        assert repeated_internal.lookahead_action_valid is True
+        assert repeated_internal.lookahead_action_error == ""
+        assert "AV" in plugin.external_state_lane_change_maneuvers
+    else:
+        assert "AV" not in plugin.external_state_lane_change_maneuvers
+
+    successor = AgentStateSimplified(
+        x=12.0,
+        y=0.0,
+        speed=9.9,
+        sumo_desired_speed=9.9,
+        lane_id="edge_432_1",
+    )
+    plugin.feedback_observed_positions["AV"] = (12.0, 0.0)
+    plugin._populate_vehicle_lookahead(
+        "AV",
+        successor,
+        context_values={
+            constants.VAR_SPEED_LAT: 0.0,
+            constants.VAR_LANEPOSITION_LAT: 0.0,
+        },
+    )
+    assert successor.lookahead_action_valid is True
+    assert successor.lookahead_action_error == ""
+
+
+@pytest.mark.parametrize(
+    ("mismatched_lane_id", "advance_to_internal"),
+    [
+        pytest.param("edge_unrelated_0", False, id="unrelated"),
+        pytest.param("edge_427_1", False, id="future"),
+        pytest.param(":node_1045_0_1", False, id="wrong-internal"),
+        pytest.param("edge_432_0", True, id="wrong-successor-after-internal"),
+        pytest.param("edge_unrelated_0", True, id="unrelated-after-internal"),
+        pytest.param("edge_426_0", True, id="source-rollback-after-internal"),
+    ],
+)
+def test_external_state_lane_change_action_rejects_unrelated_lane_jump(
+    monkeypatch, mismatched_lane_id, advance_to_internal
+):
+    from terasim_service.plugins import cosim as plugin_module
+    from terasim_service.utils.messages.AgentStateSimplified import (
+        AgentStateSimplified,
+    )
+    from terasim_service.utils.sumo_lane_geometry import compile_lane_shapes
+
+    constants = types.SimpleNamespace(
+        VAR_SPEED_LAT=1,
+        VAR_LANEPOSITION_LAT=2,
+        VAR_NEXT_LINKS=3,
+    )
+    monkeypatch.setattr(plugin_module, "traci", types.SimpleNamespace(constants=constants))
+    plugin = plugin_module.TeraSimCoSimPlugin.__new__(plugin_module.TeraSimCoSimPlugin)
+    plugin.feedback_observed_positions = {"AV": (8.0, 0.0)}
+    plugin.feedback_source_carla_frames = {"AV": 123}
+    plugin.ackermann_feedback_assimilation_mode = "external_state"
+    plugin.external_state_route_lookahead_only = True
+    plugin.lookahead_straight_min_distance = 7.0
+    plugin.lookahead_max_distance = 15.0
+    plugin.lookahead_curve_min_distance = 3.5
+    plugin.lookahead_curve_start_radians = math.radians(5.0)
+    plugin.lookahead_curve_full_scale_radians = math.radians(45.0)
+    plugin._get_vehicle_lookahead_compiled_path = lambda *args, **kwargs: (
+        compile_lane_shapes([[(0.0, 0.0), (30.0, 0.0)]])
+    )
+    plugin._get_lookahead_lane_shape = lambda *_args, **_kwargs: [
+        (0.0, 0.0),
+        (30.0, 0.0),
+    ]
+    source_next_links = [
+        (
+            "edge_432_1",
+            ":node_1045_0_0",
+            True,
+            True,
+            False,
+            "G",
+            "s",
+            2.0,
+        ),
+        (
+            "edge_427_1",
+            ":node_next_0_0",
+            True,
+            True,
+            False,
+            "G",
+            "s",
+            2.0,
+        ),
+    ]
+
+    requested = AgentStateSimplified(
+        x=8.0,
+        y=0.0,
+        speed=9.8,
+        sumo_desired_speed=9.8,
+        lane_id="edge_426_0",
+        sumo_lane_change_intent="left",
+        sumo_lane_change_target_lane_id="edge_426_1",
+    )
+    plugin._populate_vehicle_lookahead(
+        "AV",
+        requested,
+        context_values={
+            constants.VAR_SPEED_LAT: 1.0,
+            constants.VAR_LANEPOSITION_LAT: 0.0,
+            constants.VAR_NEXT_LINKS: source_next_links,
+        },
+    )
+
+    if advance_to_internal:
+        internal = AgentStateSimplified(
+            x=9.0,
+            y=0.0,
+            speed=9.9,
+            sumo_desired_speed=9.9,
+            lane_id=":node_1045_0_0",
+        )
+        plugin.feedback_observed_positions["AV"] = (9.0, 0.0)
+        plugin._populate_vehicle_lookahead(
+            "AV",
+            internal,
+            context_values={
+                constants.VAR_SPEED_LAT: 0.0,
+                constants.VAR_LANEPOSITION_LAT: 0.0,
+            },
+        )
+        assert internal.lookahead_action_valid is True
+        assert internal.lookahead_action_error == ""
+        assert "AV" in plugin.external_state_lane_change_maneuvers
+
+    unrelated = AgentStateSimplified(
+        x=10.0,
+        y=0.0,
+        speed=9.9,
+        sumo_desired_speed=9.9,
+        lane_id=mismatched_lane_id,
+    )
+    plugin.feedback_observed_positions["AV"] = (10.0, 0.0)
+    plugin._populate_vehicle_lookahead(
+        "AV",
+        unrelated,
+        context_values={
+            constants.VAR_SPEED_LAT: 0.0,
+            constants.VAR_LANEPOSITION_LAT: 0.0,
+        },
+    )
+
+    assert unrelated.lookahead_action_valid is False
+    assert unrelated.lookahead_action_error == "maneuver_primary_lane_mismatch"
+    maneuver = plugin.external_state_lane_change_maneuvers["AV"]
+    assert maneuver["source_lane_id"] == "edge_426_0"
+    assert maneuver["target_lane_id"] == "edge_426_1"
+    assert unrelated.external_state_maneuver_source_lane_id == "edge_426_0"
+    assert unrelated.external_state_maneuver_target_lane_id == "edge_426_1"
+
+
+def test_external_state_maneuver_refreshes_first_link_after_target_primary_switch(
+    monkeypatch,
+):
+    from terasim_service.plugins import cosim as plugin_module
+    from terasim_service.utils.messages.AgentStateSimplified import (
+        AgentStateSimplified,
+    )
+
+    constants = types.SimpleNamespace(VAR_NEXT_LINKS=3)
+    monkeypatch.setattr(
+        plugin_module,
+        "traci",
+        types.SimpleNamespace(
+            constants=constants,
+            lane=types.SimpleNamespace(
+                getLinks=lambda lane_id, extended=True: [
+                    (
+                        "edge_432_2",
+                        True,
+                        True,
+                        False,
+                        "",
+                        "G",
+                        "s",
+                        0.0,
+                    )
+                ]
+            ),
+        ),
+    )
+    plugin = plugin_module.TeraSimCoSimPlugin.__new__(
+        plugin_module.TeraSimCoSimPlugin
+    )
+    plugin.external_state_lane_change_maneuvers = {}
+    source_links = [
+        (
+            "edge_432_1",
+            ":node_1045_0_0",
+            True,
+            True,
+            False,
+            "G",
+            "s",
+            2.0,
+        )
+    ]
+    target_links = [
+        (
+            "edge_432_2",
+            ":node_1045_0_1",
+            True,
+            True,
+            False,
+            "G",
+            "s",
+            2.0,
+        )
+    ]
+
+    maneuver, error = plugin._external_state_lane_change_maneuver(
+        "AV",
+        AgentStateSimplified(
+            lane_id="edge_426_0",
+            sumo_lane_change_intent="left",
+            sumo_lane_change_target_lane_id="edge_426_1",
+        ),
+        context_values={constants.VAR_NEXT_LINKS: source_links},
+    )
+    assert error == ""
+    assert maneuver["immediate_downstream_lane_ids"] == (
+        ":node_1045_0_0",
+        "edge_432_1",
+    )
+
+    maneuver, error = plugin._external_state_lane_change_maneuver(
+        "AV",
+        AgentStateSimplified(lane_id="edge_426_1"),
+        context_values={constants.VAR_NEXT_LINKS: target_links},
+    )
+    assert error == ""
+    assert maneuver["immediate_downstream_lane_ids"] == (
+        ":node_1045_0_1",
+        "edge_432_2",
+    )
+
+    maneuver, error = plugin._external_state_lane_change_maneuver(
+        "AV",
+        AgentStateSimplified(lane_id=":node_1045_0_0"),
+    )
+    assert error == "maneuver_primary_lane_mismatch"
+    assert maneuver is not None
+    assert "AV" in plugin.external_state_lane_change_maneuvers
+
+    maneuver, error = plugin._external_state_lane_change_maneuver(
+        "AV",
+        AgentStateSimplified(lane_id=":node_1045_0_1"),
+    )
+    assert error == ""
+    assert maneuver is None
+    assert "AV" in plugin.external_state_lane_change_maneuvers
+
+    maneuver, error = plugin._external_state_lane_change_maneuver(
+        "AV",
+        AgentStateSimplified(lane_id="edge_432_2"),
+    )
+    assert error == ""
+    assert maneuver is None
+    assert "AV" not in plugin.external_state_lane_change_maneuvers
+
+
+def test_external_state_maneuver_expands_unique_nested_internal_link(monkeypatch):
+    from terasim_service.plugins import cosim as plugin_module
+    from terasim_service.utils.messages.AgentStateSimplified import (
+        AgentStateSimplified,
+    )
+
+    constants = types.SimpleNamespace(VAR_NEXT_LINKS=3)
+    destination_lane_id = "edge_1130_1"
+    lane_links = {
+        ":ia_300007_4_0": [
+            (
+                destination_lane_id,
+                False,
+                True,
+                False,
+                ":ia_300007_17_0",
+                "m",
+                "r",
+                25.51,
+            )
+        ],
+        ":ia_300007_17_0": [
+            (
+                destination_lane_id,
+                True,
+                True,
+                False,
+                "",
+                "M",
+                "r",
+                0.0,
+            )
+        ],
+    }
+    monkeypatch.setattr(
+        plugin_module,
+        "traci",
+        types.SimpleNamespace(
+            constants=constants,
+            lane=types.SimpleNamespace(
+                getLinks=lambda lane_id, extended=True: lane_links[lane_id]
+            ),
+            vehicle=types.SimpleNamespace(
+                getNextLinks=lambda _vehicle_id: pytest.fail(
+                    "the source next link is supplied by the same-cycle context"
+                )
+            ),
+        ),
+    )
+    plugin = plugin_module.TeraSimCoSimPlugin.__new__(
+        plugin_module.TeraSimCoSimPlugin
+    )
+    plugin.external_state_lane_change_maneuvers = {}
+    source_links = [
+        (
+            destination_lane_id,
+            True,
+            True,
+            False,
+            ":ia_300007_4_0",
+            "G",
+            "r",
+            32.762,
+        )
+    ]
+
+    maneuver, error = plugin._external_state_lane_change_maneuver(
+        "vehicle1356",
+        AgentStateSimplified(
+            lane_id="edge_419_1",
+            sumo_lane_change_intent="right",
+            sumo_lane_change_target_lane_id="edge_419_0",
+        ),
+        context_values={constants.VAR_NEXT_LINKS: source_links},
+    )
+    assert error == ""
+    assert maneuver["immediate_downstream_lane_ids"] == (
+        ":ia_300007_4_0",
+        destination_lane_id,
+    )
+
+    maneuver, error = plugin._external_state_lane_change_maneuver(
+        "vehicle1356",
+        AgentStateSimplified(lane_id=":ia_300007_4_0"),
+    )
+    assert error == ""
+    assert maneuver is None
+    maneuver = plugin.external_state_lane_change_maneuvers["vehicle1356"]
+    assert maneuver["immediate_downstream_lane_ids"] == (
+        ":ia_300007_4_0",
+        ":ia_300007_17_0",
+        destination_lane_id,
+    )
+    assert maneuver["downstream_progress_index"] == 0
+
+    repeated, error = plugin._external_state_lane_change_maneuver(
+        "vehicle1356",
+        AgentStateSimplified(lane_id=":ia_300007_4_0"),
+    )
+    assert error == ""
+    assert repeated is None
+
+    mismatched, error = plugin._external_state_lane_change_maneuver(
+        "vehicle1356",
+        AgentStateSimplified(lane_id=":ia_300007_1_0"),
+    )
+    assert error == "maneuver_primary_lane_mismatch"
+    assert mismatched is maneuver
+
+    nested, error = plugin._external_state_lane_change_maneuver(
+        "vehicle1356",
+        AgentStateSimplified(lane_id=":ia_300007_17_0"),
+    )
+    assert error == ""
+    assert nested is None
+    assert maneuver["downstream_progress_index"] == 1
+
+    repeated_nested, error = plugin._external_state_lane_change_maneuver(
+        "vehicle1356",
+        AgentStateSimplified(lane_id=":ia_300007_17_0"),
+    )
+    assert error == ""
+    assert repeated_nested is None
+    assert maneuver["downstream_progress_index"] == 1
+
+    destination, error = plugin._external_state_lane_change_maneuver(
+        "vehicle1356",
+        AgentStateSimplified(lane_id=destination_lane_id),
+    )
+    assert error == ""
+    assert destination is None
+    assert "vehicle1356" not in plugin.external_state_lane_change_maneuvers
+
+
+@pytest.mark.parametrize(
+    "mode",
+    ["empty", "exception", "ambiguous", "different-destination"],
+)
+def test_external_state_maneuver_blocks_unproven_internal_successor(
+    monkeypatch,
+    mode,
+):
+    from terasim_service.plugins import cosim as plugin_module
+    from terasim_service.utils.messages.AgentStateSimplified import (
+        AgentStateSimplified,
+    )
+
+    constants = types.SimpleNamespace(VAR_NEXT_LINKS=3)
+    current_lane_id = ":ia_300007_4_0"
+    destination_lane_id = "edge_1130_1"
+
+    def get_links(lane_id, extended=True):
+        assert lane_id == current_lane_id
+        assert extended is True
+        if mode == "empty":
+            return []
+        if mode == "exception":
+            raise RuntimeError("lane link unavailable")
+        if mode == "ambiguous":
+            return [
+                (
+                    destination_lane_id,
+                    False,
+                    True,
+                    False,
+                    ":ia_300007_17_0",
+                    "m",
+                    "r",
+                    25.51,
+                ),
+                (
+                    destination_lane_id,
+                    False,
+                    True,
+                    False,
+                    ":ia_300007_18_0",
+                    "m",
+                    "r",
+                    25.51,
+                ),
+            ]
+        return [
+            (
+                "edge_unrelated_1",
+                False,
+                True,
+                False,
+                ":ia_unrelated_0_0",
+                "m",
+                "r",
+                25.51,
+            )
+        ]
+
+    monkeypatch.setattr(
+        plugin_module,
+        "traci",
+        types.SimpleNamespace(
+            constants=constants,
+            lane=types.SimpleNamespace(getLinks=get_links),
+        ),
+    )
+    plugin = plugin_module.TeraSimCoSimPlugin.__new__(
+        plugin_module.TeraSimCoSimPlugin
+    )
+    maneuver = {
+        "source_lane_id": "edge_419_1",
+        "target_lane_id": "edge_419_0",
+        "downstream_from_lane_id": "edge_419_1",
+        "immediate_downstream_lane_ids": (
+            current_lane_id,
+            destination_lane_id,
+        ),
+    }
+    plugin.external_state_lane_change_maneuvers = {"vehicle1356": maneuver}
+
+    expanded_lane_ids = (
+        plugin._expand_external_state_maneuver_internal_downstream(
+            maneuver,
+            0,
+        )
+    )
+    assert expanded_lane_ids == (current_lane_id,)
+    assert maneuver["immediate_downstream_lane_ids"] == (current_lane_id,)
+    maneuver["downstream_progress_index"] = 0
+
+    repeated, error = plugin._external_state_lane_change_maneuver(
+        "vehicle1356",
+        AgentStateSimplified(lane_id=current_lane_id),
+    )
+    assert error == ""
+    assert repeated is None
+
+    mismatched, error = plugin._external_state_lane_change_maneuver(
+        "vehicle1356",
+        AgentStateSimplified(lane_id=destination_lane_id),
+    )
+    assert error == "maneuver_primary_lane_mismatch"
+    assert mismatched is maneuver
+    assert plugin.external_state_lane_change_maneuvers["vehicle1356"] is maneuver
+
+
+def test_external_state_maneuver_uses_unique_current_internal_lane_link(monkeypatch):
+    from terasim_service.plugins import cosim as plugin_module
+    from terasim_service.utils.messages.AgentStateSimplified import (
+        AgentStateSimplified,
+    )
+
+    constants = types.SimpleNamespace(VAR_NEXT_LINKS=3)
+    lane_links = {
+        ":ia_300006_11_1": [
+            ("edge_420_1", True, True, False, "", "M", "s", 0.0)
+        ],
+        ":ia_300006_11_2": [
+            ("edge_420_2", True, True, False, "", "M", "s", 0.0)
+        ],
+    }
+    next_junction_links = [
+        (
+            "edge_426_2",
+            True,
+            True,
+            False,
+            ":ia_300005_10_2",
+            "G",
+            "s",
+            20.0,
+        )
+    ]
+    monkeypatch.setattr(
+        plugin_module,
+        "traci",
+        types.SimpleNamespace(
+            constants=constants,
+            lane=types.SimpleNamespace(
+                getLinks=lambda lane_id, extended=True: lane_links[lane_id]
+            ),
+            vehicle=types.SimpleNamespace(
+                getNextLinks=lambda _vehicle_id: next_junction_links
+            ),
+        ),
+    )
+    plugin = plugin_module.TeraSimCoSimPlugin.__new__(
+        plugin_module.TeraSimCoSimPlugin
+    )
+    plugin.external_state_lane_change_maneuvers = {}
+
+    maneuver, error = plugin._external_state_lane_change_maneuver(
+        "vehicle1197",
+        AgentStateSimplified(
+            lane_id=":ia_300006_11_1",
+            sumo_lane_change_intent="left",
+            sumo_lane_change_target_lane_id=":ia_300006_11_2",
+        ),
+        context_values={constants.VAR_NEXT_LINKS: next_junction_links},
+    )
+    assert error == ""
+    assert maneuver["immediate_downstream_lane_ids"] == ("edge_420_1",)
+
+    maneuver, error = plugin._external_state_lane_change_maneuver(
+        "vehicle1197",
+        AgentStateSimplified(
+            lane_id=":ia_300006_11_2",
+            sumo_lane_change_intent="left",
+            sumo_lane_change_target_lane_id=":ia_300006_11_2",
+        ),
+        context_values={constants.VAR_NEXT_LINKS: next_junction_links},
+    )
+    assert error == ""
+    assert maneuver["immediate_downstream_lane_ids"] == ("edge_420_2",)
+
+    maneuver, error = plugin._external_state_lane_change_maneuver(
+        "vehicle1197",
+        AgentStateSimplified(lane_id=":ia_300006_11_2"),
+    )
+    assert error == ""
+    assert maneuver is not None
+
+    mismatched, error = plugin._external_state_lane_change_maneuver(
+        "vehicle1197",
+        AgentStateSimplified(lane_id="edge_420_1"),
+    )
+    assert error == "maneuver_primary_lane_mismatch"
+    assert mismatched is maneuver
+
+    destination, error = plugin._external_state_lane_change_maneuver(
+        "vehicle1197",
+        AgentStateSimplified(lane_id="edge_420_2"),
+    )
+    assert error == ""
+    assert destination is None
+    assert "vehicle1197" not in plugin.external_state_lane_change_maneuvers
+
+
+def test_external_state_maneuver_does_not_unlock_without_first_link(monkeypatch):
+    from terasim_service.plugins import cosim as plugin_module
+    from terasim_service.utils.messages.AgentStateSimplified import (
+        AgentStateSimplified,
+    )
+
+    constants = types.SimpleNamespace(VAR_NEXT_LINKS=3)
+    monkeypatch.setattr(
+        plugin_module,
+        "traci",
+        types.SimpleNamespace(constants=constants),
+    )
+    plugin = plugin_module.TeraSimCoSimPlugin.__new__(
+        plugin_module.TeraSimCoSimPlugin
+    )
+    plugin.external_state_lane_change_maneuvers = {}
+
+    maneuver, error = plugin._external_state_lane_change_maneuver(
+        "AV",
+        AgentStateSimplified(
+            lane_id="edge_426_0",
+            sumo_lane_change_intent="left",
+            sumo_lane_change_target_lane_id="edge_426_1",
+        ),
+        context_values={constants.VAR_NEXT_LINKS: []},
+    )
+    assert error == ""
+    assert maneuver["immediate_downstream_lane_ids"] == ()
+
+    maneuver, error = plugin._external_state_lane_change_maneuver(
+        "AV",
+        AgentStateSimplified(lane_id="edge_432_1"),
+    )
+    assert error == "maneuver_primary_lane_mismatch"
+    assert maneuver is not None
+    assert "AV" in plugin.external_state_lane_change_maneuvers
+
+
 def test_external_state_lane_change_action_missing_target_is_invalid(monkeypatch):
     from terasim_service.plugins import cosim as plugin_module
     from terasim_service.utils.messages.AgentStateSimplified import (
@@ -3970,16 +4739,46 @@ def test_invalid_declared_lookahead_fails_closed_only_for_authoritative_actor():
     assert fallback == pytest.approx([7.0, 0.0, 0.0])
 
 
-def test_invalid_authoritative_action_pose_returns_full_fail_closed_brake():
+def test_invalid_authoritative_action_pose_records_degraded_fail_closed_trace(capsys):
     cosim = _make_ackermann_authority_test_cosim("AV")
-    cosim._ackermann_actor_state = {"AV": {"steer": 0.0}}
+    cosim._ackermann_actor_state = {
+        "AV": {
+            "steer": 0.0,
+            "sumo_requested_acceleration": -9.0,
+            "sumo_emergency_decel": 4.0,
+            "sumo_desired_speed": 0.2,
+            "feedback_observed_speed": 0.1,
+            "applied_desired_acceleration": -3.0,
+            "longitudinal_position_error": 99.0,
+            "longitudinal_velocity_error": -88.0,
+            "restart_active": True,
+            "restart_target_speed": 0.276,
+        }
+    }
+    cosim._ackermann_feedback_state = {}
+    cosim.ackermann_control_log_records = True
+    cosim.ackermann_control_log_actor_ids = {"AV"}
+    cosim.terasim_states = {"simulation_time": 42.0}
+    cosim.world = types.SimpleNamespace(
+        get_snapshot=lambda: types.SimpleNamespace(frame=1001)
+    )
     vehicle = types.SimpleNamespace(
         get_control=lambda: types.SimpleNamespace(steer=0.0)
     )
+    veh_info = {
+        "lane_id": "edge_current_0",
+        "sumo_desired_speed": 4.0,
+        "sumo_emergency_decel": 7.0,
+        "acceleration": 0.25,
+        "feedback_observed_speed": 3.5,
+        "feedback_source_carla_frame": 1001,
+        "external_state_maneuver_source_lane_id": "edge_source_0",
+        "external_state_maneuver_target_lane_id": "edge_source_1",
+    }
 
     control = cosim._build_ackermann_control(
         "AV",
-        {},
+        veh_info,
         vehicle,
         [float("nan"), 0.0, 0.0],
         90.0,
@@ -3989,9 +4788,133 @@ def test_invalid_authoritative_action_pose_returns_full_fail_closed_brake():
     assert isinstance(control, FakeVehicleControl)
     assert control.throttle == pytest.approx(0.0)
     assert control.brake == pytest.approx(1.0)
-    assert cosim._ackermann_actor_state["AV"]["control_mode"] == (
-        "fail_closed_brake"
+    state = cosim._ackermann_actor_state["AV"]
+    assert state["control_mode"] == "fail_closed_brake"
+    assert state["sumo_requested_acceleration"] == pytest.approx(0.25)
+    assert state["sumo_emergency_decel"] == pytest.approx(7.0)
+    assert state["sumo_desired_speed"] == pytest.approx(4.0)
+    assert state["feedback_observed_speed"] == pytest.approx(3.5)
+    assert state["applied_desired_acceleration"] is None
+    assert state["longitudinal_position_error"] is None
+    assert state["longitudinal_velocity_error"] is None
+    assert state["restart_active"] is False
+    assert "restart_target_speed" not in state
+
+    prefix, payload = capsys.readouterr().out.strip().split(" ", 1)
+    record = json.loads(payload)
+    assert prefix == "AckermannControlTrace"
+    assert record["trace_degraded"] is True
+    assert record["actor_id"] == "AV"
+    assert record["carla_frame"] == 1001
+    assert record["external_state_maneuver_current_lane_id"] == "edge_current_0"
+    assert record["external_state_maneuver_source_lane_id"] == "edge_source_0"
+    assert record["external_state_maneuver_target_lane_id"] == "edge_source_1"
+    assert record["fail_closed_reason"] == "invalid_authoritative_action_pose"
+    assert record["control_mode"] == "fail_closed_brake"
+    assert record["commanded_throttle"] == pytest.approx(0.0)
+    assert record["commanded_brake"] == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize("actor_id", ["AV", "BV"])
+def test_invalid_authoritative_lookahead_records_full_fail_closed_control_trace(
+    capsys, actor_id
+):
+    cosim = _make_ackermann_authority_test_cosim(actor_id)
+    cosim._ackermann_actor_state = {
+        actor_id: {
+            "steer": 0.0,
+            "sumo_requested_acceleration": -9.0,
+            "sumo_emergency_decel": 4.0,
+            "sumo_desired_speed": 0.2,
+            "feedback_observed_speed": 0.1,
+            "applied_desired_acceleration": -3.0,
+            "longitudinal_position_error": 99.0,
+            "longitudinal_velocity_error": -88.0,
+            "restart_active": True,
+            "restart_target_speed": 0.276,
+        }
+    }
+    cosim._ackermann_feedback_state = {}
+    cosim.ackermann_control_log_records = True
+    cosim.ackermann_control_log_actor_ids = {actor_id}
+    cosim.ackermann_warn_error_m = 0.0
+    cosim.ackermann_snap_error_m = 0.0
+    cosim.terasim_states = {"simulation_time": 587.4}
+    cosim.world = types.SimpleNamespace(
+        get_snapshot=lambda: types.SimpleNamespace(frame=6774175)
     )
+    current_transform = FakeTransform()
+    vehicle = types.SimpleNamespace(
+        get_transform=lambda: current_transform,
+        get_velocity=lambda: FakeVector3D(x=9.8),
+        get_acceleration=lambda: FakeVector3D(x=0.0),
+        get_control=lambda: types.SimpleNamespace(
+            throttle=0.0,
+            brake=0.0,
+            steer=0.0,
+        ),
+    )
+    veh_info = {
+        "x": 10.0,
+        "y": 0.0,
+        "sumo_angle": 90.0,
+        "lane_id": ":node_1045_0_0",
+        "sumo_desired_speed": 9.9,
+        "sumo_emergency_decel": 7.06,
+        "feedback_observed_speed": 9.8,
+        "acceleration": 0.1,
+        "feedback_source_carla_frame": 6774175,
+        "lookahead_position_valid": False,
+        "lookahead_action_valid": False,
+        "lookahead_action_error": "maneuver_primary_lane_mismatch",
+        "lookahead_action_mode": "route",
+        "external_state_maneuver_source_lane_id": "edge_426_0",
+        "external_state_maneuver_target_lane_id": "edge_426_1",
+    }
+
+    control = cosim._build_ackermann_control(
+        actor_id,
+        veh_info,
+        vehicle,
+        [10.0, 0.0, 0.0],
+        90.0,
+        FakeTransform(),
+    )
+
+    assert isinstance(control, FakeVehicleControl)
+    assert control.throttle == pytest.approx(0.0)
+    assert control.brake == pytest.approx(1.0)
+    state = cosim._ackermann_actor_state[actor_id]
+    assert state["last_action_source_carla_frame"] == 6774175
+    assert state["sumo_requested_acceleration"] == pytest.approx(0.1)
+    assert state["sumo_emergency_decel"] == pytest.approx(7.06)
+    assert state["sumo_desired_speed"] == pytest.approx(9.9)
+    assert state["feedback_observed_speed"] == pytest.approx(9.8)
+    assert state["applied_desired_acceleration"] is None
+    assert state["longitudinal_position_error"] is None
+    assert state["longitudinal_velocity_error"] is None
+    assert state["restart_active"] is False
+    assert "restart_target_speed" not in state
+
+    prefix, payload = capsys.readouterr().out.strip().split(" ", 1)
+    record = json.loads(payload)
+    assert prefix == "AckermannControlTrace"
+    assert record["actor_id"] == actor_id
+    assert record["action_source_carla_frame"] == 6774175
+    assert record["external_state_maneuver_current_lane_id"] == ":node_1045_0_0"
+    assert record["external_state_maneuver_source_lane_id"] == "edge_426_0"
+    assert record["external_state_maneuver_target_lane_id"] == "edge_426_1"
+    assert record["lookahead_action_error"] == "maneuver_primary_lane_mismatch"
+    assert record["fail_closed_reason"] == "maneuver_primary_lane_mismatch"
+    assert record["sumo_requested_acceleration"] == pytest.approx(0.1)
+    assert record["sumo_emergency_decel"] == pytest.approx(7.06)
+    assert record["restart_active"] is False
+    assert record["restart_target_speed"] is None
+    assert record["longitudinal_position_error"] is None
+    assert record["longitudinal_velocity_error"] is None
+    assert record["control_mode"] == "fail_closed_brake"
+    assert record["commanded_throttle"] == pytest.approx(0.0)
+    assert record["commanded_brake"] == pytest.approx(1.0)
 
 
 @pytest.mark.parametrize("actor_id", ["AV", "vehicle123"])
@@ -4257,6 +5180,43 @@ def test_authoritative_direct_brake_is_proportional_and_releases_on_positive_acc
         is None
     )
     assert cosim._ackermann_actor_state[actor_id]["emergency_brake_command"] == 0.0
+
+
+@pytest.mark.parametrize("actor_id", ["AV", "vehicle1356"])
+def test_authoritative_direct_emergency_brake_keeps_current_route_steer(actor_id):
+    install_fake_carla()
+    from terasim_service.utils.carla.ackermann_control import (
+        AckermannEmergencyBrakeTuning,
+        AckermannTuning,
+    )
+
+    cosim = _make_ackermann_authority_test_cosim(actor_id)
+    cosim.ackermann_emergency_brake_tuning = AckermannEmergencyBrakeTuning(
+        engage_decel=4.0,
+        min_brake=0.5,
+    )
+    cosim.ackermann_tuning = AckermannTuning(
+        max_steer_rad=0.6,
+        max_decel=6.0,
+    )
+    cosim._ackermann_actor_state = {
+        actor_id: {
+            "sumo_requested_acceleration": -4.5,
+            "sumo_emergency_decel": 6.0,
+        }
+    }
+    vehicle = types.SimpleNamespace(get_control=lambda: types.SimpleNamespace(steer=0.0))
+
+    control = cosim._update_ackermann_emergency_brake(
+        actor_id,
+        vehicle,
+        current_speed=12.85,
+        ackermann_steer=0.3,
+    )
+
+    assert isinstance(control, FakeVehicleControl)
+    assert control.brake == pytest.approx(0.75)
+    assert control.steer == pytest.approx(0.5)
 
 
 def test_direct_emergency_brake_releases_at_stop_without_reengaging():

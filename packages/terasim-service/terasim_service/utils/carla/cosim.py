@@ -3109,16 +3109,177 @@ class CarlaCosim(object):
             return 0.0
         return min(1.0, max(-1.0, ackermann_steer / max_steer))
 
-    def _make_direct_brake_control(self, veh_id, vehicle, brake=1.0):
+    def _make_direct_brake_control(self, veh_id, vehicle, brake=1.0, ackermann_steer=None):
+        direct_steer = self._as_finite_float(ackermann_steer)
+        if direct_steer is None:
+            direct_steer = self._current_direct_brake_steer(veh_id, vehicle)
+        else:
+            max_steer = self.ackermann_tuning.max_steer_rad
+            direct_steer = (
+                0.0 if max_steer <= 0.0 else min(1.0, max(-1.0, direct_steer / max_steer))
+            )
         return carla.VehicleControl(
             throttle=0.0,
-            steer=self._current_direct_brake_steer(veh_id, vehicle),
+            steer=direct_steer,
             brake=min(1.0, max(0.0, float(brake))),
             hand_brake=False,
             reverse=False,
         )
 
-    def _update_ackermann_emergency_brake(self, veh_id, vehicle, current_speed):
+    def _mark_ackermann_authoritative_fail_closed(
+        self, veh_id, veh_info, reason
+    ):
+        state = self._ackermann_actor_state.setdefault(veh_id, {})
+        state["control_mode"] = "fail_closed_brake"
+        state["sumo_action_invalid"] = True
+        state["sumo_emergency_decel"] = self._resolve_ackermann_max_decel(
+            veh_info
+        )
+        state["sumo_requested_acceleration"] = self._as_finite_float(
+            veh_info.get("acceleration")
+        )
+        state["sumo_desired_speed"] = self._as_finite_float(
+            veh_info.get("sumo_desired_speed")
+        )
+        state["feedback_observed_speed"] = self._as_finite_float(
+            veh_info.get("feedback_observed_speed")
+        )
+        state["applied_desired_acceleration"] = None
+        state["longitudinal_position_error"] = None
+        state["longitudinal_velocity_error"] = None
+        state.pop("restart_target_speed", None)
+        state["restart_active"] = False
+        state["emergency_brake_command"] = 1.0
+        state["fail_closed_reason"] = reason
+
+    def _should_record_ackermann_control_trace(self, veh_id):
+        if not getattr(self, "ackermann_control_log_records", False):
+            return False
+        control_log_actor_ids = getattr(
+            self, "ackermann_control_log_actor_ids", set()
+        )
+        return (
+            not control_log_actor_ids
+            or "*" in control_log_actor_ids
+            or veh_id in control_log_actor_ids
+        )
+
+    def _record_fail_closed_ackermann_control_trace(
+        self,
+        *,
+        veh_id,
+        veh_info,
+        vehicle,
+        control,
+        reason,
+        current_transform=None,
+        current_velocity=None,
+        position_error=None,
+    ):
+        if not self._should_record_ackermann_control_trace(veh_id):
+            return
+        try:
+            if current_transform is None:
+                current_transform = vehicle.get_transform()
+            if current_velocity is None:
+                current_velocity = vehicle.get_velocity()
+            current_speed = horizontal_speed(current_velocity)
+            self._record_ackermann_control_trace(
+                veh_id=veh_id,
+                veh_info=veh_info,
+                vehicle=vehicle,
+                current_transform=current_transform,
+                current_speed=current_speed,
+                target_speed=0.0,
+                target_acceleration=-self._resolve_ackermann_max_decel(veh_info),
+                position_error=position_error,
+                feedback_unhealthy=False,
+                target_behind=False,
+                control_mode="fail_closed_brake",
+                commanded_throttle=control.throttle,
+                commanded_brake=control.brake,
+                commanded_steer=control.steer,
+                fail_closed_reason=reason,
+            )
+        except Exception as trace_error:
+            # Diagnostics must never prevent the already-selected full brake.
+            try:
+                try:
+                    carla_frame = int(self.world.get_snapshot().frame)
+                except Exception:
+                    carla_frame = None
+                terasim_states = getattr(self, "terasim_states", {})
+                simulation_time = (
+                    terasim_states.get("simulation_time")
+                    if isinstance(terasim_states, dict)
+                    else None
+                )
+                state = self._ackermann_actor_state.setdefault(veh_id, {})
+                trace = {
+                    "actor_id": veh_id,
+                    "carla_frame": carla_frame,
+                    "simulation_time": simulation_time,
+                    "action_source_carla_frame": veh_info.get(
+                        "feedback_source_carla_frame"
+                    ),
+                    "external_state_maneuver_current_lane_id": veh_info.get(
+                        "lane_id"
+                    ),
+                    "external_state_maneuver_source_lane_id": veh_info.get(
+                        "external_state_maneuver_source_lane_id", ""
+                    ),
+                    "external_state_maneuver_target_lane_id": veh_info.get(
+                        "external_state_maneuver_target_lane_id", ""
+                    ),
+                    "lookahead_action_error": veh_info.get(
+                        "lookahead_action_error", ""
+                    ),
+                    "fail_closed_reason": reason,
+                    "sumo_desired_speed": self._as_finite_float(
+                        veh_info.get("sumo_desired_speed")
+                    ),
+                    "sumo_requested_acceleration": state.get(
+                        "sumo_requested_acceleration"
+                    ),
+                    "sumo_emergency_decel": state.get("sumo_emergency_decel"),
+                    "restart_active": bool(state.get("restart_active")),
+                    "restart_target_speed": state.get("restart_target_speed"),
+                    "longitudinal_position_error": state.get(
+                        "longitudinal_position_error"
+                    ),
+                    "longitudinal_velocity_error": state.get(
+                        "longitudinal_velocity_error"
+                    ),
+                    "control_mode": "fail_closed_brake",
+                    "commanded_throttle": self._as_finite_float(
+                        getattr(control, "throttle", None)
+                    ),
+                    "commanded_brake": self._as_finite_float(
+                        getattr(control, "brake", None)
+                    ),
+                    "commanded_steer": self._as_finite_float(
+                        getattr(control, "steer", None)
+                    ),
+                    "trace_degraded": True,
+                    "trace_error": (
+                        f"{type(trace_error).__name__}: {trace_error}"
+                    ),
+                }
+                print(
+                    "AckermannControlTrace "
+                    + json.dumps(trace, sort_keys=True, default=str),
+                    flush=True,
+                )
+            except Exception as fallback_error:
+                print(
+                    "Warning: fail-closed AckermannControlTrace failed for "
+                    f"{veh_id}: {fallback_error}",
+                    flush=True,
+                )
+
+    def _update_ackermann_emergency_brake(
+        self, veh_id, vehicle, current_speed, ackermann_steer=None
+    ):
         state = self._ackermann_actor_state.setdefault(veh_id, {})
         tuning = getattr(
             self,
@@ -3180,7 +3341,14 @@ class CarlaCosim(object):
             0.0 if authoritative else tuning.min_brake,
         )
         state["emergency_brake_command"] = brake
-        return self._make_direct_brake_control(veh_id, vehicle, brake)
+        if not authoritative:
+            ackermann_steer = None
+        return self._make_direct_brake_control(
+            veh_id,
+            vehicle,
+            brake,
+            ackermann_steer=ackermann_steer,
+        )
 
     def _neutralize_ackermann_steer(self, veh_id):
         state = self._ackermann_actor_state.setdefault(veh_id, {})
@@ -3246,17 +3414,34 @@ class CarlaCosim(object):
     ):
         state = self._ackermann_actor_state.setdefault(veh_id, {})
         feedback_actor = self._is_ackermann_feedback_apply_actor(veh_id)
+        state.pop("fail_closed_reason", None)
+        if feedback_actor:
+            state["last_action_source_carla_frame"] = veh_info.get(
+                "feedback_source_carla_frame"
+            )
+            phase_b_sumo_angle = self._as_finite_float(sumo_angle)
+            state["last_phase_b_target_sumo_angle"] = phase_b_sumo_angle
+            state["last_phase_b_target_carla_yaw"] = (
+                (phase_b_sumo_angle - 90.0) % 360.0
+                if phase_b_sumo_angle is not None
+                else None
+            )
         action_pose = [
             self._as_finite_float(value)
             for value in (*sumo_location[:3], sumo_angle)
         ]
         if feedback_actor and any(value is None for value in action_pose):
-            state["control_mode"] = "fail_closed_brake"
-            state["sumo_action_invalid"] = True
-            state["emergency_brake_command"] = 1.0
-            return self._make_direct_brake_control(
-                veh_id, vehicle, brake=1.0
+            reason = "invalid_authoritative_action_pose"
+            self._mark_ackermann_authoritative_fail_closed(veh_id, veh_info, reason)
+            control = self._make_direct_brake_control(veh_id, vehicle, brake=1.0)
+            self._record_fail_closed_ackermann_control_trace(
+                veh_id=veh_id,
+                veh_info=veh_info,
+                vehicle=vehicle,
+                control=control,
+                reason=reason,
             )
+            return control
         try:
             current_transform = vehicle.get_transform()
             current_velocity = vehicle.get_velocity()
@@ -3304,14 +3489,28 @@ class CarlaCosim(object):
             lookahead_location = self._sumo_point_to_carla_location(
                 lookahead_sumo_location
             )
-        except Exception:
+        except Exception as exc:
             if feedback_actor:
-                state["control_mode"] = "fail_closed_brake"
-                state["sumo_action_invalid"] = True
-                state["emergency_brake_command"] = 1.0
-                return self._make_direct_brake_control(
+                reason = (
+                    veh_info.get("lookahead_action_error")
+                    or str(exc)
+                    or "invalid_authoritative_lookahead"
+                )
+                self._mark_ackermann_authoritative_fail_closed(veh_id, veh_info, reason)
+                control = self._make_direct_brake_control(
                     veh_id, vehicle, brake=1.0
                 )
+                self._record_fail_closed_ackermann_control_trace(
+                    veh_id=veh_id,
+                    veh_info=veh_info,
+                    vehicle=vehicle,
+                    control=control,
+                    reason=reason,
+                    current_transform=current_transform,
+                    current_velocity=current_velocity,
+                    position_error=position_error,
+                )
+                return control
             state["control_mode"] = "ackermann"
             return self._make_brake_ackermann_control(veh_id)
 
@@ -3367,11 +3566,6 @@ class CarlaCosim(object):
             else feedback_desired_acceleration
         )
         feedback = self._ackermann_feedback_state.get(veh_id, {})
-        state["last_action_source_carla_frame"] = veh_info.get(
-            "feedback_source_carla_frame"
-        )
-        state["last_phase_b_target_sumo_angle"] = sumo_angle
-        state["last_phase_b_target_carla_yaw"] = (sumo_angle - 90.0) % 360.0
         feedback_unhealthy = (
             feedback_actor
             and not self._is_ackermann_feedback_healthy(
@@ -3383,6 +3577,15 @@ class CarlaCosim(object):
         )
         invalid_action = feedback_actor and bool(state.get("sumo_action_invalid"))
         fail_closed = feedback_unhealthy or target_behind or invalid_action
+        fail_closed_reason = ""
+        if feedback_unhealthy:
+            fail_closed_reason = "feedback_unhealthy"
+        elif target_behind:
+            fail_closed_reason = "target_behind"
+        elif invalid_action:
+            fail_closed_reason = "invalid_sumo_longitudinal_action"
+        if fail_closed_reason:
+            state["fail_closed_reason"] = fail_closed_reason
         if fail_closed:
             final_steer = self._neutralize_ackermann_steer(veh_id)
             final_speed = 0.0
@@ -3396,7 +3599,10 @@ class CarlaCosim(object):
             state["emergency_brake_command"] = 1.0
         else:
             emergency_control = self._update_ackermann_emergency_brake(
-                veh_id, vehicle, current_speed
+                veh_id,
+                vehicle,
+                current_speed,
+                ackermann_steer=final_steer,
             )
         if emergency_control is None:
             control_mode = "ackermann"
@@ -3425,6 +3631,7 @@ class CarlaCosim(object):
             commanded_throttle=commanded_throttle,
             commanded_brake=commanded_brake,
             commanded_steer=commanded_steer,
+            fail_closed_reason=fail_closed_reason,
         )
         state["steer"] = final_steer
         state["last_position_error"] = position_error
@@ -3457,18 +3664,9 @@ class CarlaCosim(object):
         commanded_throttle=None,
         commanded_brake=None,
         commanded_steer=None,
+        fail_closed_reason="",
     ):
-        if not getattr(self, "ackermann_control_log_records", False):
-            return
-
-        control_log_actor_ids = getattr(
-            self, "ackermann_control_log_actor_ids", set()
-        )
-        if (
-            control_log_actor_ids
-            and "*" not in control_log_actor_ids
-            and veh_id not in control_log_actor_ids
-        ):
+        if not self._should_record_ackermann_control_trace(veh_id):
             return
 
         feedback = getattr(self, "_ackermann_feedback_state", {}).get(
@@ -3565,6 +3763,16 @@ class CarlaCosim(object):
             "lookahead_action_mode": veh_info.get("lookahead_action_mode"),
             "lookahead_action_valid": bool(veh_info.get("lookahead_action_valid", True)),
             "lookahead_action_error": veh_info.get("lookahead_action_error", ""),
+            "external_state_maneuver_current_lane_id": veh_info.get("lane_id"),
+            "external_state_maneuver_source_lane_id": veh_info.get(
+                "external_state_maneuver_source_lane_id", ""
+            ),
+            "external_state_maneuver_target_lane_id": veh_info.get(
+                "external_state_maneuver_target_lane_id", ""
+            ),
+            "fail_closed_reason": (
+                fail_closed_reason or state.get("fail_closed_reason", "")
+            ),
             "lookahead_lateral_horizon_displacement": self._as_finite_float(
                 veh_info.get("lookahead_lateral_horizon_displacement")
             ),

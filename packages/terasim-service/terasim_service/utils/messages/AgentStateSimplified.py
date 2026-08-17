@@ -68,6 +68,8 @@ class AgentStateSimplified(BaseModel):
     sumo_emergency_decel: float | None = None
     sumo_lane_change_intent: str = "none"
     sumo_lane_change_target_lane_id: str = ""
+    external_state_maneuver_source_lane_id: str = ""
+    external_state_maneuver_target_lane_id: str = ""
     feedback_observed_x: float | None = None
     feedback_observed_y: float | None = None
     feedback_observed_sumo_angle: float | None = None

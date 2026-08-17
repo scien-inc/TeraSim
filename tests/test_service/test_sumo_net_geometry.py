@@ -5,6 +5,12 @@ from terasim_service.utils.sumo_net_geometry import (
     find_geometry_discontinuities,
     parse_shape,
 )
+from terasim_service.utils.sumo_lane_geometry import (
+    select_route_aware_lane_projection,
+)
+from scripts.repair_odaiba_sumo_net import (
+    _restore_reversed_short_internal_lanes,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -22,6 +28,161 @@ def _issues_by_object(net_file):
 def _lane(net_file, lane_id):
     root = ET.parse(net_file).getroot()
     return next(lane for lane in root.iter("lane") if lane.get("id") == lane_id)
+
+
+def _direct_short_source_via_candidates():
+    """Return direct 0.25 m via lanes whose source shape owns the movement."""
+    repaired_root = ET.parse(REPAIRED_NET).getroot()
+    source_root = ET.parse(FIXED_NET).getroot()
+    repaired_lanes = {
+        lane.get("id"): lane for lane in repaired_root.iter("lane") if lane.get("id")
+    }
+    source_lanes = {
+        lane.get("id"): lane for lane in source_root.iter("lane") if lane.get("id")
+    }
+    source_connections = {
+        (
+            connection.get("from"),
+            connection.get("fromLane"),
+            connection.get("to"),
+            connection.get("toLane"),
+        ): connection
+        for connection in source_root.iter("connection")
+    }
+    repaired_connections = list(repaired_root.iter("connection"))
+
+    candidates = []
+    for connection in repaired_connections:
+        via = connection.get("via")
+        from_edge = connection.get("from", "")
+        to_edge = connection.get("to", "")
+        if not via or from_edge.startswith(":") or to_edge.startswith(":"):
+            continue
+        try:
+            internal_edge, internal_lane_index = via.rsplit("_", 1)
+        except ValueError:
+            continue
+        downstream = [
+            candidate
+            for candidate in repaired_connections
+            if candidate.get("from") == internal_edge
+            and candidate.get("fromLane") == internal_lane_index
+            and candidate.get("to") == to_edge
+            and candidate.get("toLane") == connection.get("toLane")
+        ]
+        if len(downstream) != 1 or downstream[0].get("via"):
+            # A chained via is a legitimate split-junction movement, not a
+            # short direct connector owned by this connection.
+            continue
+
+        repaired_lane = repaired_lanes.get(via)
+        source_lane = source_lanes.get(via)
+        source_connection = source_connections.get(
+            (
+                from_edge,
+                connection.get("fromLane"),
+                to_edge,
+                connection.get("toLane"),
+            )
+        )
+        if repaired_lane is None or source_lane is None or source_connection is None:
+            continue
+        guarded_elements = (
+            connection,
+            repaired_lane,
+            source_lane,
+            source_connection,
+        )
+        lengths = tuple(element.get("length") for element in guarded_elements)
+        if any(element.get("shape") is None for element in guarded_elements):
+            continue
+        connection_shape = parse_shape(connection.get("shape"))
+        repaired_shape = parse_shape(repaired_lane.get("shape"))
+        source_shape = parse_shape(source_lane.get("shape"))
+        source_connection_shape = parse_shape(source_connection.get("shape"))
+        guarded_shapes = (
+            connection_shape, repaired_shape, source_shape, source_connection_shape
+        )
+        if not all(len(shape) == 2 for shape in guarded_shapes):
+            continue
+        if not all(abs(float(length) - 0.250) <= 1e-9 for length in lengths):
+            continue
+        if source_connection.get("via") != via:
+            continue
+        if source_connection_shape != connection_shape:
+            continue
+        if source_shape != connection_shape:
+            continue
+        if sum(
+            (repaired_shape[0][index] - source_shape[0][index]) ** 2 for index in (0, 1)
+        ) > 4e-6:
+            continue
+        candidates.append((via, connection_shape, repaired_shape))
+    return candidates
+
+
+def _is_reversed_or_degenerate(source_shape, rebuilt_shape):
+    source_dx = source_shape[1][0] - source_shape[0][0]
+    source_dy = source_shape[1][1] - source_shape[0][1]
+    rebuilt_dx = rebuilt_shape[1][0] - rebuilt_shape[0][0]
+    rebuilt_dy = rebuilt_shape[1][1] - rebuilt_shape[0][1]
+    rebuilt_length_sq = rebuilt_dx * rebuilt_dx + rebuilt_dy * rebuilt_dy
+    if rebuilt_length_sq <= 1e-18:
+        return True
+
+    source_length_sq = source_dx * source_dx + source_dy * source_dy
+    return (
+        source_length_sq > 1e-18
+        and source_dx * rebuilt_dx + source_dy * rebuilt_dy < 0.0
+    )
+
+
+def _synthetic_short_internal_net(direct_shape, zero_shape, split_shape):
+    return ET.fromstring(
+        f"""
+        <net>
+            <edge id=":direct_0" function="internal">
+                <lane id=":direct_0_0" index="0" length="0.250" shape="{direct_shape}" />
+            </edge>
+            <edge id=":zero_0" function="internal">
+                <lane id=":zero_0_0" index="0" length="0.250" shape="{zero_shape}" />
+            </edge>
+            <edge id=":split_0" function="internal">
+                <lane id=":split_0_0" index="0" length="0.250" shape="{split_shape}" />
+            </edge>
+            <connection from="in" fromLane="0" to="out" toLane="0"
+                length="0.250" shape="0,0,0 0.25,0,0" via=":direct_0_0" />
+            <connection from=":direct_0" fromLane="0" to="out" toLane="0" />
+            <connection from="in" fromLane="1" to="out" toLane="1"
+                length="0.250" shape="1,0,0 1.25,0,0" via=":zero_0_0" />
+            <connection from=":zero_0" fromLane="0" to="out" toLane="1" />
+            <connection from="in" fromLane="2" to="out" toLane="2"
+                length="0.250" shape="2,0,0 2.25,0,0" via=":split_0_0" />
+            <connection from=":split_0" fromLane="0" to="out" toLane="2"
+                via=":split_1_0" />
+        </net>
+        """
+    )
+
+
+def test_short_internal_repair_restores_only_direct_source_backed_defects():
+    source_root = _synthetic_short_internal_net(
+        direct_shape="0,0,0 0.25,0,0",
+        zero_shape="1,0,0 1.25,0,0",
+        split_shape="2,0,0 2.25,0,0",
+    )
+    rebuilt_root = _synthetic_short_internal_net(
+        direct_shape="0,0,0 -0.25,0,0",
+        zero_shape="1,0,0 1,0,0",
+        split_shape="2,0,0 1.75,0,0",
+    )
+    lanes = {lane.get("id"): lane for lane in rebuilt_root.iter("lane")}
+    split_before = lanes[":split_0_0"].get("shape")
+
+    assert _restore_reversed_short_internal_lanes(rebuilt_root, source_root) == 2
+    assert lanes[":direct_0_0"].get("shape") == "0,0,0 0.25,0,0"
+    assert lanes[":zero_0_0"].get("shape") == "1,0,0 1.25,0,0"
+    assert lanes[":split_0_0"].get("shape") == split_before
 
 
 def test_fixed_odaiba_geometry_removes_node_119_discontinuities():
@@ -157,4 +318,76 @@ def test_previous_fixed_odaiba_net_is_preserved():
         89810.506,
         42416.284,
         3.404,
+    )
+
+
+def test_repaired_short_direct_via_lanes_keep_lanelet2_source_geometry():
+    # These source lanes come from the fixed net generated from odaiba_ll2_raw.osm.
+    candidates = _direct_short_source_via_candidates()
+    candidate_lane_ids = {lane_id for lane_id, _, _ in candidates}
+
+    assert candidates
+    assert ":node_1046_0_1" in candidate_lane_ids
+    assert [
+        lane_id
+        for lane_id, source_shape, repaired_shape in candidates
+        if _is_reversed_or_degenerate(source_shape, repaired_shape)
+    ] == []
+
+
+def test_repaired_node_1046_lane_keeps_lanelet2_source_geometry():
+    source_lane = _lane(FIXED_NET, ":node_1046_0_1")
+    repaired_lane = _lane(REPAIRED_NET, ":node_1046_0_1")
+    expected_shape = (
+        (89361.382, 42903.444, 6.939),
+        (89361.464, 42903.208, 6.939),
+    )
+
+    assert parse_shape(source_lane.get("shape")) == expected_shape
+    assert parse_shape(repaired_lane.get("shape")) == expected_shape
+    assert float(repaired_lane.get("length")) == 0.250
+
+
+def test_node_1046_field_pose_projects_to_authoritative_current_lane():
+    lane = _lane(REPAIRED_NET, ":node_1046_0_1")
+    shape = parse_shape(lane.get("shape"))
+    candidate = {
+        "lane_id": lane.get("id"),
+        "edge_id": ":node_1046_0",
+        "lane_index": 1,
+        "shape": shape,
+        "shape3d": shape,
+        "length": float(lane.get("length")),
+    }
+    projection = select_route_aware_lane_projection(
+        position=(89359.87321072252, 42895.57717352966),
+        position_z=7.010738372802734,
+        sumo_angle=165.9237289428711,
+        lane_candidates=[candidate],
+        current_lane_id=lane.get("id"),
+        max_distance=8.0,
+        max_elevation_error=2.0,
+        max_heading_error=90.0,
+        prefer_current_lane=True,
+    )
+
+    assert projection is not None
+    assert projection["lane_id"] == ":node_1046_0_1"
+    assert abs(projection["distance"] - 7.7948780071) < 1e-6
+    assert projection["lane_position"] == 0.250
+    assert projection["heading_error"] < 6.0
+
+    assert (
+        select_route_aware_lane_projection(
+            position=(89450.0, 43000.0),
+            position_z=6.939,
+            sumo_angle=165.9237289428711,
+            lane_candidates=[candidate],
+            current_lane_id=lane.get("id"),
+            max_distance=8.0,
+            max_elevation_error=2.0,
+            max_heading_error=90.0,
+            prefer_current_lane=True,
+        )
+        is None
     )
