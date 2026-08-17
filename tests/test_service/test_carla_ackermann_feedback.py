@@ -1536,6 +1536,18 @@ def test_external_state_lookahead_stops_before_missing_internal_lane(monkeypatch
         "edge_0_0": [(0.0, 0.0), (10.0, 0.0)],
         "edge_1_0": [(20.0, 10.0), (30.0, 10.0)],
     }
+    next_links = [
+        (
+            "edge_1_0",
+            ":junction_0_0",
+            True,
+            True,
+            False,
+            "G",
+            "s",
+            2.0,
+        )
+    ]
     monkeypatch.setattr(
         plugin_module,
         "traci",
@@ -1543,6 +1555,10 @@ def test_external_state_lookahead_stops_before_missing_internal_lane(monkeypatch
             constants=constants,
             lane=types.SimpleNamespace(
                 getShape=lambda lane_id: lane_shapes.get(lane_id)
+            ),
+            vehicle=types.SimpleNamespace(
+                getLaneID=lambda _actor_id: "edge_0_0",
+                getNextLinks=lambda _actor_id: next_links,
             ),
         ),
     )
@@ -1557,18 +1573,7 @@ def test_external_state_lookahead_stops_before_missing_internal_lane(monkeypatch
         "AV",
         context_values={
             constants.VAR_LANE_ID: "edge_0_0",
-            constants.VAR_NEXT_LINKS: [
-                (
-                    "edge_1_0",
-                    ":junction_0_0",
-                    True,
-                    True,
-                    False,
-                    "G",
-                    "s",
-                    2.0,
-                )
-            ],
+            constants.VAR_NEXT_LINKS: next_links,
         },
     )
 
@@ -1625,6 +1630,122 @@ def test_external_state_lane_export_uses_live_state_over_stale_subscription(monk
     assert state.lateral_offset == pytest.approx(0.25)
     assert state.reconstructed_x == pytest.approx(12.5)
     assert state.reconstructed_y == pytest.approx(0.25)
+
+
+def test_external_state_lookahead_uses_live_phase_b_route_over_stale_subscription(
+    monkeypatch,
+):
+    from terasim_service.plugins import cosim as plugin_module
+
+    constants = types.SimpleNamespace(
+        VAR_LANE_ID=1,
+        VAR_NEXT_LINKS=2,
+        VAR_ROUTE_ID=3,
+        VAR_EDGES=4,
+    )
+    lane_shapes = {
+        "edge_426_0": [(0.0, 0.0), (10.0, 0.0)],
+        "edge_426_1": [(0.0, 0.0), (10.0, 0.0)],
+        ":node_1045_1_0": [(10.0, 0.0), (12.0, 0.0)],
+        "edge_432_1": [(12.0, 0.0), (30.0, 0.0)],
+        ":node_1046_0_1": [(30.0, 0.0), (32.0, 0.0)],
+        "edge_427_1": [(32.0, 0.0), (0.0, -4.0)],
+        ":return_to_edge_426_1": [(0.0, -4.0), (0.0, 0.0)],
+    }
+    calls = []
+    shape_calls = []
+    live_next_links = [
+        (
+            "edge_432_1",
+            ":node_1045_1_0",
+            True,
+            True,
+            False,
+            "G",
+            "s",
+            2.0,
+        ),
+        (
+            "edge_427_1",
+            ":node_1046_0_1",
+            True,
+            True,
+            False,
+            "G",
+            "s",
+            2.0,
+        ),
+        (
+            "edge_426_1",
+            ":return_to_edge_426_1",
+            True,
+            True,
+            False,
+            "G",
+            "s",
+            2.0,
+        ),
+    ]
+    fake_vehicle = types.SimpleNamespace(
+        getLaneID=lambda actor_id: calls.append(("lane", actor_id)) or "edge_426_1",
+        getNextLinks=lambda actor_id: calls.append(("links", actor_id))
+        or live_next_links,
+    )
+    fake_lane = types.SimpleNamespace(
+        getShape=lambda lane_id: shape_calls.append(lane_id) or lane_shapes.get(lane_id)
+    )
+    monkeypatch.setattr(
+        plugin_module,
+        "traci",
+        types.SimpleNamespace(
+            constants=constants,
+            lane=fake_lane,
+            vehicle=fake_vehicle,
+        ),
+    )
+    plugin = plugin_module.TeraSimCoSimPlugin.__new__(plugin_module.TeraSimCoSimPlugin)
+    plugin.ackermann_feedback_assimilation_mode = "external_state"
+    plugin.external_state_route_lookahead_only = True
+    plugin.feedback_source_carla_frames = {"AV": 123}
+    plugin.lookahead_lane_shape_cache = {}
+    plugin.lookahead_geometry_cache = {}
+
+    compiled = plugin._get_vehicle_lookahead_compiled_path(
+        "AV",
+        context_values={
+            constants.VAR_LANE_ID: "edge_426_0",
+            constants.VAR_NEXT_LINKS: [
+                (
+                    "edge_432_0",
+                    ":stale_missing_internal_0",
+                    True,
+                    True,
+                    False,
+                    "G",
+                    "s",
+                    2.0,
+                )
+            ],
+        },
+    )
+
+    assert calls == [("lane", "AV"), ("links", "AV")]
+    assert shape_calls == ["edge_426_1", ":node_1045_1_0", "edge_432_1"]
+    assert compiled is not None
+    assert tuple(compiled["last_end"]) == pytest.approx((30.0, 0.0))
+
+    origin = (0.0, -3.8)
+    action = plugin_module.build_external_state_lateral_action_lookahead(
+        compiled,
+        origin,
+        7.0,
+    )
+
+    assert action["valid"] is True
+    assert math.hypot(
+        action["lookahead"][0] - origin[0],
+        action["lookahead"][1] - origin[1],
+    ) == pytest.approx(7.0)
 
 
 def test_lookahead_route_cache_avoids_repeated_traci_calls(monkeypatch):

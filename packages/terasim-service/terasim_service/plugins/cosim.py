@@ -2403,9 +2403,37 @@ class TeraSimCoSimPlugin(BasePlugin):
         profile_ctx=None,
     ):
         context_values = context_values or {}
-        has_current_lane, current_lane = self._context_vehicle_value(
-            context_values, "VAR_LANE_ID"
-        )
+        use_live_route_state = self._uses_external_state_route_lookahead(vehicle_id)
+        if use_live_route_state:
+            try:
+                current_lane = self._profile_detail_traci_call(
+                    profile_ctx,
+                    "vehicle_get_lane_id",
+                    traci.vehicle.getLaneID,
+                    vehicle_id,
+                )
+            except Exception:
+                current_lane = ""
+            try:
+                next_links = self._profile_detail_traci_call(
+                    profile_ctx,
+                    "vehicle_get_next_links",
+                    traci.vehicle.getNextLinks,
+                    vehicle_id,
+                )
+            except Exception:
+                next_links = []
+            # A cyclic full route can alias the lane immediately behind the vehicle.
+            next_links = tuple(next_links or ())[:1]
+            has_current_lane = True
+            has_next_links = True
+        else:
+            has_current_lane, current_lane = self._context_vehicle_value(
+                context_values, "VAR_LANE_ID"
+            )
+            has_next_links, next_links = self._context_vehicle_value(
+                context_values, "VAR_NEXT_LINKS"
+            )
         if not has_current_lane:
             try:
                 current_lane = self._profile_detail_traci_call(
@@ -2417,9 +2445,6 @@ class TeraSimCoSimPlugin(BasePlugin):
             except Exception:
                 current_lane = ""
 
-        has_next_links, next_links = self._context_vehicle_value(
-            context_values, "VAR_NEXT_LINKS"
-        )
         if has_next_links:
             next_lane_ids = self._profile_detail_python_call(
                 profile_ctx,
