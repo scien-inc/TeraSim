@@ -9,6 +9,11 @@ from terasim_service.utils.sumo_lane_geometry import (
     select_route_aware_lane_projection,
 )
 from scripts.repair_odaiba_sumo_net import (
+    NODE_205_CONNECTION_LANELETS,
+    NODE_205_INCOMING_LANELETS,
+    NODE_205_OUTGOING_LANELETS,
+    SOURCE_LANELET_IDS,
+    _load_lanelet_centerlines,
     _restore_reversed_short_internal_lanes,
 )
 
@@ -18,6 +23,7 @@ MAP_DIR = REPO_ROOT / "examples/maps/odaiba_ll2/tlmappings_0708"
 ORIGINAL_NET = MAP_DIR / "network.net.xml"
 FIXED_NET = MAP_DIR / "network.fixed_geometry.net.xml"
 REPAIRED_NET = MAP_DIR / "network.repaired_geometry.net.xml"
+SOURCE_OSM = REPO_ROOT / "examples/maps/odaiba_ll2/odaiba_ll2_raw.osm"
 
 
 def _issues_by_object(net_file):
@@ -346,6 +352,71 @@ def test_repaired_node_1046_lane_keeps_lanelet2_source_geometry():
     assert parse_shape(source_lane.get("shape")) == expected_shape
     assert parse_shape(repaired_lane.get("shape")) == expected_shape
     assert float(repaired_lane.get("length")) == 0.250
+
+
+def test_repaired_node_205_follows_lanelet2_source_chains():
+    centerlines = _load_lanelet_centerlines(SOURCE_OSM)
+
+    for lane_id, source_name in NODE_205_INCOMING_LANELETS.items():
+        actual = parse_shape(_lane(REPAIRED_NET, lane_id).get("shape"))
+        source = centerlines[SOURCE_LANELET_IDS[source_name]]
+        assert actual[-1] == tuple(round(value, 3) for value in source[-1])
+
+    for lane_id, source_name in NODE_205_OUTGOING_LANELETS.items():
+        actual = parse_shape(_lane(REPAIRED_NET, lane_id).get("shape"))
+        source = centerlines[SOURCE_LANELET_IDS[source_name]]
+        assert actual[0] == tuple(round(value, 3) for value in source[0])
+
+    root = ET.parse(REPAIRED_NET).getroot()
+    connections = {
+        (
+            connection.get("from"),
+            connection.get("fromLane"),
+            connection.get("to"),
+            connection.get("toLane"),
+        ): connection
+        for connection in root.findall("connection")
+    }
+    for key, (source_name, expected_via) in NODE_205_CONNECTION_LANELETS.items():
+        source = tuple(
+            tuple(round(value, 3) for value in point)
+            for point in centerlines[SOURCE_LANELET_IDS[source_name]]
+        )
+        connection = connections[key]
+        assert connection.get("via") == expected_via
+        assert parse_shape(connection.get("shape")) == source
+        assert parse_shape(_lane(REPAIRED_NET, expected_via).get("shape")) == source
+
+
+def test_edge_1384_field_pose_projects_to_lanelet2_internal_connector():
+    lane = _lane(REPAIRED_NET, ":node_205_4_0")
+    shape = parse_shape(lane.get("shape"))
+    candidate = {
+        "lane_id": lane.get("id"),
+        "edge_id": ":node_205_4",
+        "lane_index": 0,
+        "shape": shape,
+        "shape3d": shape,
+        "length": float(lane.get("length")),
+    }
+
+    projection = select_route_aware_lane_projection(
+        position=(89641.13103695, 42232.28135523),
+        position_z=6.32,
+        sumo_angle=326.55926422121814,
+        lane_candidates=[candidate],
+        current_lane_id=lane.get("id"),
+        max_distance=8.0,
+        max_elevation_error=2.0,
+        max_heading_error=90.0,
+        prefer_current_lane=True,
+    )
+
+    assert projection is not None
+    assert projection["lane_id"] == ":node_205_4_0"
+    assert abs(projection["distance"] - 2.1115860462) < 1e-6
+    assert abs(projection["heading_error"]) < 1e-6
+    assert abs(projection["elevation_error"] - 0.0143014505) < 1e-6
 
 
 def test_node_1046_field_pose_projects_to_authoritative_current_lane():
