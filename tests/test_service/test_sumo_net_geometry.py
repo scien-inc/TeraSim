@@ -1,3 +1,4 @@
+import math
 from pathlib import Path
 import xml.etree.ElementTree as ET
 
@@ -12,8 +13,11 @@ from scripts.repair_odaiba_sumo_net import (
     NODE_205_CONNECTION_LANELETS,
     NODE_205_INCOMING_LANELETS,
     NODE_205_OUTGOING_LANELETS,
+    NODE_825_INVALID_CONNECTIONS,
+    NODE_825_VALID_CONNECTION,
     SOURCE_LANELET_IDS,
     _load_lanelet_centerlines,
+    _normal_connection_keys,
     _restore_reversed_short_internal_lanes,
 )
 
@@ -24,6 +28,10 @@ ORIGINAL_NET = MAP_DIR / "network.net.xml"
 FIXED_NET = MAP_DIR / "network.fixed_geometry.net.xml"
 REPAIRED_NET = MAP_DIR / "network.repaired_geometry.net.xml"
 SOURCE_OSM = REPO_ROOT / "examples/maps/odaiba_ll2/odaiba_ll2_raw.osm"
+ACTIVE_ROUTES = (
+    MAP_DIR / "period_0p2_filter_check/vehicles.filtered_r300.rou.xml"
+)
+
 
 
 def _issues_by_object(net_file):
@@ -387,6 +395,50 @@ def test_repaired_node_205_follows_lanelet2_source_chains():
         assert parse_shape(connection.get("shape")) == source
         assert parse_shape(_lane(REPAIRED_NET, expected_via).get("shape")) == source
 
+
+def test_repaired_node_825_removes_only_connections_rejected_by_lanelet2_topology():
+    centerlines = _load_lanelet_centerlines(SOURCE_OSM)
+    incoming_end = centerlines[SOURCE_LANELET_IDS["node_825_incoming"]][-1]
+    valid_start = centerlines[SOURCE_LANELET_IDS["node_825_valid_outgoing"]][0]
+    invalid_starts = (
+        centerlines[SOURCE_LANELET_IDS["node_825_invalid_outgoing_0"]][0],
+        centerlines[SOURCE_LANELET_IDS["node_825_invalid_outgoing_1"]][0],
+    )
+
+    assert math.dist(incoming_end[:2], valid_start[:2]) < 1e-6
+    assert all(math.dist(incoming_end[:2], point[:2]) > 8.0 for point in invalid_starts)
+
+    source_connections = _normal_connection_keys(FIXED_NET)
+    repaired_connections = _normal_connection_keys(REPAIRED_NET)
+    assert source_connections - repaired_connections == NODE_825_INVALID_CONNECTIONS
+    assert repaired_connections - source_connections == set()
+    assert NODE_825_VALID_CONNECTION in repaired_connections
+
+def test_active_odaiba_routes_follow_repaired_normal_edge_topology():
+    normal_edge_connections = {
+        (from_edge, to_edge)
+        for from_edge, _, to_edge, _ in _normal_connection_keys(REPAIRED_NET)
+    }
+    root = ET.parse(ACTIVE_ROUTES).getroot()
+    routes = [
+        (f"route:{route.get('id')}", route.get("edges", "").split())
+        for route in root.findall("route")
+    ]
+    routes.extend(
+        (
+            f"vehicle:{vehicle.get('id')}",
+            vehicle.find("route").get("edges", "").split(),
+        )
+        for vehicle in root.findall("vehicle")
+    )
+    invalid_transitions = [
+        (owner, from_edge, to_edge)
+        for owner, edges in routes
+        for from_edge, to_edge in zip(edges, edges[1:])
+        if (from_edge, to_edge) not in normal_edge_connections
+    ]
+
+    assert invalid_transitions == []
 
 def test_edge_1384_field_pose_projects_to_lanelet2_internal_connector():
     lane = _lane(REPAIRED_NET, ":node_205_4_0")
