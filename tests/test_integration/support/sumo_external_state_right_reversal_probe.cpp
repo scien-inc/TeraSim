@@ -35,6 +35,8 @@ struct Snapshot {
     std::string primaryLane;
     std::string lcmTargetLane;
     std::string shadowLane;
+    double positionX;
+    double positionY;
     double primaryPosLat;
     double sourcePosLat;
     double targetPosLat;
@@ -204,10 +206,13 @@ snapshot(
         libsumo::Vehicle::getLaneChangeState(vehicleID, 1);
     const std::pair<int, int> rightState =
         libsumo::Vehicle::getLaneChangeState(vehicleID, -1);
+    const Position& position = vehicle.getPosition();
     return {
         libsumo::Vehicle::getLaneID(vehicleID),
         laneID(laneChangeModel.getTargetLane()),
         laneID(laneChangeModel.getShadowLane()),
+        position.x(),
+        position.y(),
         libsumo::Vehicle::getLateralLanePosition(vehicleID),
         relativePosLat(vehicle, sourceLane),
         relativePosLat(vehicle, targetLane),
@@ -254,7 +259,11 @@ writeSnapshot(
               << ",\"shadow_lane\":" << jsonString(value.shadowLane)
               << ",\"source_reference_lane\":" << jsonString(sourceLane)
               << ",\"target_reference_lane\":" << jsonString(targetLane)
-              << ",\"primary_pos_lat\":";
+              << ",\"position_x\":";
+    writeNumber(value.positionX);
+    std::cout << ",\"position_y\":";
+    writeNumber(value.positionY);
+    std::cout << ",\"primary_pos_lat\":";
     writeNumber(value.primaryPosLat);
     std::cout << ",\"source_pos_lat\":";
     writeNumber(value.sourcePosLat);
@@ -475,6 +484,47 @@ main(int argc, char** argv) {
             writeSnapshot(
                 "field_trigger",
                 "wait_phase_b",
+                cycle,
+                vehicleID,
+                strictLaneHint,
+                "edge_426_1",
+                "edge_426_0",
+                originalRoute
+            );
+        }
+
+        // Inject the field failure state after a completed maneuver: no
+        // intent/target/shadow and maneuverDist == 0, but stale speedLat remains.
+        // Phase A must synchronize this to the frozen external pose without
+        // inventing a lane-change decision.
+        getVehicle(vehicleID).getLaneChangeModel().setSpeedLat(1.);
+        for (int cycle = 0; cycle < 3; ++cycle) {
+            writeSnapshot(
+                "field_trigger",
+                "zero_stale_pre_phase_a",
+                cycle,
+                vehicleID,
+                strictLaneHint,
+                "edge_426_1",
+                "edge_426_0",
+                originalRoute
+            );
+            applyImmediatePose(
+                vehicleID, lane1Center, lane1Yaw, strictLaneHint, 1);
+            writeSnapshot(
+                "field_trigger",
+                "zero_stale_phase_a",
+                cycle,
+                vehicleID,
+                strictLaneHint,
+                "edge_426_1",
+                "edge_426_0",
+                originalRoute
+            );
+            libsumo::Simulation::step();
+            writeSnapshot(
+                "field_trigger",
+                "zero_stale_phase_b",
                 cycle,
                 vehicleID,
                 strictLaneHint,

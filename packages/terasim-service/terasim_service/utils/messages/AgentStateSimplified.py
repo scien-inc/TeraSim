@@ -35,6 +35,13 @@ class AgentStateSimplified(BaseModel):
     lookahead_action_error: str = ""
     lookahead_lateral_horizon_displacement: float = 0.0
     lookahead_target_lateral_distance: float | None = None
+    lookahead_route_tangent_x: float | None = None
+    lookahead_route_tangent_y: float | None = None
+    lookahead_world_left_normal_x: float | None = None
+    lookahead_world_left_normal_y: float | None = None
+    lookahead_phase_b_lateral_delta: float | None = None
+    lookahead_expected_phase_b_lateral_distance: float | None = None
+    lookahead_world_lateral_speed: float = 0.0
     lookahead_origin_x: float = 0.0
     lookahead_origin_y: float = 0.0
     lateral_speed: float = 0.0
@@ -68,6 +75,7 @@ class AgentStateSimplified(BaseModel):
     sumo_emergency_decel: float | None = None
     sumo_lane_change_intent: str = "none"
     sumo_lane_change_target_lane_id: str = ""
+    sumo_route: tuple[str, ...] = ()
     external_state_maneuver_source_lane_id: str = ""
     external_state_maneuver_target_lane_id: str = ""
     feedback_observed_x: float | None = None
@@ -75,6 +83,7 @@ class AgentStateSimplified(BaseModel):
     feedback_observed_sumo_angle: float | None = None
     feedback_observed_speed: float | None = None
     feedback_observed_acceleration: float | None = None
+    feedback_requested_lane_id: str | None = None
     feedback_observed_lane_id: str | None = None
     feedback_phase_a_sumo_time: float | None = None
     feedback_source_carla_frame: int | None = None

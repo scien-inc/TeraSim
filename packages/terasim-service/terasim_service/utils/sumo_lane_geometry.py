@@ -529,22 +529,21 @@ def build_external_state_lateral_action_lookahead(
     current_position,
     lookahead_distance,
     *,
-    target_lane_shape=None,
     lateral_speed=0.0,
     desired_speed=None,
-    maneuver_active=False,
     min_forward_speed=0.2,
-    previous_lateral_displacement=None,
-    max_lateral_displacement_change=None,
+    lateral_speed_epsilon=0.05,
+    phase_a_position=None,
+    phase_step_length=0.05,
     z=0.0,
 ):
-    """Build a rolling lookahead from route geometry and SUMO lateral action.
+    """Build a rolling lookahead from live route geometry and SUMO lateral speed.
 
-    The current CARLA position remains the origin. SUMO's route geometry supplies
-    the longitudinal displacement, while its lateral speed controls how far the
-    target advances toward the lane selected by SUMO. SUMO's reported angle is
-    deliberately not an input. When continuity state is supplied, only the
-    preview displacement is rate-limited; SUMO still owns its sign and target.
+    The live Phase B front position remains the origin. SUMO route geometry supplies
+    longitudinal displacement. The raw Phase A-to-B world displacement determines
+    which side of the live route SUMO moved toward; only the magnitude of speedLat
+    is used. No target lane, adjacent-lane lookup, angle, or cross-cycle maneuver
+    latch is used.
     """
 
     def invalid(reason):
@@ -556,6 +555,13 @@ def build_external_state_lateral_action_lookahead(
             "route_lookahead": None,
             "lateral_displacement": 0.0,
             "target_lateral_distance": None,
+            "route_tangent_x": None,
+            "route_tangent_y": None,
+            "world_left_normal_x": None,
+            "world_left_normal_y": None,
+            "phase_b_lateral_delta": None,
+            "expected_phase_b_lateral_distance": None,
+            "world_lateral_speed": 0.0,
         }
 
     try:
@@ -564,10 +570,26 @@ def build_external_state_lateral_action_lookahead(
             dtype=np.float64,
         )
         distance = max(0.0, float(lookahead_distance))
+        phase_step_length = float(phase_step_length)
         z = float(z)
+        phase_a = (
+            None
+            if phase_a_position is None
+            else np.asarray(
+                [float(phase_a_position[0]), float(phase_a_position[1])],
+                dtype=np.float64,
+            )
+        )
     except (TypeError, ValueError, IndexError):
         return invalid("invalid_route_input")
-    if not np.all(np.isfinite(origin)) or not math.isfinite(distance) or not math.isfinite(z):
+    if (
+        not np.all(np.isfinite(origin))
+        or not math.isfinite(distance)
+        or not math.isfinite(phase_step_length)
+        or phase_step_length <= 0.0
+        or not math.isfinite(z)
+        or (phase_a is not None and not np.all(np.isfinite(phase_a)))
+    ):
         return invalid("non_finite_route_input")
     if compiled_path is None:
         return invalid("missing_route_geometry")
@@ -616,6 +638,12 @@ def build_external_state_lateral_action_lookahead(
         target_point = starts[target_index] + target_ratio * deltas[target_index]
 
     tangent = deltas[nearest_index] / lengths[nearest_index]
+    left_normal = np.asarray([-tangent[1], tangent[0]], dtype=np.float64)
+    phase_b_lateral_delta = (
+        None
+        if phase_a is None
+        else float(np.dot(origin - phase_a, left_normal))
+    )
     route_displacement = target_point - projected_point
     route_lookahead_xy = origin + route_displacement
     route_lookahead = (
@@ -631,70 +659,54 @@ def build_external_state_lateral_action_lookahead(
         "route_lookahead": route_lookahead,
         "lateral_displacement": 0.0,
         "target_lateral_distance": None,
+        "route_tangent_x": float(tangent[0]),
+        "route_tangent_y": float(tangent[1]),
+        "world_left_normal_x": float(left_normal[0]),
+        "world_left_normal_y": float(left_normal[1]),
+        "phase_b_lateral_delta": phase_b_lateral_delta,
+        "expected_phase_b_lateral_distance": None,
+        "world_lateral_speed": 0.0,
     }
-    if not maneuver_active:
-        return result
 
     try:
         lateral_speed = float(lateral_speed)
+        lateral_speed_epsilon = max(0.0, float(lateral_speed_epsilon))
+    except (TypeError, ValueError):
+        return invalid("invalid_lateral_action")
+    if not all(math.isfinite(value) for value in (lateral_speed, lateral_speed_epsilon)):
+        return invalid("non_finite_lateral_action")
+    result["expected_phase_b_lateral_distance"] = abs(lateral_speed) * phase_step_length
+    if abs(lateral_speed) <= lateral_speed_epsilon + 1e-9:
+        return result
+    if phase_b_lateral_delta is None:
+        result["valid"] = False
+        result["error"] = "missing_phase_a_world_position"
+        result["lookahead"] = None
+        return result
+    if abs(phase_b_lateral_delta) <= 1e-9:
+        result["valid"] = False
+        result["error"] = "unresolved_phase_b_lateral_direction"
+        result["lookahead"] = None
+        return result
+    world_lateral_speed = math.copysign(abs(lateral_speed), phase_b_lateral_delta)
+    result["world_lateral_speed"] = world_lateral_speed
+
+    try:
         desired_speed = float(desired_speed)
         min_forward_speed = max(0.0, float(min_forward_speed))
     except (TypeError, ValueError):
         return invalid("invalid_lateral_action")
-    if not all(math.isfinite(value) for value in (lateral_speed, desired_speed, min_forward_speed)):
+    if not all(math.isfinite(value) for value in (desired_speed, min_forward_speed)):
         return invalid("non_finite_lateral_action")
-    target_projection = project_position_to_lane_shape(target_lane_shape, origin)
-    if target_projection is None:
-        return invalid("missing_target_lane_geometry")
-    target_point = np.asarray(
-        [target_projection["projected_x"], target_projection["projected_y"]],
-        dtype=np.float64,
-    )
-    lateral_vector = target_point - origin
-    lateral_vector = lateral_vector - float(np.dot(lateral_vector, tangent)) * tangent
-    target_lateral_distance = float(np.linalg.norm(lateral_vector))
-    if not math.isfinite(target_lateral_distance):
-        return invalid("invalid_target_lane_geometry")
-    result["target_lateral_distance"] = target_lateral_distance
-    mode = "sumo_lateral_velocity"
-    if desired_speed <= min_forward_speed:
-        requested_lateral_displacement = 0.0
-        mode = "deferred"
-    else:
-        requested_lateral_displacement = min(
-            target_lateral_distance,
-            abs(lateral_speed) * distance / desired_speed,
-        )
 
-    lateral_displacement = requested_lateral_displacement
-    if previous_lateral_displacement is not None:
-        try:
-            previous_lateral_displacement = max(
-                0.0, float(previous_lateral_displacement)
-            )
-            max_lateral_displacement_change = max(
-                0.0, float(max_lateral_displacement_change)
-            )
-        except (TypeError, ValueError):
-            return invalid("invalid_lateral_continuity_state")
-        if not math.isfinite(
-            previous_lateral_displacement
-        ) or not math.isfinite(max_lateral_displacement_change):
-            return invalid("non_finite_lateral_continuity_state")
-        lateral_displacement = min(
-            previous_lateral_displacement + max_lateral_displacement_change,
-            max(
-                previous_lateral_displacement - max_lateral_displacement_change,
-                requested_lateral_displacement,
-            ),
-        )
-        lateral_displacement = min(target_lateral_distance, lateral_displacement)
+    lateral_displacement = 0.0
+    mode = "deferred"
+    if desired_speed > min_forward_speed:
+        lateral_displacement = world_lateral_speed * distance / desired_speed
+        mode = "sumo_lateral_velocity"
 
+    route_lookahead_xy = route_lookahead_xy + left_normal * lateral_displacement
     result["mode"] = mode
-    if target_lateral_distance > 1e-9 and lateral_displacement > 0.0:
-        route_lookahead_xy = (
-            route_lookahead_xy + lateral_vector / target_lateral_distance * lateral_displacement
-        )
     result["lateral_displacement"] = float(lateral_displacement)
     result["lookahead"] = (
         float(route_lookahead_xy[0]),

@@ -50,11 +50,6 @@ def _annotate_service_actions(records: list[dict], monkeypatch) -> None:
         state_key = "left_state" if direction == 1 else "right_state"
         return 0, int(snapshot[state_key])
 
-    def get_lane_index(_vehicle_id: str) -> int:
-        snapshot = current["snapshot"]
-        assert isinstance(snapshot, dict)
-        return int(snapshot["lane_index"])
-
     monkeypatch.setattr(
         plugin_module,
         "traci",
@@ -62,7 +57,6 @@ def _annotate_service_actions(records: list[dict], monkeypatch) -> None:
             constants=types.SimpleNamespace(LCA_LEFT=2, LCA_RIGHT=4),
             vehicle=types.SimpleNamespace(
                 getLaneChangeState=get_lane_change_state,
-                getLaneIndex=get_lane_index,
             ),
         ),
     )
@@ -201,6 +195,7 @@ def test_repeated_external_pose_rebases_realized_phase_a_lane_change_state(
             snapshot = record[branch]
             assert required_snapshot_fields <= snapshot.keys()
             assert snapshot["service_lane_change_intent"] == snapshot["lca_bit_intent"]
+            assert snapshot["service_lane_change_target_lane_id"] == ""
 
     assert cycles[0]["pre_phase_a"] == candidate["feedback_state"]
     same_primary_updates = []
