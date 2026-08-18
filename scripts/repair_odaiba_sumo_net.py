@@ -3,6 +3,7 @@
 
 The input net is never modified.  The script exports it to SUMO Plain XML,
 restores source-backed lane geometry, removes discontinuous connection shapes,
+removes two node_825 connections rejected by the Lanelet2 topology,
 and lets the same netconvert version rebuild junction-internal geometry.
 """
 
@@ -36,6 +37,10 @@ SOURCE_LANELET_IDS = {
     "node_205_outgoing_1368_1": "2224381",
     "node_205_outgoing_1368_2": "2224380",
     "node_205_outgoing_1369_0": "2224375",
+    "node_825_incoming": "178481",
+    "node_825_valid_outgoing": "1910618",
+    "node_825_invalid_outgoing_0": "2306272",
+    "node_825_invalid_outgoing_1": "2307310",
 }
 
 NODE_205_INCOMING_LANELETS = {
@@ -66,6 +71,12 @@ PRESERVED_CONNECTIONS: set[ConnectionKey] = {
 }
 
 TARGET_CONNECTION: ConnectionKey = ("edge_1231", "1", "edge_1235", "0")
+
+NODE_825_INVALID_CONNECTIONS: set[ConnectionKey] = {
+    ("edge_482", "0", "edge_3249", "0"),
+    ("edge_482", "0", "edge_3249", "1"),
+}
+NODE_825_VALID_CONNECTION: ConnectionKey = ("edge_482", "0", "edge_506", "0")
 
 
 def _parse_args() -> argparse.Namespace:
@@ -364,12 +375,18 @@ def _repair_plain_connections(
         _connection_key(connection): connection for connection in root.findall("connection")
     }
 
-    required = PRESERVED_CONNECTIONS | {TARGET_CONNECTION} | set(
-        NODE_205_CONNECTION_LANELETS
+    required = (
+        PRESERVED_CONNECTIONS
+        | {TARGET_CONNECTION, NODE_825_VALID_CONNECTION}
+        | set(NODE_205_CONNECTION_LANELETS)
+        | NODE_825_INVALID_CONNECTIONS
     )
     missing = required - connections.keys()
     if missing:
         raise ValueError(f"required connections were not found: {sorted(missing)}")
+
+    for key in NODE_825_INVALID_CONNECTIONS:
+        root.remove(connections.pop(key))
 
     preserved_shapes = {
         key: connections[key].get("shape", "") for key in PRESERVED_CONNECTIONS
@@ -400,6 +417,9 @@ def _repair_plain_connections(
 
     _write_xml(tree, connection_file)
     print(f"regenerating {len(regenerated_keys)} discontinuous connection shapes")
+    print(
+        f"removed {len(NODE_825_INVALID_CONNECTIONS)} invalid node_825 connections"
+    )
 
 
 def _point_at_distance(points: list[Point], distance: float) -> tuple[Point, int]:
@@ -835,8 +855,13 @@ def _tls_signatures(net_file: Path) -> set[tuple[object, ...]]:
 def _assert_topology_preserved(source_net: Path, output_net: Path) -> None:
     if _external_edge_ids(source_net) != _external_edge_ids(output_net):
         raise RuntimeError("external edge IDs changed while rebuilding the net")
-    if _normal_connection_keys(source_net) != _normal_connection_keys(output_net):
-        raise RuntimeError("normal edge connection topology changed while rebuilding the net")
+    source_connections = _normal_connection_keys(source_net)
+    output_connections = _normal_connection_keys(output_net)
+    expected_connections = source_connections - NODE_825_INVALID_CONNECTIONS
+    if output_connections != expected_connections:
+        raise RuntimeError(
+            "normal edge connection topology changed beyond the node_825 repair"
+        )
     if _tls_link_assignments(source_net) != _tls_link_assignments(output_net):
         raise RuntimeError("traffic-light link assignments changed while rebuilding the net")
     if _tls_signatures(source_net) != _tls_signatures(output_net):
@@ -891,6 +916,28 @@ def _assert_repaired_geometry(output_net: Path, centerlines: dict[str, list[Poin
             )
         if _parse_shape(_net_lane(root, expected_via).get("shape")) != expected_shape:
             raise RuntimeError(f"{expected_via} is not source-backed")
+
+    node_825_incoming_end = centerlines[SOURCE_LANELET_IDS["node_825_incoming"]][-1]
+    node_825_valid_start = centerlines[
+        SOURCE_LANELET_IDS["node_825_valid_outgoing"]
+    ][0]
+    node_825_invalid_starts = (
+        centerlines[SOURCE_LANELET_IDS["node_825_invalid_outgoing_0"]][0],
+        centerlines[SOURCE_LANELET_IDS["node_825_invalid_outgoing_1"]][0],
+    )
+    if _point_distance(node_825_incoming_end, node_825_valid_start) >= 1e-6:
+        raise RuntimeError("node_825 valid Lanelet2 successor is not continuous")
+    if any(
+        _point_distance(node_825_incoming_end, point) <= 8.0
+        for point in node_825_invalid_starts
+    ):
+        raise RuntimeError("node_825 rejected Lanelet2 successor is unexpectedly nearby")
+
+    output_connections = _normal_connection_keys(output_net)
+    if NODE_825_INVALID_CONNECTIONS & output_connections:
+        raise RuntimeError("invalid node_825 connections remain in the rebuilt net")
+    if NODE_825_VALID_CONNECTION not in output_connections:
+        raise RuntimeError("valid node_825 Lanelet2 successor was removed")
 
 
 def main() -> None:
