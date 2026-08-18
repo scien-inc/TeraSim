@@ -7,7 +7,9 @@ import os
 import subprocess
 import textwrap
 import types
+from functools import lru_cache
 from pathlib import Path
+from xml.etree import ElementTree
 
 import pytest
 
@@ -17,6 +19,7 @@ FIELD_LEFT_STEPS = 65
 OUTSIDE_CYCLES = 60
 STEP_LENGTH = 0.05
 POSITION_TOLERANCE = 1e-6
+ANGLE_OFFSET_TOLERANCE = 1e-6
 TARGET_CENTER_TOLERANCE = 1e-4
 FIELD_COMPLETION_TOLERANCE = 0.05 + 1e-6
 SUMO_LATERAL_SPEED_LIMIT = 1.0 + 1e-6
@@ -91,9 +94,6 @@ def _annotate_service_actions(records: list[dict], monkeypatch) -> None:
         key = "left_state" if direction == 1 else "right_state"
         return 0, int(snapshot[key])
 
-    def get_lane_index(_vehicle_id: str) -> int:
-        return int(current["snapshot"]["primary_lane"].rsplit("_", 1)[1])
-
     monkeypatch.setattr(
         plugin_module,
         "traci",
@@ -101,7 +101,6 @@ def _annotate_service_actions(records: list[dict], monkeypatch) -> None:
             constants=types.SimpleNamespace(LCA_LEFT=2, LCA_RIGHT=4),
             vehicle=types.SimpleNamespace(
                 getLaneChangeState=get_lane_change_state,
-                getLaneIndex=get_lane_index,
             ),
         ),
     )
@@ -123,13 +122,58 @@ def _annotate_service_actions(records: list[dict], monkeypatch) -> None:
         snapshot["service_target_lane"] = target_lane_id
 
 
-def _write_artifact(vehicle_id: str, strict_lane_hint: bool, output: str) -> None:
+@lru_cache(maxsize=1)
+def _lane_shapes() -> dict[str, list[tuple[float, float]]]:
+    root = ElementTree.parse(_network_path()).getroot()
+    return {
+        lane.get("id", ""): [
+            tuple(float(value) for value in point.split(",")[:2])
+            for point in lane.get("shape", "").split()
+        ]
+        for lane in root.iter("lane")
+        if lane.get("id") and lane.get("shape")
+    }
+
+
+def _annotate_world_lateral_action(phase_a: dict, phase_b: dict) -> dict:
+    from terasim_service.utils.sumo_lane_geometry import (
+        build_external_state_lateral_action_lookahead,
+        compile_lane_shapes,
+    )
+
+    result = build_external_state_lateral_action_lookahead(
+        compile_lane_shapes([_lane_shapes()[phase_b["primary_lane"]]]),
+        (phase_b["position_x"], phase_b["position_y"]),
+        7.0,
+        lateral_speed=phase_b["speed_lat"],
+        desired_speed=7.0,
+        phase_a_position=(phase_a["position_x"], phase_a["position_y"]),
+        phase_step_length=STEP_LENGTH,
+    )
+    for key in (
+        "route_tangent_x",
+        "route_tangent_y",
+        "world_left_normal_x",
+        "world_left_normal_y",
+        "phase_b_lateral_delta",
+        "expected_phase_b_lateral_distance",
+        "world_lateral_speed",
+        "lateral_displacement",
+    ):
+        phase_b[f"service_{key}"] = result.get(key)
+    phase_b["service_lookahead_valid"] = result["valid"]
+    phase_b["service_lookahead_error"] = result["error"]
+    return result
+
+
+def _write_artifact(vehicle_id: str, strict_lane_hint: bool, records: list[dict]) -> None:
     value = os.environ.get("SUMO_EXTERNAL_STATE_RIGHT_REVERSAL_ARTIFACT_DIR")
     if not value:
         return
     directory = Path(value)
     directory.mkdir(parents=True, exist_ok=True)
     mode = "strict" if strict_lane_hint else "standard"
+    output = "".join(json.dumps(record, sort_keys=True) + "\n" for record in records)
     (directory / f"{vehicle_id}-{mode}.ndjson").write_text(output, encoding="utf-8")
 
 
@@ -184,7 +228,6 @@ def test_edge426_realized_right_reversal_preserves_sumo_phase_b_decision(
         text=True,
         timeout=120,
     )
-    _write_artifact(vehicle_id, strict_lane_hint, completed.stdout)
     records: list[dict] = []
     result = None
     for line in completed.stdout.splitlines():
@@ -205,6 +248,7 @@ def test_edge426_realized_right_reversal_preserves_sumo_phase_b_decision(
     assert result["right_route_unchanged"] is True
     assert all(record["route_unchanged"] for record in records)
     assert all(record["service_intent"] == record["raw_intent"] for record in records)
+    assert all(record["service_target_lane"] == "" for record in records)
 
     field_authorize = _one(records, "field_trigger", "left_authorize")
     assert field_authorize["primary_lane"] == "edge_426_0"
@@ -302,11 +346,48 @@ def test_edge426_realized_right_reversal_preserves_sumo_phase_b_decision(
         for phase_a, phase_b in zip(wait_phase_a, wait_phase_b)
     )
 
+    zero_stale_pre = _stage(
+        records, "field_trigger", "zero_stale_pre_phase_a"
+    )
+    zero_stale_phase_a = _stage(
+        records, "field_trigger", "zero_stale_phase_a"
+    )
+    zero_stale_phase_b = _stage(
+        records, "field_trigger", "zero_stale_phase_b"
+    )
+    assert len(zero_stale_pre) == len(zero_stale_phase_a) == len(zero_stale_phase_b) == 3
+    first_stale = zero_stale_pre[0]
+    assert first_stale["primary_lane"] == "edge_426_1"
+    assert first_stale["maneuver_distance"] == pytest.approx(
+        0.0, abs=POSITION_TOLERANCE
+    )
+    assert first_stale["service_intent"] == "none"
+    assert first_stale["lcm_target_lane"] == ""
+    assert first_stale["shadow_lane"] == ""
+    assert first_stale["speed_lat"] == pytest.approx(1.0)
+    for phase_a, phase_b in zip(zero_stale_phase_a, zero_stale_phase_b):
+        assert phase_a["primary_lane"] == phase_b["primary_lane"] == "edge_426_1"
+        assert phase_a["maneuver_distance"] == pytest.approx(
+            0.0, abs=POSITION_TOLERANCE
+        )
+        assert phase_b["maneuver_distance"] == pytest.approx(
+            0.0, abs=POSITION_TOLERANCE
+        )
+        assert phase_a["service_intent"] == phase_b["service_intent"] == "none"
+        assert phase_a["lcm_target_lane"] == phase_b["lcm_target_lane"] == ""
+        assert phase_a["shadow_lane"] == phase_b["shadow_lane"] == ""
+        assert phase_a["speed_lat"] == pytest.approx(0.0, abs=POSITION_TOLERANCE)
+        assert phase_b["speed_lat"] == pytest.approx(0.0, abs=POSITION_TOLERANCE)
+    zero_stale_angle_offsets = [
+        record["angle_offset_degrees"] for record in zero_stale_phase_a
+    ]
+    assert max(zero_stale_angle_offsets) - min(zero_stale_angle_offsets) < ANGLE_OFFSET_TOLERANCE
+
     fresh_authorize = _one(records, "fresh_right", "right_authorize")
     assert fresh_authorize["primary_lane"] == "edge_426_1"
     assert fresh_authorize["maneuver_distance"] < 0.0
     assert fresh_authorize["service_intent"] == "right"
-    assert fresh_authorize["service_target_lane"] == "edge_426_0"
+    assert fresh_authorize["service_target_lane"] == ""
 
     right_a1 = _one(records, "fresh_right", "right_a1")
     right_b1 = _one(records, "fresh_right", "right_b1")
@@ -347,14 +428,8 @@ def test_edge426_realized_right_reversal_preserves_sumo_phase_b_decision(
     assert all(record["maneuver_distance"] < 0.0 for record in outside_phase_b)
     assert all(record["service_intent"] == "right" for record in outside_phase_a)
     assert all(record["service_intent"] == "right" for record in outside_phase_b)
-    assert all(
-        record["service_target_lane"] == "edge_426_0"
-        for record in outside_phase_a
-    )
-    assert all(
-        record["service_target_lane"] == "edge_426_0"
-        for record in outside_phase_b
-    )
+    assert all(record["service_target_lane"] == "" for record in outside_phase_a)
+    assert all(record["service_target_lane"] == "" for record in outside_phase_b)
     assert all(
         record["speed_lat"] == pytest.approx(0.0, abs=1e-9)
         for record in outside_phase_a[1:]
@@ -381,6 +456,32 @@ def test_edge426_realized_right_reversal_preserves_sumo_phase_b_decision(
         for phase_a, phase_b in zip(outside_phase_a, outside_phase_b)
     )
 
+    # Compare raw world XY directly. Do not normalize through SUMO's
+    # getLateralGeometrySign(), which hid the Odaiba field sign inversion.
+    world_lateral_samples = []
+    for phase_a, phase_b in (
+        list(zip(left_phase_a, left_phase_b))
+        + list(zip(outside_phase_a, outside_phase_b))
+    ):
+        if (
+            phase_a["primary_lane"] != phase_b["primary_lane"]
+            or abs(phase_b["speed_lat"]) <= 0.05
+        ):
+            continue
+        result = _annotate_world_lateral_action(phase_a, phase_b)
+        if abs(result["phase_b_lateral_delta"] or 0.0) <= POSITION_TOLERANCE:
+            continue
+        assert result["valid"] is True
+        assert abs(result["phase_b_lateral_delta"]) == pytest.approx(
+            result["expected_phase_b_lateral_distance"],
+            abs=POSITION_TOLERANCE,
+        )
+        assert result["world_lateral_speed"] * result["phase_b_lateral_delta"] > 0.0
+        world_lateral_samples.append(result)
+    assert world_lateral_samples
+    assert any(sample["world_lateral_speed"] > 0.0 for sample in world_lateral_samples)
+    assert any(sample["world_lateral_speed"] < 0.0 for sample in world_lateral_samples)
+
     target_phase_a = _one(records, "fresh_right", "right_target_phase_a")
     target_phase_b = _one(records, "fresh_right", "right_target_phase_b")
     assert target_phase_a["primary_lane"] == "edge_426_1"
@@ -401,7 +502,17 @@ def test_edge426_realized_right_reversal_preserves_sumo_phase_b_decision(
     assert target_phase_b["maneuver_distance"] == pytest.approx(
         0.0, abs=POSITION_TOLERANCE
     )
-    assert abs(target_phase_b["speed_lat"]) <= SUMO_LATERAL_SPEED_LIMIT
+    # A completed maneuver must not re-apply the pre-Phase-A lateral speed
+    # during the same Phase B primary-lane handover cycle.
+    assert target_phase_b["speed_lat"] == pytest.approx(
+        0.0, abs=POSITION_TOLERANCE
+    )
+    target_action = _annotate_world_lateral_action(target_phase_a, target_phase_b)
+    assert target_action["valid"] is True
+    assert target_action["error"] == ""
+    assert target_action["mode"] == "route"
     assert target_phase_b["lcm_target_lane"] == ""
     assert target_phase_b["service_intent"] != "left"
     assert _angle_difference(target_phase_a["angle"], target_phase_b["angle"]) < 45.0
+
+    _write_artifact(vehicle_id, strict_lane_hint, records)

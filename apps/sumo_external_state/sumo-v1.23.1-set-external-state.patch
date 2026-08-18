@@ -165,15 +165,26 @@ diff --git a/src/microsim/MSLaneChangerSublane.cpp b/src/microsim/MSLaneChangerS
 index 48248b2a6..f1f5fb7fb 100644
 --- a/src/microsim/MSLaneChangerSublane.cpp
 +++ b/src/microsim/MSLaneChangerSublane.cpp
-@@ -117,0 +118,7 @@ MSLaneChangerSublane::change() {
+@@ -117,0 +118,18 @@ MSLaneChangerSublane::change() {
 +    double remotePhaseBSpeedLat = 0.;
 +    if (vehicle->hasInfluencer()
 +            && vehicle->getInfluencer().consumeRemoteLaneChangeSpeedRestore(
 +                remotePhaseBSpeedLat)
 +            && std::isfinite(remotePhaseBSpeedLat)) {
-+        vehicle->getLaneChangeModel().setSpeedLat(remotePhaseBSpeedLat);
++        MSAbstractLaneChangeModel& laneChangeModel =
++            vehicle->getLaneChangeModel();
++        const double remainingManeuver = laneChangeModel.getManeuverDist();
++        const double maxRemainingSpeedLat = DIST2SPEED(remainingManeuver);
++        const bool restoreContinuesManeuver =
++            remotePhaseBSpeedLat * remainingManeuver > 0.;
++        const double boundedSpeedLat =
++            !restoreContinuesManeuver
++            ? 0.
++            : fabs(remotePhaseBSpeedLat) <= fabs(maxRemainingSpeedLat)
++              ? remotePhaseBSpeedLat : maxRemainingSpeedLat;
++        laneChangeModel.setSpeedLat(boundedSpeedLat);
 +    }
-@@ -125,0 +133,37 @@ MSLaneChangerSublane::change() {
+@@ -125,0 +144,37 @@ MSLaneChangerSublane::change() {
 +    double remoteRebaseTargetPosLat = 0.;
 +    const int remoteRebaseDirection = vehicle->hasInfluencer()
 +                                      ? vehicle->getInfluencer().consumeRemoteLaneChangeRebase(
@@ -332,7 +343,7 @@ index 1792121ea..9e7482753 100644
 +    if (!myRemoteStrictLaneHint) {
 +        v->myCurrEdge = v->getRoute().begin() + myRemoteEdgeOffset;
 +    }
-@@ -933,0 +1037,196 @@ MSVehicle::Influencer::postProcessRemoteControl(MSVehicle* v) {
+@@ -933,0 +1037,200 @@ MSVehicle::Influencer::postProcessRemoteControl(MSVehicle* v) {
 +void
 +MSVehicle::Influencer::completeRemoteControl(MSVehicle* v, SUMOTime t) {
 +    myRemoteLaneChangeRebaseDirection = 0;
@@ -451,8 +462,8 @@ index 1792121ea..9e7482753 100644
 +                    <= 0.5 * authorizedTargetLane->getWidth() + POSITION_EPS;
 +                const bool hasActiveManeuver =
 +                    fabs(maneuverDist) > NUMERICAL_EPS;
++                laneChangeModel.setSpeedLat(DIST2SPEED(realized));
 +                if (hasActiveManeuver) {
-+                    laneChangeModel.setSpeedLat(DIST2SPEED(realized));
 +                    myRemoteLaneChangeSpeedRestore = myRemotePrePhaseASpeedLat;
 +                    myRemoteLaneChangeSpeedRestorePending = true;
 +                    const double simulated =
@@ -490,22 +501,26 @@ index 1792121ea..9e7482753 100644
 +                        }
 +                    }
 +
-+                    const double phaseAComputedAngle = v->computeAngle();
-+                    const double phaseAComputedOffset =
-+                        laneChangeModel.getAngleOffset();
-+                    const double laneBaseline =
-+                        phaseAComputedAngle
-+                        + myRemotePositionGeometrySign * phaseAComputedOffset;
-+                    const double externalOffset =
-+                        myRemotePositionGeometrySign
-+                        * GeomHelper::angleDiff(externalAngle, laneBaseline);
-+                    if (std::isfinite(phaseAComputedAngle)
-+                            && std::isfinite(phaseAComputedOffset)
-+                            && std::isfinite(laneBaseline)
-+                            && std::isfinite(externalOffset)) {
-+                        laneChangeModel.setAngleOffset(externalOffset);
-+                        laneChangeModel.setPreviousAngleOffset(externalOffset);
-+                    }
++                } else {
++                    myRemoteLaneChangeSpeedRestorePending = false;
++                    myRemoteLaneChangeSpeedRestore = 0.;
++                }
++
++                const double phaseAComputedAngle = v->computeAngle();
++                const double phaseAComputedOffset =
++                    laneChangeModel.getAngleOffset();
++                const double laneBaseline =
++                    phaseAComputedAngle
++                    + myRemotePositionGeometrySign * phaseAComputedOffset;
++                const double externalOffset =
++                    myRemotePositionGeometrySign
++                    * GeomHelper::angleDiff(externalAngle, laneBaseline);
++                if (std::isfinite(phaseAComputedAngle)
++                        && std::isfinite(phaseAComputedOffset)
++                        && std::isfinite(laneBaseline)
++                        && std::isfinite(externalOffset)) {
++                    laneChangeModel.setAngleOffset(externalOffset);
++                    laneChangeModel.setPreviousAngleOffset(externalOffset);
 +                }
 +            }
 +        }
@@ -529,7 +544,7 @@ index 1792121ea..9e7482753 100644
 +}
 +
 +
-@@ -1247,0 +1547,12 @@ MSVehicle::getSlope() const {
+@@ -1247,0 +1551,12 @@ MSVehicle::getSlope() const {
 +double
 +MSVehicle::getLateralGeometrySign() const {
 +    if (myInfluencer != nullptr) {
@@ -542,28 +557,28 @@ index 1792121ea..9e7482753 100644
 +}
 +
 +
-@@ -1272 +1583 @@ MSVehicle::getPosition(const double offset) const {
+@@ -1272 +1587 @@ MSVehicle::getPosition(const double offset) const {
 -    const double posLat = (MSGlobals::gLefthand ? 1 : -1) * getLateralPositionOnLane();
 +    const double posLat = getLateralGeometrySign() * getLateralPositionOnLane();
-@@ -1482,2 +1793,2 @@ MSVehicle::computeAngle() const {
+@@ -1482,2 +1797,2 @@ MSVehicle::computeAngle() const {
 -    const double posLat = -myState.myPosLat; // @todo get rid of the '-'
 -    const double lefthandSign = (MSGlobals::gLefthand ? -1 : 1);
 +    const double geometrySign = getLateralGeometrySign();
 +    const double posLat = geometrySign * myState.myPosLat;
-@@ -1499 +1810 @@ MSVehicle::computeAngle() const {
+@@ -1499 +1814 @@ MSVehicle::computeAngle() const {
 -        p1 = myLane->geometryPositionAtOffset(myState.myPos, lefthandSign * posLat);
 +        p1 = myLane->geometryPositionAtOffset(myState.myPos, posLat);
-@@ -1503 +1814 @@ MSVehicle::computeAngle() const {
+@@ -1503 +1818 @@ MSVehicle::computeAngle() const {
 -            p1 = predecessorLane->geometryPositionAtOffset(predecessorLane->getLength() + myState.myPos, lefthandSign * posLat);
 +            p1 = predecessorLane->geometryPositionAtOffset(predecessorLane->getLength() + myState.myPos, posLat);
-@@ -1532 +1843 @@ MSVehicle::computeAngle() const {
+@@ -1532 +1847 @@ MSVehicle::computeAngle() const {
 -    result += lefthandSign * myLaneChangeModel->calcAngleOffset();
 +    result -= geometrySign * myLaneChangeModel->calcAngleOffset();
-@@ -1545 +1856,2 @@ MSVehicle::getBackPosition() const {
+@@ -1545 +1860,2 @@ MSVehicle::getBackPosition() const {
 -    const double posLat = MSGlobals::gLefthand ? myState.myPosLat : -myState.myPosLat;
 +    const double geometrySign = getLateralGeometrySign();
 +    const double posLat = geometrySign * myState.myPosLat;
-@@ -1568 +1880 @@ MSVehicle::getBackPosition() const {
+@@ -1568 +1884 @@ MSVehicle::getBackPosition() const {
 -                result = myFurtherLanes.back()->geometryPositionAtOffset(backPos, -myFurtherLanesPosLat.back() * (MSGlobals::gLefthand ? -1 : 1));
 +                result = myFurtherLanes.back()->geometryPositionAtOffset(backPos, geometrySign * myFurtherLanesPosLat.back());
 diff --git a/src/microsim/MSVehicle.h b/src/microsim/MSVehicle.h

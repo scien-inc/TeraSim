@@ -171,6 +171,7 @@ class TeraSimCoSimPlugin(BasePlugin):
         self.feedback_observed_accelerations = {}
         self.feedback_observed_positions = {}
         self.feedback_observed_angles = {}
+        self.feedback_requested_lane_ids = {}
         self.feedback_observed_lane_ids = {}
         self.feedback_phase_a_sumo_times = {}
         self.feedback_observed_rear_axle_positions = {}
@@ -1226,6 +1227,11 @@ class TeraSimCoSimPlugin(BasePlugin):
         self.feedback_observed_accelerations[actor_id] = observed_acceleration
         self.feedback_observed_positions[actor_id] = tuple(observed_position[:2])
         self.feedback_observed_angles[actor_id] = observed_angle
+        requested_lane_ids = getattr(self, "feedback_requested_lane_ids", None)
+        if requested_lane_ids is None:
+            requested_lane_ids = {}
+            self.feedback_requested_lane_ids = requested_lane_ids
+        requested_lane_ids[actor_id] = lane_id
         self.feedback_observed_lane_ids[actor_id] = observed_lane_id
         self.feedback_phase_a_sumo_times[actor_id] = phase_a_time
         return True
@@ -2205,20 +2211,8 @@ class TeraSimCoSimPlugin(BasePlugin):
             add_timing(profile_ctx, f"{base}.total_s", elapsed)
             add_timing(profile_ctx, f"{base}.{operation_name}_s", elapsed)
 
-    @staticmethod
-    def _lane_change_target_lane_id(current_lane_id, current_lane_index, direction):
-        if not current_lane_id or direction not in {-1, 1}:
-            return ""
-        target_lane_index = current_lane_index + direction
-        if target_lane_index < 0:
-            return ""
-        lane_prefix, separator, lane_suffix = current_lane_id.rpartition("_")
-        if not separator or not lane_prefix or not lane_suffix.isdigit():
-            return ""
-        return f"{lane_prefix}_{target_lane_index}"
-
     def _get_sumo_lane_change_action(self, vehicle_id, current_lane_id, profile_ctx=None):
-        """Export SUMO's post-decision lane-change request without altering it."""
+        """Export SUMO directional state for diagnostics without choosing a lane."""
         try:
             left_state = self._profile_detail_traci_call(
                 profile_ctx,
@@ -2234,12 +2228,6 @@ class TeraSimCoSimPlugin(BasePlugin):
                 vehicle_id,
                 -1,
             )[1]
-            current_lane_index = self._profile_detail_traci_call(
-                profile_ctx,
-                "vehicle_get_lane_index",
-                traci.vehicle.getLaneIndex,
-                vehicle_id,
-            )
         except Exception:
             return "none", ""
 
@@ -2247,21 +2235,7 @@ class TeraSimCoSimPlugin(BasePlugin):
         wants_right = bool(right_state & traci.constants.LCA_RIGHT)
         if wants_left == wants_right:
             return "none", ""
-        direction = 1 if wants_left else -1
-        intent = "left" if wants_left else "right"
-        maneuver = getattr(
-            self, "external_state_lane_change_maneuvers", {}
-        ).get(vehicle_id)
-        if (
-            maneuver is not None
-            and maneuver.get("intent") == intent
-            and maneuver.get("target_lane_id") == current_lane_id
-        ):
-            return intent, current_lane_id
-        target_lane_id = self._lane_change_target_lane_id(
-            current_lane_id, current_lane_index, direction
-        )
-        return intent, target_lane_id
+        return ("left" if wants_left else "right"), ""
 
     @staticmethod
     def _context_vehicle_value(context_values, constant_name):
@@ -2413,7 +2387,7 @@ class TeraSimCoSimPlugin(BasePlugin):
                     vehicle_id,
                 )
             except Exception:
-                current_lane = ""
+                return None
             try:
                 next_links = self._profile_detail_traci_call(
                     profile_ctx,
@@ -2422,7 +2396,7 @@ class TeraSimCoSimPlugin(BasePlugin):
                     vehicle_id,
                 )
             except Exception:
-                next_links = []
+                return None
             # A cyclic full route can alias the lane immediately behind the vehicle.
             next_links = tuple(next_links or ())[:1]
             has_current_lane = True
@@ -2786,6 +2760,7 @@ class TeraSimCoSimPlugin(BasePlugin):
 
         compiled_paths = []
         current_positions = []
+        current_position_errors = []
         lookahead_distances = []
         z_values = []
         for vehicle_id, vehicle_state, context_values in requests:
@@ -2800,13 +2775,27 @@ class TeraSimCoSimPlugin(BasePlugin):
                 self, "feedback_observed_rear_axle_positions", {}
             )
             feedback_positions = getattr(self, "feedback_observed_positions", {})
-            current_position = rear_axle_positions.get(
-                vehicle_id,
-                feedback_positions.get(
-                    vehicle_id, (vehicle_state.x, vehicle_state.y)
-                ),
-            )
+            current_position_error = ""
+            if self._uses_external_state_route_lookahead(vehicle_id):
+                try:
+                    current_position = self._profile_detail_traci_call(
+                        profile_ctx,
+                        "vehicle_get_position",
+                        traci.vehicle.getPosition,
+                        vehicle_id,
+                    )
+                except Exception:
+                    current_position = (vehicle_state.x, vehicle_state.y)
+                    current_position_error = "phase_b_position_api_failed"
+            else:
+                current_position = rear_axle_positions.get(
+                    vehicle_id,
+                    feedback_positions.get(
+                        vehicle_id, (vehicle_state.x, vehicle_state.y)
+                    ),
+                )
             current_positions.append(current_position)
+            current_position_errors.append(current_position_error)
             vehicle_state.lookahead_origin_x = current_position[0]
             vehicle_state.lookahead_origin_y = current_position[1]
             observed_lane_progress = getattr(
@@ -2864,6 +2853,7 @@ class TeraSimCoSimPlugin(BasePlugin):
             request,
             compiled_path,
             current_position,
+            current_position_error,
             lookahead,
             lookahead_distance,
             heading_change,
@@ -2871,6 +2861,7 @@ class TeraSimCoSimPlugin(BasePlugin):
             requests,
             compiled_paths,
             current_positions,
+            current_position_errors,
             lookaheads,
             effective_distances,
             heading_changes,
@@ -2892,33 +2883,15 @@ class TeraSimCoSimPlugin(BasePlugin):
             use_external_state_lookahead = self._uses_external_state_route_lookahead(vehicle_id)
 
             if use_external_state_lookahead:
-                maneuver, maneuver_error = self._external_state_lane_change_maneuver(
-                    vehicle_id,
-                    vehicle_state,
-                    context_values=context_values,
-                    profile_ctx=profile_ctx,
-                )
-                if maneuver is not None:
-                    vehicle_state.external_state_maneuver_source_lane_id = (
-                        maneuver.get("source_lane_id", "")
-                    )
-                    vehicle_state.external_state_maneuver_target_lane_id = (
-                        maneuver.get("target_lane_id", "")
-                    )
-                target_lane_shape = None
-                if maneuver is not None and not maneuver_error:
-                    try:
-                        target_lane_shape = self._get_lookahead_lane_shape(
-                            maneuver.get("target_lane_id"),
-                            profile_ctx=profile_ctx,
-                        )
-                    except Exception:
-                        target_lane_shape = None
-
-                if maneuver_error:
+                maneuvers = getattr(self, "external_state_lane_change_maneuvers", None)
+                if maneuvers is not None:
+                    maneuvers.pop(vehicle_id, None)
+                vehicle_state.external_state_maneuver_source_lane_id = ""
+                vehicle_state.external_state_maneuver_target_lane_id = ""
+                if current_position_error:
                     action_result = {
                         "valid": False,
-                        "error": maneuver_error,
+                        "error": current_position_error,
                         "mode": "route",
                         "lookahead": None,
                         "route_lookahead": None,
@@ -2926,20 +2899,6 @@ class TeraSimCoSimPlugin(BasePlugin):
                         "target_lateral_distance": None,
                     }
                 else:
-                    previous_lateral_displacement = None
-                    max_lateral_displacement_change = None
-                    if maneuver is not None:
-                        maneuver["max_abs_lateral_speed"] = max(
-                            float(maneuver.get("max_abs_lateral_speed", 0.0)),
-                            abs(float(lateral_speed)),
-                        )
-                        previous_lateral_displacement = float(
-                            maneuver.get("lateral_horizon_displacement", 0.0)
-                        )
-                        max_lateral_displacement_change = (
-                            maneuver["max_abs_lateral_speed"]
-                            * getattr(self, "ackermann_feedback_step_length", 0.05)
-                        )
                     action_result = self._profile_detail_python_call(
                         profile_ctx,
                         "build_external_state_lateral_action_lookahead",
@@ -2947,45 +2906,26 @@ class TeraSimCoSimPlugin(BasePlugin):
                         compiled_path,
                         current_position,
                         lookahead_distance,
-                        target_lane_shape=target_lane_shape,
                         lateral_speed=lateral_speed,
                         desired_speed=vehicle_state.sumo_desired_speed,
-                        maneuver_active=maneuver is not None,
                         min_forward_speed=0.2,
-                        previous_lateral_displacement=previous_lateral_displacement,
-                        max_lateral_displacement_change=max_lateral_displacement_change,
+                        lateral_speed_epsilon=getattr(
+                            self, "lookahead_lane_change_speed_start", 0.05
+                        ),
+                        phase_a_position=(
+                            (
+                                vehicle_state.feedback_observed_x,
+                                vehicle_state.feedback_observed_y,
+                            )
+                            if vehicle_state.feedback_observed_x is not None
+                            and vehicle_state.feedback_observed_y is not None
+                            else None
+                        ),
+                        phase_step_length=getattr(
+                            self, "ackermann_feedback_step_length", 0.05
+                        ),
                         z=vehicle_state.z,
                     )
-                    if maneuver is not None and action_result.get("valid", False):
-                        maneuver["lateral_horizon_displacement"] = float(
-                            action_result.get("lateral_displacement", 0.0)
-                        )
-
-                target_lateral_distance = action_result.get("target_lateral_distance")
-                maneuver_settled = (
-                    maneuver is not None
-                    and action_result.get("valid", False)
-                    and vehicle_state.lane_id == maneuver.get("target_lane_id")
-                    and abs(float(lateral_speed))
-                    < getattr(self, "lookahead_lane_change_speed_start", 0.05)
-                    and target_lateral_distance is not None
-                    and target_lateral_distance
-                    < getattr(self, "lookahead_lane_change_offset_start", 0.15)
-                )
-                if maneuver_settled:
-                    self.external_state_lane_change_maneuvers.pop(vehicle_id, None)
-                    settled_distance = target_lateral_distance
-                    action_result = self._profile_detail_python_call(
-                        profile_ctx,
-                        "build_external_state_route_lookahead",
-                        build_external_state_lateral_action_lookahead,
-                        compiled_path,
-                        current_position,
-                        lookahead_distance,
-                        maneuver_active=False,
-                        z=vehicle_state.z,
-                    )
-                    action_result["target_lateral_distance"] = settled_distance
 
                 route_lookahead = action_result.get("route_lookahead")
                 if route_lookahead is not None:
@@ -3002,6 +2942,27 @@ class TeraSimCoSimPlugin(BasePlugin):
                 )
                 vehicle_state.lookahead_target_lateral_distance = action_result.get(
                     "target_lateral_distance"
+                )
+                vehicle_state.lookahead_route_tangent_x = action_result.get(
+                    "route_tangent_x"
+                )
+                vehicle_state.lookahead_route_tangent_y = action_result.get(
+                    "route_tangent_y"
+                )
+                vehicle_state.lookahead_world_left_normal_x = action_result.get(
+                    "world_left_normal_x"
+                )
+                vehicle_state.lookahead_world_left_normal_y = action_result.get(
+                    "world_left_normal_y"
+                )
+                vehicle_state.lookahead_phase_b_lateral_delta = action_result.get(
+                    "phase_b_lateral_delta"
+                )
+                vehicle_state.lookahead_expected_phase_b_lateral_distance = (
+                    action_result.get("expected_phase_b_lateral_distance")
+                )
+                vehicle_state.lookahead_world_lateral_speed = action_result.get(
+                    "world_lateral_speed", 0.0
                 )
                 vehicle_state.lookahead_lane_change_blend = 0.0
                 lookahead = action_result.get("lookahead")
@@ -3106,6 +3067,7 @@ class TeraSimCoSimPlugin(BasePlugin):
             self.feedback_observed_accelerations,
             self.feedback_observed_positions,
             self.feedback_observed_angles,
+            getattr(self, "feedback_requested_lane_ids", {}),
             self.feedback_observed_lane_ids,
             self.feedback_phase_a_sumo_times,
             self.feedback_observed_rear_axle_positions,
@@ -3248,9 +3210,26 @@ class TeraSimCoSimPlugin(BasePlugin):
                 vehicle_state.feedback_observed_acceleration = getattr(
                     self, "feedback_observed_accelerations", {}
                 ).get(vid)
+                vehicle_state.feedback_requested_lane_id = getattr(
+                    self, "feedback_requested_lane_ids", {}
+                ).get(vid)
                 vehicle_state.feedback_observed_lane_id = getattr(
                     self, "feedback_observed_lane_ids", {}
                 ).get(vid)
+                has_route_edges, route_edges = self._context_vehicle_value(
+                    context_values, "VAR_EDGES"
+                )
+                if not has_route_edges:
+                    try:
+                        route_edges = self._profile_detail_traci_call(
+                            profile_ctx,
+                            "vehicle_get_route",
+                            traci.vehicle.getRoute,
+                            vid,
+                        )
+                    except Exception:
+                        route_edges = ()
+                vehicle_state.sumo_route = tuple(route_edges or ())
                 vehicle_state.feedback_phase_a_sumo_time = getattr(
                     self, "feedback_phase_a_sumo_times", {}
                 ).get(vid)

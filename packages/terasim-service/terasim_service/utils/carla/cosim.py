@@ -1586,6 +1586,7 @@ class CarlaCosim(object):
         transform_batch = []
         ackermann_batch = []
         spawn_requests = []
+        self._pending_authoritative_action_error = None
 
         command_conversion_started_at = time.perf_counter()
         for veh_id, veh_info in vehicles.items():
@@ -1654,6 +1655,9 @@ class CarlaCosim(object):
         self._prune_ackermann_actor_state(vehicles.keys())
         self._prune_ackermann_feedback_state(feedback_candidate_actor_ids)
         self._prune_collision_sensors(vehicles.keys())
+        # Direct or batch full-brake controls are applied above. Propagate the
+        # invalid authoritative action only after preserving that same-cycle control.
+        self._raise_pending_authoritative_action_error()
 
         # self.sync_cosim_tls_to_carla()
 
@@ -3151,6 +3155,22 @@ class CarlaCosim(object):
         state["restart_active"] = False
         state["emergency_brake_command"] = 1.0
         state["fail_closed_reason"] = reason
+        if getattr(self, "_pending_authoritative_action_error", None) is None:
+            self._pending_authoritative_action_error = {
+                "actor_id": veh_id,
+                "reason": reason,
+            }
+
+    def _raise_pending_authoritative_action_error(self):
+        pending = getattr(self, "_pending_authoritative_action_error", None)
+        if pending is None:
+            return
+        self._pending_authoritative_action_error = None
+        actor_id = pending["actor_id"]
+        reason = pending["reason"]
+        raise RuntimeError(
+            f"invalid authoritative SUMO action actor={actor_id} reason={reason}"
+        )
 
     def _should_record_ackermann_control_trace(self, veh_id):
         if not getattr(self, "ackermann_control_log_records", False):
@@ -3222,6 +3242,14 @@ class CarlaCosim(object):
                     "action_source_carla_frame": veh_info.get(
                         "feedback_source_carla_frame"
                     ),
+                    "phase_a_requested_lane_id": veh_info.get(
+                        "feedback_requested_lane_id"
+                    ),
+                    "phase_a_observed_lane_id": veh_info.get(
+                        "feedback_observed_lane_id"
+                    ),
+                    "phase_b_live_lane_id": veh_info.get("lane_id"),
+                    "sumo_route": veh_info.get("sumo_route", ()),
                     "external_state_maneuver_current_lane_id": veh_info.get(
                         "lane_id"
                     ),
@@ -3750,6 +3778,8 @@ class CarlaCosim(object):
             "sumo_x": self._as_finite_float(veh_info.get("x")),
             "sumo_y": self._as_finite_float(veh_info.get("y")),
             "sumo_lane_id": veh_info.get("lane_id"),
+            "phase_b_live_lane_id": veh_info.get("lane_id"),
+            "sumo_route": veh_info.get("sumo_route", ()),
             "sumo_lane_position": self._as_finite_float(
                 veh_info.get("lane_position")
             ),
@@ -3779,6 +3809,27 @@ class CarlaCosim(object):
             "lookahead_target_lateral_distance": self._as_finite_float(
                 veh_info.get("lookahead_target_lateral_distance")
             ),
+            "lookahead_route_tangent_x": self._as_finite_float(
+                veh_info.get("lookahead_route_tangent_x")
+            ),
+            "lookahead_route_tangent_y": self._as_finite_float(
+                veh_info.get("lookahead_route_tangent_y")
+            ),
+            "lookahead_world_left_normal_x": self._as_finite_float(
+                veh_info.get("lookahead_world_left_normal_x")
+            ),
+            "lookahead_world_left_normal_y": self._as_finite_float(
+                veh_info.get("lookahead_world_left_normal_y")
+            ),
+            "phase_b_lateral_delta": self._as_finite_float(
+                veh_info.get("lookahead_phase_b_lateral_delta")
+            ),
+            "expected_phase_b_lateral_distance": self._as_finite_float(
+                veh_info.get("lookahead_expected_phase_b_lateral_distance")
+            ),
+            "world_lateral_speed": self._as_finite_float(
+                veh_info.get("lookahead_world_lateral_speed")
+            ),
             "lookahead_origin_x": self._as_finite_float(
                 veh_info.get("lookahead_origin_x")
             ),
@@ -3790,6 +3841,9 @@ class CarlaCosim(object):
             "carla_yaw": self._as_finite_float(current_transform.rotation.yaw),
             "phase_a_observed_acceleration": self._as_finite_float(
                 veh_info.get("feedback_observed_acceleration")
+            ),
+            "phase_a_requested_lane_id": veh_info.get(
+                "feedback_requested_lane_id"
             ),
             "phase_a_observed_lane_id": veh_info.get("feedback_observed_lane_id"),
             "sumo_lane_change_intent": veh_info.get(
