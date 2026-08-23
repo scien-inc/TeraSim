@@ -36,14 +36,11 @@ from logging.handlers import RotatingFileHandler
 from typing import Optional
 
 import numpy as np
-
 from terasim.overlay import traci
 from terasim.simulator import Simulator
-
 from terasim_nde_nade.adversity import ConstructionAdversity
 
-from .base import BasePlugin
-from ..utils import SimulationState, SUMOSignal, AgentCommand
+from ..utils import AgentCommand, SimulationState, SUMOSignal
 from ..utils.sumo_lane_geometry import (
     adapt_lookahead_distances_for_compiled_paths,
     build_external_state_lateral_action_lookahead,
@@ -52,6 +49,7 @@ from ..utils.sumo_lane_geometry import (
     reconstruct_position_from_lane_geometry,
     select_route_aware_lane_projection,
 )
+from .base import BasePlugin
 
 
 def interpolate_by_distance(points, step):
@@ -1050,11 +1048,17 @@ class TeraSimCoSimInProcessPlugin(BasePlugin):
         lane_position = traci.vehicle.getLanePosition(vehicle_id)
         lateral_offset = traci.vehicle.getLateralLanePosition(vehicle_id)
         lane_shape = traci.lane.getShape(lane_id)
+        try:
+            lane_length = traci.lane.getLength(lane_id)
+        except Exception:
+            lane_length = None
         reconstructed = reconstruct_position_from_lane_geometry(
             lane_shape,
             lane_position,
             lateral_offset,
             vehicle_state["z"],
+            lane_length,
+            (vehicle_state["x"], vehicle_state["y"]),
         )
 
         vehicle_state["lane_id"] = lane_id
@@ -1117,6 +1121,10 @@ class TeraSimCoSimInProcessPlugin(BasePlugin):
             else:
                 lon = lat = 0.0
             sumo_angle = traci.vehicle.getAngle(vid)
+            try:
+                sumo_slope = traci.vehicle.getSlope(vid)
+            except Exception:
+                sumo_slope = 0.0
             orientation = math.radians((90.0 - sumo_angle) % 360.0)
             static = static_attrs.get(vid)
             if static is None:
@@ -1149,6 +1157,7 @@ class TeraSimCoSimInProcessPlugin(BasePlugin):
                 "lon": lon,
                 "lat": lat,
                 "sumo_angle": sumo_angle,
+                "sumo_slope": sumo_slope,
                 "length": static[0],
                 "width": static[1],
                 "height": static[2],

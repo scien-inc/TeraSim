@@ -12,7 +12,6 @@ from pathlib import Path
 
 import pytest
 
-
 STEP_LENGTH = 0.05
 POSITION_TOLERANCE = 1e-6
 

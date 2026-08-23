@@ -12,10 +12,12 @@ Three tick modes (--tick_mode):
     (autoware_carla_interface) owns world.tick(); this process only follows via
     world.wait_for_tick() and mirrors TeraSim/SUMO background traffic into
     CARLA.
-  master (stage 3a) - this process is the clock master: it owns world.tick()
-    on a fixed step_length cadence (deadlines never wait for anyone) and runs
-    one SUMO step serially inside each cycle; the bridge must run passively
-    (tick_follower:=true). Design: traffic-cosim-sync-design.md §4.2.
+  master (stage 3a) - this process is the clock master: it applies the previous
+    SUMO result, owns one world.tick() on a fixed step_length cadence, collects
+    that CARLA frame's feedback, and requests one SUMO step whose result is
+    consumed by the next cycle. At most one SUMO step is pending; the bridge
+    must run passively (tick_follower:=true). Design:
+    traffic-cosim-sync-design.md §4.2.
   async (stage 3b) - nobody ticks: this process clears synchronous_mode so the
     CARLA server free-runs with a variable delta (sim time tracks real time by
     construction) and paces SUMO on a step_length wall-clock timer, catching up
@@ -82,8 +84,9 @@ def main():
                    help="follow (default): the psim bridge owns world.tick(); this "
                         "process follows via wait_for_tick (current behavior). "
                         "master: this process is the clock master (stage 3a) -- it "
-                        "ticks CARLA on a fixed step_length cadence and runs SUMO "
-                        "serially inside each cycle; the bridge must run with "
+                        "applies the previous SUMO result, ticks CARLA on a fixed "
+                        "step_length cadence, and requests the next SUMO step after "
+                        "collecting feedback; the bridge must run with "
                         "tick_follower:=true. async: nobody ticks (stage 3b) -- "
                         "CARLA free-runs with a variable delta and this process "
                         "paces SUMO on a step_length wall-clock timer; the bridge "

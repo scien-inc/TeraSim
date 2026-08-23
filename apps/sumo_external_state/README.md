@@ -26,16 +26,23 @@ the lane-change model onto the realized CARLA lateral state, releases stale
 TraCI speed overrides, and lets the in-process service apply CARLA measured
 speed and acceleration with `setPreviousSpeed`.
 
-The cycle is intentionally serial:
+The master cycle preserves the validated feature pipeline:
 
-1. CARLA advances frame N under the co-sim clock master.
-2. Phase A assimilates each selected background vehicle into its current SUMO
-   lane without changing SUMO time.
-3. TeraSim/NADE plans and the existing priority-10 `simulationStep()` advances
-   SUMO exactly 0.05 seconds.
-4. Phase B exports SUMO desired speed, acceleration, and a route/lane-change
-   lookahead target.
-5. CARLA applies Ackermann control for frame N+1.
+1. Resolve the SUMO step requested by the previous cycle and apply its Phase B
+   state and Ackermann control to CARLA. The first cycle uses the initial state
+   already published by the in-process plugin.
+2. Advance CARLA frame N exactly once under the co-sim clock master.
+3. Build the Autoware ego observation, when present, and the selected background
+   vehicle feedback from completed CARLA frame N. Background feedback commands
+   are emitted in actor-ID order, matching the feature implementation and
+   keeping eager lane-change neighborhood updates deterministic.
+4. Request one SUMO step. Phase A immediately assimilates the background
+   feedback without changing SUMO time, TeraSim/NADE plans, and the existing
+   priority-10 `simulationStep()` advances SUMO exactly 0.05 seconds before
+   Phase B exports the desired state.
+5. Keep that request pending and resolve it at the beginning of the next master
+   cycle. The newly requested step is never awaited in the same cycle, and at
+   most one SUMO step is in flight.
 
 The Autoware ego is never selected for Ackermann ownership. It keeps the normal
 CARLA-to-SUMO AV observation path.
@@ -61,11 +68,36 @@ export USE_LIBSUMO=0
 python -m terasim_service.run_cosim --tick_mode master ...
 ```
 
+The feature-tip control defaults are retained: feedback ack lag is 2 frames,
+the consecutive ack failure limit is 3, restart enter/release speeds are
+0.05/0.2 m/s, and the bounded restart target is at most 0.3 m/s. These remain
+overridable with the existing `CARLA_COSIM_ACKERMANN_*` environment variables.
+
+Diagnostics are opt-in and do not alter control behavior:
+
+```bash
+export CARLA_COSIM_ACKERMANN_CONTROL_LOG_RECORDS=1
+export CARLA_COSIM_ACKERMANN_CONTROL_LOG_ACTORS='*'
+export CARLA_COSIM_INITIALIZATION_DIAGNOSTICS_ENABLED=1
+export CARLA_COSIM_INITIALIZATION_LOG=/app/outputs/carla_physics_initialization.jsonl
+export CARLA_COSIM_COLLISION_SENSOR_ENABLED=1
+export CARLA_COSIM_COLLISION_LOG=/app/outputs/carla_collision_events.jsonl
+export CARLA_COSIM_COLLISION_SUMMARY=/app/outputs/carla_collision_summary.json
+export CARLA_COSIM_SPAWN_MAX_ATTEMPTS=3
+```
+
 The dedicated physical launcher sets `USE_LIBSUMO=0`, matching the 3-way
 workflow. This runs the patched SUMO engine as a TraCI child process instead
 of loading libsumo into TeraSim's simulation thread. Both generated Python
 APIs expose `moveToXYImmediate`; focused integration tests cover TraCI and
 libsumo, while the Odaiba physical 3-way run is validated through TraCI.
+
+Acceptance uses CARLA world `odaiba_default_carla_repaired`, SUMO net
+`/var/tmp/share/maps_0821/network.repaired_geometry.net.xml`, and route
+`/var/tmp/share/maps_0821/vehicles.filtered_r300.rou.xml`. The two-way physical
+run is exercised for 12,000 synchronized steps with TraCI and again with
+libsumo before adding the Autoware ego for the 6,000-step three-way run.
+`odaiba_osmlike` and CARLA `odaiba_tl_mapping` are not acceptance maps.
 
 `examples/scripts/check_physics_motion.py` requires a non-ego CARLA vehicle to
 show both displacement and non-zero speed. The personal one-command launcher

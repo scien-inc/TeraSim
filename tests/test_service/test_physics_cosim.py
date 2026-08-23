@@ -1,3 +1,5 @@
+import json
+import tempfile
 import unittest
 from threading import Event, Lock
 from types import SimpleNamespace
@@ -7,6 +9,7 @@ from terasim_service.plugins import cosim_inprocess
 from terasim_service.plugins.cosim_inprocess import TeraSimCoSimInProcessPlugin
 from terasim_service.utils import AgentCommand
 from terasim_service.utils import base as service_base
+from terasim_service.utils.carla import cosim as carla_cosim
 from terasim_service.utils.carla.ackermann_control import (
     AckermannTuning,
     compute_ackermann_control_values,
@@ -88,6 +91,70 @@ class _FakeLane:
 
 
 class PhysicalCosimTest(unittest.TestCase):
+    def test_initial_inprocess_state_exports_sumo_road_slope(self):
+        fake_vehicle = SimpleNamespace(
+            getPosition3D=lambda _actor_id: (10.0, 20.0, 1.0),
+            getAngle=lambda _actor_id: 90.0,
+            getSlope=lambda _actor_id: 3.25,
+            getLength=lambda _actor_id: 4.8,
+            getWidth=lambda _actor_id: 1.8,
+            getHeight=lambda _actor_id: 1.5,
+            getTypeID=lambda _actor_id: "vehicle_passenger",
+            getSpeed=lambda _actor_id: 5.0,
+            getAcceleration=lambda _actor_id: 0.25,
+            getIDList=lambda: ("vehicle0",),
+        )
+        fake_traci = SimpleNamespace(
+            vehicle=fake_vehicle,
+            person=SimpleNamespace(getIDList=lambda: ()),
+            simulation=SimpleNamespace(getTime=lambda: 500.05),
+        )
+
+        plugin = object.__new__(TeraSimCoSimInProcessPlugin)
+        plugin.get_vehicle_vru_ids = lambda: (("vehicle0",), (), ())
+        plugin._filter_vehicle_ids_for_state = lambda vehicle_ids: (vehicle_ids, {})
+        plugin._cache_prune_countdown = 1
+        plugin.last_orientations = {}
+        plugin._static_attr_cache = {}
+        plugin.state_lonlat_enabled = False
+        plugin.lane_relative_position_enabled = False
+        plugin._populate_physics_action_state = lambda _actor_id, _state: None
+        plugin._tls_static_cache = {}
+        plugin.construction_zone_shapes = {}
+
+        with patch.object(cosim_inprocess, "traci", fake_traci):
+            state = plugin._build_simulation_state(SimpleNamespace())
+
+        self.assertEqual(
+            state.agent_details["vehicle"]["vehicle0"]["sumo_slope"],
+            3.25,
+        )
+
+    def test_inprocess_lane_reconstruction_matches_feature_inputs(self):
+        fake_traci = SimpleNamespace(
+            vehicle=SimpleNamespace(
+                getLaneID=lambda _actor_id: "edge_0_0",
+                getLanePosition=lambda _actor_id: 50.0,
+                getLateralLanePosition=lambda _actor_id: 1.0,
+            ),
+            lane=SimpleNamespace(
+                getShape=lambda _lane_id: ((0.0, 0.0), (80.0, 0.0)),
+                getLength=lambda _lane_id: 100.0,
+            ),
+        )
+        plugin = object.__new__(TeraSimCoSimInProcessPlugin)
+        plugin.lane_relative_position_enabled = True
+        state = {"x": 40.0, "y": -1.0, "z": 2.0}
+
+        with patch.object(cosim_inprocess, "traci", fake_traci):
+            plugin._populate_lane_relative_position("vehicle0", state)
+
+        self.assertEqual(state["lane_id"], "edge_0_0")
+        self.assertAlmostEqual(state["reconstructed_x"], 40.0)
+        self.assertAlmostEqual(state["reconstructed_y"], -1.0)
+        self.assertAlmostEqual(state["reconstructed_z"], 2.0)
+        self.assertTrue(state["reconstructed_position_valid"])
+
     def test_ackermann_steer_is_rate_limited_toward_lookahead(self):
         values = compute_ackermann_control_values(
             current_x=0.0,
@@ -307,49 +374,583 @@ class PhysicalCosimTest(unittest.TestCase):
         self.assertTrue(plugin.function_before_env_step(None, None))
         self.assertEqual(plugin.physics_feedback_observations, {})
 
+    def test_master_tick_matches_feature_pipeline_and_defers_new_result(self):
+        events = []
+        frames = iter((101, 102))
+
+        class FakeHandle:
+            def __init__(self, response):
+                self.response = response
+                self.result_calls = 0
+
+            def result(self, timeout):
+                self.result_calls += 1
+                events.append(("previous_result", timeout))
+                return self.response
+
+        requested_handles = []
+
+        def request_tick(commands):
+            events.append(("request_sumo", commands))
+            handle = FakeHandle(
+                SimpleNamespace(status="ticked", state={"state": "post_step"})
+            )
+            requested_handles.append(handle)
+            return handle
+
+        cosim = object.__new__(CarlaCosim)
+        cosim._inproc_tick_handle = None
+        cosim._inproc_prev_state = {"state": "initial"}
+        cosim._next_tick_deadline = None
+        cosim.step_length = 0.05
+        cosim.args = SimpleNamespace(skip_tls=True)
+        cosim.control_av = True
+        cosim.inprocess_plugin = SimpleNamespace(tick_async=request_tick)
+        cosim.world = SimpleNamespace(
+            tick=lambda: events.append("carla_tick") or next(frames)
+        )
+        cosim.sync_cosim_actor_to_carla = lambda state: events.append(
+            ("apply_state", state)
+        )
+        cosim._build_av_command = lambda: events.append(
+            ("build_av", cosim._last_world_frame)
+        ) or {"agent_id": "AV", "source_carla_frame": cosim._last_world_frame}
+        cosim._build_physics_feedback_commands = lambda: events.append(
+            ("build_feedback", cosim._last_world_frame)
+        ) or [
+            {
+                "agent_id": "vehicle0",
+                "source_carla_frame": cosim._last_world_frame,
+            }
+        ]
+        cosim._apply_physics_fail_closed_brake = lambda reason: events.append(
+            ("brake", reason)
+        )
+        cosim._tick_times_ms = []
+        cosim._tick_time_hist = [0] * 11
+        cosim._tick_veh_min = None
+        cosim._tick_veh_max = None
+        cosim._vehicle_actor_index = {}
+
+        self.assertTrue(cosim._tick_master())
+        first_handle = requested_handles[0]
+        self.assertEqual(first_handle.result_calls, 0)
+        self.assertEqual(
+            events,
+            [
+                ("apply_state", {"state": "initial"}),
+                "carla_tick",
+                ("build_av", 101),
+                ("build_feedback", 101),
+                (
+                    "request_sumo",
+                    [
+                        {"agent_id": "AV", "source_carla_frame": 101},
+                        {"agent_id": "vehicle0", "source_carla_frame": 101},
+                    ],
+                ),
+            ],
+        )
+
+        events.clear()
+        self.assertTrue(cosim._tick_master())
+        self.assertEqual(first_handle.result_calls, 1)
+        self.assertEqual(requested_handles[1].result_calls, 0)
+        self.assertEqual(
+            events,
+            [
+                ("previous_result", 300.0),
+                ("apply_state", {"state": "post_step"}),
+                "carla_tick",
+                ("build_av", 102),
+                ("build_feedback", 102),
+                (
+                    "request_sumo",
+                    [
+                        {"agent_id": "AV", "source_carla_frame": 102},
+                        {"agent_id": "vehicle0", "source_carla_frame": 102},
+                    ],
+                ),
+            ],
+        )
+
+    def test_master_does_not_delay_first_ackermann_control_for_phase_a_feedback(self):
+        cosim = object.__new__(CarlaCosim)
+        cosim.ackermann_feedback_apply_enabled = True
+        cosim.ackermann_feedback_actor_ids = {"*"}
+        cosim._physics_feedback_frames = {}
+
+        cosim.tick_master = True
+        self.assertFalse(cosim._waits_for_first_phase_a_feedback("vehicle0"))
+
+        cosim.tick_master = False
+        self.assertTrue(cosim._waits_for_first_phase_a_feedback("vehicle0"))
+
+        cosim._physics_feedback_frames["vehicle0"] = 101
+        self.assertFalse(cosim._waits_for_first_phase_a_feedback("vehicle0"))
+
+    def test_physics_feedback_commands_use_feature_actor_id_order(self):
+        collected_actor_ids = []
+        cosim = object.__new__(CarlaCosim)
+        cosim.ackermann_feedback_apply_enabled = True
+        cosim._inproc_prev_state = {
+            "agent_details": {
+                "vehicle": {
+                    "vehicle9": {"speed": 9.0},
+                    "AV": {"speed": 0.0},
+                    "vehicle10": {"speed": 10.0},
+                    "vehicle2": {"speed": 2.0},
+                }
+            }
+        }
+        cosim._last_world_frame = 123
+        cosim._vehicle_actor_index = {
+            actor_id: SimpleNamespace(id=actor_id)
+            for actor_id in ("vehicle9", "vehicle10", "vehicle2")
+        }
+        cosim._ackermann_actor_state = {}
+        cosim._physics_feedback_frames = {}
+        cosim._ackermann_feedback_state = {}
+        cosim._is_ackermann_feedback_actor = lambda actor_id: actor_id != "AV"
+
+        def collect(actor_id, _actor, vehicle_info):
+            collected_actor_ids.append(actor_id)
+            return {"speed": vehicle_info["speed"]}
+
+        cosim._carla_actor_to_sumo_feedback = collect
+        cosim._clear_physics_feedback_failure = lambda _actor_id: None
+
+        commands = cosim._build_physics_feedback_commands()
+
+        self.assertEqual(
+            collected_actor_ids,
+            ["vehicle10", "vehicle2", "vehicle9"],
+        )
+        self.assertEqual(
+            [command["agent_id"] for command in commands],
+            ["vehicle10", "vehicle2", "vehicle9"],
+        )
+        self.assertTrue(
+            all(command["data"]["source_carla_frame"] == 123 for command in commands)
+        )
+
+    def test_master_previous_step_failure_brakes_before_advancing_carla(self):
+        events = []
+
+        class FailedHandle:
+            @staticmethod
+            def result(timeout):
+                events.append(("previous_result", timeout))
+                raise TimeoutError("SUMO did not finish")
+
+        cosim = object.__new__(CarlaCosim)
+        cosim._inproc_tick_handle = FailedHandle()
+        cosim._inproc_prev_state = {"state": "stale"}
+        cosim._apply_physics_fail_closed_brake = lambda reason: events.append(
+            ("brake", reason)
+        )
+        cosim.sync_cosim_actor_to_carla = lambda _state: events.append("apply_state")
+        cosim.world = SimpleNamespace(tick=lambda: events.append("carla_tick"))
+        cosim.inprocess_plugin = SimpleNamespace(
+            tick_async=lambda _commands: events.append("request_sumo")
+        )
+
+        self.assertFalse(cosim._tick_master())
+        self.assertEqual(
+            events,
+            [
+                ("previous_result", 300.0),
+                ("brake", "inprocess_tick_error:TimeoutError"),
+            ],
+        )
+
+    def test_master_ended_step_brakes_before_advancing_carla(self):
+        events = []
+        handle = SimpleNamespace(
+            result=lambda timeout: events.append(("previous_result", timeout))
+            or SimpleNamespace(status="error", state=None)
+        )
+        cosim = object.__new__(CarlaCosim)
+        cosim._inproc_tick_handle = handle
+        cosim._inproc_prev_state = {"state": "stale"}
+        cosim._apply_physics_fail_closed_brake = lambda reason: events.append(
+            ("brake", reason)
+        )
+        cosim.sync_cosim_actor_to_carla = lambda _state: events.append("apply_state")
+        cosim.world = SimpleNamespace(tick=lambda: events.append("carla_tick"))
+
+        self.assertFalse(cosim._tick_master())
+        self.assertEqual(
+            events,
+            [("previous_result", 300.0), ("brake", "error")],
+        )
+
+    def test_master_request_failure_brakes_after_current_carla_frame(self):
+        events = []
+        cosim = object.__new__(CarlaCosim)
+        cosim._inproc_tick_handle = None
+        cosim._inproc_prev_state = {"state": "initial"}
+        cosim._next_tick_deadline = None
+        cosim.step_length = 0.05
+        cosim.args = SimpleNamespace(skip_tls=True)
+        cosim.control_av = False
+        cosim.world = SimpleNamespace(
+            tick=lambda: events.append("carla_tick") or 201
+        )
+        cosim.sync_cosim_actor_to_carla = lambda state: events.append(
+            ("apply_state", state)
+        )
+        cosim._build_physics_feedback_commands = lambda: events.append(
+            ("build_feedback", cosim._last_world_frame)
+        ) or []
+
+        def request_tick(_commands):
+            events.append("request_sumo")
+            raise RuntimeError("request rejected")
+
+        cosim.inprocess_plugin = SimpleNamespace(tick_async=request_tick)
+        cosim._apply_physics_fail_closed_brake = lambda reason: events.append(
+            ("brake", reason)
+        )
+        cosim._tick_times_ms = []
+        cosim._tick_time_hist = [0] * 11
+        cosim._tick_veh_min = None
+        cosim._tick_veh_max = None
+        cosim._vehicle_actor_index = {}
+
+        self.assertFalse(cosim._tick_master())
+        self.assertEqual(
+            events,
+            [
+                ("apply_state", {"state": "initial"}),
+                "carla_tick",
+                ("build_feedback", 201),
+                "request_sumo",
+                ("brake", "inprocess_tick_request_error:RuntimeError"),
+            ],
+        )
+
+    def test_tick_dispatch_keeps_follow_and_async_paths_separate(self):
+        cosim = object.__new__(CarlaCosim)
+        calls = []
+        cosim._tick_master = lambda: calls.append("master") or "master"
+        cosim._tick_async = lambda: calls.append("async") or "async"
+        cosim._tick_follow = lambda: calls.append("follow") or "follow"
+
+        cosim.tick_master = False
+        cosim.tick_async = False
+        self.assertEqual(cosim.tick(), "follow")
+        cosim.tick_async = True
+        self.assertEqual(cosim.tick(), "async")
+        cosim.tick_master = True
+        self.assertEqual(cosim.tick(), "master")
+        self.assertEqual(calls, ["follow", "async", "master"])
+
     def test_physics_initialization_waits_one_completed_carla_frame(self):
         calls = []
 
         class FakeActor:
+            id = 10
+
+            def __init__(self, transform):
+                self.transform = transform
+                self.velocity = carla_cosim.carla.Vector3D(0.0, 0.0, 0.0)
+
             def set_simulate_physics(self, enabled):
                 calls.append(("physics", enabled))
 
             def set_transform(self, transform):
                 calls.append(("transform", transform))
+                self.transform = transform
 
             def set_target_velocity(self, velocity):
                 calls.append(("velocity", velocity.x, velocity.y, velocity.z))
+                self.velocity = velocity
 
-        transform = SimpleNamespace(
-            get_forward_vector=lambda: SimpleNamespace(x=1.0, y=0.0)
+            def set_target_angular_velocity(self, velocity):
+                calls.append(("angular_velocity", velocity.x, velocity.y, velocity.z))
+
+            def get_transform(self):
+                return self.transform
+
+            def get_velocity(self):
+                return self.velocity
+
+            def get_physics_control(self):
+                return SimpleNamespace(wheels=[])
+
+            def apply_ackermann_controller_settings(self, settings):
+                calls.append(("configure", settings))
+
+        transform = carla_cosim.carla.Transform(
+            carla_cosim.carla.Location(x=1.0, y=2.0, z=0.5),
+            carla_cosim.carla.Rotation(pitch=0.0, yaw=0.0, roll=0.0),
         )
-        actor = FakeActor()
+        elevated = CarlaCosim._transform_with_z_offset(transform, 5.0)
+        actor = FakeActor(elevated)
         cosim = object.__new__(CarlaCosim)
         cosim._ackermann_actor_state = {}
-        cosim._last_world_frame = 100
-        cosim._configure_ackermann_actor = lambda configured_actor: calls.append(
-            ("configure", configured_actor)
+        cosim._vehicle_actor_index = {"vehicle0": actor}
+        cosim.spawn_max_attempts = 3
+        cosim.spawn_z_clearance = 5.0
+        cosim.initialization_diagnostics_enabled = False
+        cosim.ackermann_tuning = AckermannTuning()
+        cosim.ackermann_controller_tuning = SimpleNamespace(
+            speed_kp=1.0,
+            speed_ki=0.0,
+            speed_kd=0.0,
+            accel_kp=0.05,
+            accel_ki=0.0,
+            accel_kd=0.0,
+        )
+        frame = {"value": 100}
+        cosim.world = SimpleNamespace(
+            get_snapshot=lambda: SimpleNamespace(frame=frame["value"])
         )
 
         self.assertFalse(
-            cosim._initialize_ackermann_actor(actor, "vehicle0", transform, 4.0)
+            cosim._prepare_ackermann_actor_physics(
+                actor, "vehicle0", 4.0, transform, elevated
+            )
         )
-        self.assertEqual([call[0] for call in calls], ["physics", "transform"])
-
         self.assertFalse(
-            cosim._initialize_ackermann_actor(actor, "vehicle0", transform, 4.0)
+            cosim._ensure_ackermann_actor_physics(
+                actor, "vehicle0", 4.0, transform
+            )
         )
-        self.assertEqual([call[0] for call in calls], ["physics", "transform"])
+        self.assertNotIn(("physics", True), calls)
 
-        cosim._last_world_frame = 101
+        frame["value"] = 101
+        self.assertFalse(
+            cosim._ensure_ackermann_actor_physics(
+                actor, "vehicle0", 4.0, transform
+            )
+        )
+        self.assertIn(("physics", True), calls)
+
+        frame["value"] = 102
+        self.assertFalse(
+            cosim._ensure_ackermann_actor_physics(
+                actor, "vehicle0", 4.0, transform
+            )
+        )
+        frame["value"] = 103
+        self.assertFalse(
+            cosim._ensure_ackermann_actor_physics(
+                actor, "vehicle0", 4.0, transform
+            )
+        )
+        frame["value"] = 104
         self.assertTrue(
-            cosim._initialize_ackermann_actor(actor, "vehicle0", transform, 4.0)
+            cosim._ensure_ackermann_actor_physics(
+                actor, "vehicle0", 4.0, transform
+            )
         )
+        state = cosim._ackermann_actor_state["vehicle0"]
+        self.assertFalse(state["physics_initialization_pending"])
+        self.assertEqual(state["physics_stable_ticks"], 3)
+
+    def test_feedback_frame_failure_brakes_then_propagates_on_third_failure(self):
+        cosim = object.__new__(CarlaCosim)
+        cosim._ackermann_actor_state = {}
+        cosim._physics_feedback_failures = {}
+        cosim._ackermann_feedback_state = {}
+        cosim._ackermann_fail_closed_reasons = {}
+        cosim._pending_authoritative_action_error = None
+        cosim.ackermann_feedback_ack_max_frame_lag = 2
+        cosim.ackermann_feedback_ack_failure_limit = 3
+
+        feedback = {"feedback_status": "queued", "source_carla_frame": 100}
+        self.assertFalse(cosim._is_ackermann_feedback_healthy("vehicle0", feedback, 99))
+        self.assertFalse(cosim._is_ackermann_feedback_healthy("vehicle0", feedback, 99))
+        self.assertIsNone(cosim._pending_authoritative_action_error)
+        self.assertFalse(cosim._is_ackermann_feedback_healthy("vehicle0", feedback, 99))
         self.assertEqual(
-            [call[0] for call in calls],
-            ["physics", "transform", "physics", "velocity", "configure"],
+            cosim._pending_authoritative_action_error["actor_id"], "vehicle0"
         )
-        self.assertTrue(cosim._ackermann_actor_state["vehicle0"]["initialized"])
+
+        calls = []
+        cosim._apply_ackermann_fail_closed_brake = calls.append
+        with self.assertRaisesRegex(RuntimeError, "feedback_frame_mismatch"):
+            cosim._raise_pending_authoritative_action_error()
+        self.assertEqual(calls, ["feedback_frame_mismatch"])
+
+    def test_newly_initialized_actor_waits_for_first_phase_a_feedback(self):
+        cosim = object.__new__(CarlaCosim)
+        cosim.ackermann_feedback_apply_enabled = True
+        cosim.ackermann_feedback_actor_ids = {"*"}
+        cosim._physics_feedback_frames = {}
+
+        self.assertTrue(cosim._waits_for_first_phase_a_feedback("vehicle0"))
+        self.assertFalse(cosim._waits_for_first_phase_a_feedback("AV"))
+
+        cosim._physics_feedback_frames["vehicle0"] = 101
+        self.assertFalse(cosim._waits_for_first_phase_a_feedback("vehicle0"))
+
+    def test_restart_target_is_bounded_and_releases_at_feature_threshold(self):
+        cosim = object.__new__(CarlaCosim)
+        cosim._ackermann_actor_state = {}
+        cosim.ackermann_tuning = AckermannTuning()
+        cosim.step_length = 0.05
+        cosim._is_ackermann_feedback_apply_actor = lambda _actor_id: True
+        vehicle_info = {
+            "sumo_desired_speed": 0.1,
+            "feedback_observed_speed": 0.0,
+            "acceleration": 2.0,
+            "sumo_emergency_decel": 8.0,
+        }
+
+        target, acceleration = cosim._resolve_ackermann_longitudinal_target(
+            "vehicle0", vehicle_info, 0.0
+        )
+        self.assertAlmostEqual(target, 0.1)
+        self.assertAlmostEqual(acceleration, 2.0)
+        self.assertTrue(cosim._ackermann_actor_state["vehicle0"]["restart_active"])
+
+        for _ in range(10):
+            target, _ = cosim._resolve_ackermann_longitudinal_target(
+                "vehicle0", vehicle_info, 0.0
+            )
+        self.assertAlmostEqual(target, 0.3)
+
+        cosim._resolve_ackermann_longitudinal_target(
+            "vehicle0", vehicle_info, 0.2
+        )
+        self.assertFalse(cosim._ackermann_actor_state["vehicle0"]["restart_active"])
+
+    def test_emergency_brake_retains_steer_and_releases_after_hysteresis(self):
+        cosim = object.__new__(CarlaCosim)
+        cosim._ackermann_actor_state = {
+            "vehicle0": {
+                "sumo_requested_acceleration": -5.0,
+                "sumo_emergency_decel": 8.0,
+            }
+        }
+        cosim.ackermann_tuning = AckermannTuning()
+        cosim.ackermann_emergency_brake_tuning = (
+            carla_cosim.AckermannEmergencyBrakeTuning()
+        )
+        cosim.ackermann_feedback_apply_enabled = True
+        cosim._is_ackermann_feedback_apply_actor = lambda _actor_id: True
+
+        control = cosim._update_ackermann_emergency_brake(
+            "vehicle0", SimpleNamespace(), 5.0, ackermann_steer=0.3
+        )
+        self.assertIsNotNone(control)
+        self.assertAlmostEqual(control.brake, 0.625)
+        self.assertAlmostEqual(control.steer, 0.5)
+
+        state = cosim._ackermann_actor_state["vehicle0"]
+        state["sumo_requested_acceleration"] = -0.5
+        for _ in range(2):
+            self.assertIsNotNone(
+                cosim._update_ackermann_emergency_brake(
+                    "vehicle0", SimpleNamespace(), 5.0, ackermann_steer=0.3
+                )
+            )
+        self.assertIsNone(
+            cosim._update_ackermann_emergency_brake(
+                "vehicle0", SimpleNamespace(), 5.0, ackermann_steer=0.3
+            )
+        )
+
+    def test_healthy_phase_aligned_action_builds_ackermann_command(self):
+        transform = carla_cosim.carla.Transform(
+            carla_cosim.carla.Location(x=0.0, y=0.0, z=0.0),
+            carla_cosim.carla.Rotation(yaw=0.0),
+        )
+        actor = SimpleNamespace(
+            get_transform=lambda: transform,
+            get_velocity=lambda: carla_cosim.carla.Vector3D(0.0, 0.0, 0.0),
+            get_acceleration=lambda: carla_cosim.carla.Vector3D(0.0, 0.0, 0.0),
+            get_control=lambda: carla_cosim.carla.VehicleControl(),
+        )
+        cosim = object.__new__(CarlaCosim)
+        cosim._ackermann_actor_state = {
+            "vehicle0": {
+                "wheel_base_m": 2.8,
+                "rear_axle_local_x_m": -1.4,
+                "front_bumper_local_x_m": 2.5,
+            }
+        }
+        cosim._ackermann_feedback_state = {
+            "vehicle0": {"feedback_status": "queued", "source_carla_frame": 100}
+        }
+        cosim._physics_feedback_failures = {}
+        cosim._ackermann_fail_closed_reasons = {}
+        cosim._pending_authoritative_action_error = None
+        cosim.ackermann_feedback_ack_max_frame_lag = 2
+        cosim.ackermann_feedback_ack_failure_limit = 3
+        cosim.ackermann_feedback_apply_enabled = True
+        cosim.ackermann_tuning = AckermannTuning()
+        cosim.ackermann_emergency_brake_tuning = (
+            carla_cosim.AckermannEmergencyBrakeTuning()
+        )
+        cosim.ackermann_control_log_records = False
+        cosim.ackermann_warn_error_m = 3.0
+        cosim.ackermann_snap_error_m = 8.0
+        cosim.ackermann_warning_interval = 2.0
+        cosim.step_length = 0.05
+        cosim._is_ackermann_feedback_apply_actor = lambda _actor_id: True
+        cosim._sumo_point_to_carla_location = lambda location: (
+            carla_cosim.carla.Location(x=location[0], y=location[1], z=location[2])
+        )
+        vehicle_info = {
+            "length": 5.0,
+            "sumo_desired_speed": 5.0,
+            "feedback_observed_speed": 0.0,
+            "feedback_source_carla_frame": 100,
+            "feedback_longitudinal_error": 0.0,
+            "acceleration": 1.0,
+            "sumo_emergency_decel": 8.0,
+            "lookahead_action_valid": True,
+            "lookahead_position_valid": True,
+            "lookahead_x": 10.0,
+            "lookahead_y": 0.0,
+            "lookahead_z": 0.0,
+        }
+
+        control = cosim._build_ackermann_control(
+            "vehicle0", vehicle_info, actor, [0.0, 0.0, 0.0], 90.0, transform
+        )
+        self.assertAlmostEqual(control.speed, 5.0)
+        self.assertAlmostEqual(control.acceleration, 1.0)
+        self.assertEqual(
+            cosim._ackermann_actor_state["vehicle0"]["control_mode"], "ackermann"
+        )
+
+    def test_initialization_diagnostic_and_footprint_overlap(self):
+        overlapping = {
+            "center": (0.0, 0.0),
+            "axes": ((1.0, 0.0), (0.0, 1.0)),
+            "half_extents": (2.0, 1.0),
+            "center_z": 0.5,
+            "half_z": 0.5,
+        }
+        separated = dict(overlapping, center=(10.0, 0.0))
+        self.assertTrue(
+            CarlaCosim._ackermann_footprints_overlap(overlapping, overlapping)
+        )
+        self.assertFalse(
+            CarlaCosim._ackermann_footprints_overlap(overlapping, separated)
+        )
+
+        cosim = object.__new__(CarlaCosim)
+        cosim.initialization_diagnostics_enabled = True
+        cosim._diagnostic_lock = None
+        cosim._initialization_failure_counts = {}
+        cosim._current_carla_frame = lambda: 123
+        with tempfile.TemporaryDirectory() as directory:
+            cosim.initialization_log_path = f"{directory}/initialization.jsonl"
+            actor = SimpleNamespace(id=10, type_id="vehicle.test", attributes={})
+            cosim._record_initialization_diagnostic(
+                "failure", actor, "vehicle0", reason="overlap=vehicle1", attempt=1
+            )
+            with open(cosim.initialization_log_path, encoding="utf-8") as output:
+                record = json.loads(output.read())
+        self.assertEqual(record["carla_frame"], 123)
+        self.assertEqual(record["vehicle_id"], "vehicle0")
+        self.assertEqual(cosim._initialization_failure_counts["overlap"], 1)
 
     def test_physics_selection_never_takes_autoware_ego(self):
         cosim = object.__new__(CarlaCosim)
