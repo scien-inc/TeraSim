@@ -272,7 +272,6 @@ class TeraSimCoSimInProcessPlugin(BasePlugin):
         self.physics_feedback_observations = {}
         self.physics_lane_geometry_cache = {}
         self.physics_lookahead_path_cache = {}
-        self.physics_lane_change_maneuvers = {}
         self.physics_lookahead_min_distance = max(
             0.1, float(os.getenv("CARLA_COSIM_ACKERMANN_LOOKAHEAD_MIN_DISTANCE", "7.0"))
         )
@@ -787,6 +786,7 @@ class TeraSimCoSimInProcessPlugin(BasePlugin):
             "sumo_angle": observed_angle,
             "speed": observed_speed,
             "acceleration": observed_acceleration,
+            "requested_lane_id": projection["lane_id"],
             "lane_id": observed_lane_id,
             "lane_position": lane_position,
             "lane_length": lane_length,
@@ -795,62 +795,55 @@ class TeraSimCoSimInProcessPlugin(BasePlugin):
         }
         return True
 
-    @staticmethod
-    def _physics_lane_change_target_lane_id(current_lane_id, current_lane_index, direction):
-        if not current_lane_id or direction not in {-1, 1}:
-            return ""
-        target_index = current_lane_index + direction
-        if target_index < 0:
-            return ""
-        prefix, separator, suffix = current_lane_id.rpartition("_")
-        if not separator or not prefix or not suffix.isdigit():
-            return ""
-        return f"{prefix}_{target_index}"
-
     def _physics_lane_change_action(self, vehicle_id, current_lane_id):
         try:
             left_state = traci.vehicle.getLaneChangeState(vehicle_id, 1)[1]
             right_state = traci.vehicle.getLaneChangeState(vehicle_id, -1)[1]
-            current_index = traci.vehicle.getLaneIndex(vehicle_id)
         except Exception:
             return "none", ""
         wants_left = bool(left_state & traci.constants.LCA_LEFT)
         wants_right = bool(right_state & traci.constants.LCA_RIGHT)
         if wants_left == wants_right:
             return "none", ""
-        direction = 1 if wants_left else -1
-        return (
-            "left" if wants_left else "right",
-            self._physics_lane_change_target_lane_id(
-                current_lane_id, current_index, direction
-            ),
-        )
+        return ("left" if wants_left else "right"), ""
 
     def _physics_compiled_lookahead_path(self, vehicle_id, current_lane_id):
-        lane_ids = [current_lane_id]
         try:
-            next_links = traci.vehicle.getNextLinks(vehicle_id)
+            current_lane_id = traci.vehicle.getLaneID(vehicle_id)
         except Exception:
-            next_links = ()
-        for lane_id in extract_next_link_lane_ids(next_links):
+            return None
+        try:
+            next_links = tuple(traci.vehicle.getNextLinks(vehicle_id) or ())[:1]
+        except Exception:
+            return None
+
+        next_lane_ids = extract_next_link_lane_ids(next_links)
+        lane_ids = []
+        for lane_id in [current_lane_id, *next_lane_ids]:
             if lane_id and lane_id not in lane_ids:
                 lane_ids.append(lane_id)
+        if not lane_ids:
+            return None
+
         key = tuple(lane_ids)
         if key in self.physics_lookahead_path_cache:
             return self.physics_lookahead_path_cache[key]
+
         shapes = []
         valid_ids = []
         for lane_id in lane_ids:
             try:
                 geometry = self._physics_lane_geometry(lane_id)
             except Exception:
-                continue
-            if len(geometry["shape"]) >= 2:
-                shapes.append(geometry["shape"])
-                valid_ids.append(lane_id)
+                break
+            if len(geometry["shape"]) < 2:
+                break
+            shapes.append(geometry["shape"])
+            valid_ids.append(lane_id)
+
         compiled = compile_lane_shapes(shapes)
-        self.physics_lookahead_path_cache[key] = compiled
-        if tuple(valid_ids) != key:
+        if compiled is not None:
+            self.physics_lookahead_path_cache[key] = compiled
             self.physics_lookahead_path_cache.setdefault(tuple(valid_ids), compiled)
         return compiled
 
@@ -876,11 +869,15 @@ class TeraSimCoSimInProcessPlugin(BasePlugin):
         vehicle_state["feedback_observed_sumo_angle"] = observation["sumo_angle"]
         vehicle_state["feedback_observed_speed"] = observation["speed"]
         vehicle_state["feedback_observed_acceleration"] = observation["acceleration"]
+        vehicle_state["feedback_requested_lane_id"] = observation[
+            "requested_lane_id"
+        ]
         vehicle_state["feedback_observed_lane_id"] = observation["lane_id"]
         vehicle_state["feedback_phase_a_sumo_time"] = observation["phase_a_time"]
         vehicle_state["feedback_source_carla_frame"] = observation[
             "source_carla_frame"
         ]
+        vehicle_state["feedback_longitudinal_error"] = None
         try:
             vehicle_state["sumo_desired_speed"] = traci.vehicle.getSpeedWithoutTraCI(
                 vehicle_id
@@ -894,9 +891,55 @@ class TeraSimCoSimInProcessPlugin(BasePlugin):
         except Exception:
             vehicle_state["sumo_emergency_decel"] = None
 
-        current_lane_id = vehicle_state.get("lane_id") or traci.vehicle.getLaneID(
-            vehicle_id
-        )
+        try:
+            current_lane_id = traci.vehicle.getLaneID(vehicle_id)
+        except Exception:
+            current_lane_id = vehicle_state.get("lane_id", "")
+        current_position_error = ""
+        try:
+            current_position = tuple(traci.vehicle.getPosition(vehicle_id)[:2])
+        except Exception:
+            current_position = (vehicle_state["x"], vehicle_state["y"])
+            current_position_error = "phase_b_position_api_failed"
+        try:
+            current_lane_position = traci.vehicle.getLanePosition(vehicle_id)
+        except Exception:
+            current_lane_position = vehicle_state.get("lane_position")
+        try:
+            sumo_route = tuple(traci.vehicle.getRoute(vehicle_id))
+        except Exception:
+            sumo_route = ()
+        try:
+            sumo_slope = traci.vehicle.getSlope(vehicle_id)
+        except Exception:
+            sumo_slope = 0.0
+
+        vehicle_state["lane_id"] = current_lane_id
+        vehicle_state["lane_position"] = current_lane_position
+        vehicle_state["sumo_route"] = sumo_route
+        vehicle_state["sumo_slope"] = sumo_slope
+        vehicle_state["external_state_maneuver_source_lane_id"] = ""
+        vehicle_state["external_state_maneuver_target_lane_id"] = ""
+
+        observed_lane_position = observation.get("lane_position")
+        observed_lane_length = observation.get("lane_length")
+        if observed_lane_position is not None and current_lane_position is not None:
+            if current_lane_id == observation["lane_id"]:
+                progress_delta = current_lane_position - observed_lane_position
+            elif observed_lane_length is not None:
+                progress_delta = (
+                    observed_lane_length
+                    - observed_lane_position
+                    + current_lane_position
+                )
+            else:
+                progress_delta = None
+            if progress_delta is not None:
+                vehicle_state["feedback_longitudinal_error"] = (
+                    progress_delta
+                    - float(observation["speed"]) * self.physics_step_length
+                )
+
         intent, target_lane_id = self._physics_lane_change_action(
             vehicle_id, current_lane_id
         )
@@ -918,76 +961,39 @@ class TeraSimCoSimInProcessPlugin(BasePlugin):
         effective_distances, heading_changes = (
             adapt_lookahead_distances_for_compiled_paths(
                 [compiled_path],
-                [observation["position"]],
+                [current_position],
                 [base_distance],
             )
         )
         lookahead_distance = effective_distances[0]
         vehicle_state["lookahead_distance"] = lookahead_distance
         vehicle_state["lookahead_heading_change"] = heading_changes[0]
-        vehicle_state["lookahead_origin_x"] = observation["position"][0]
-        vehicle_state["lookahead_origin_y"] = observation["position"][1]
+        vehicle_state["lookahead_origin_x"] = current_position[0]
+        vehicle_state["lookahead_origin_y"] = current_position[1]
 
-        maneuver = self.physics_lane_change_maneuvers.get(vehicle_id)
-        if intent in {"left", "right"} and target_lane_id:
-            if (
-                maneuver is None
-                or maneuver.get("intent") != intent
-                or maneuver.get("target_lane_id") != target_lane_id
-            ):
-                maneuver = {
-                    "intent": intent,
-                    "source_lane_id": current_lane_id,
-                    "target_lane_id": target_lane_id,
-                    "lateral_horizon_displacement": 0.0,
-                    "max_abs_lateral_speed": 0.0,
-                }
-                self.physics_lane_change_maneuvers[vehicle_id] = maneuver
-
-        target_lane_shape = None
-        previous_lateral_displacement = None
-        max_lateral_change = None
-        if maneuver is not None:
-            try:
-                target_lane_shape = self._physics_lane_geometry(
-                    maneuver["target_lane_id"]
-                )["shape"]
-            except Exception:
-                target_lane_shape = None
-            maneuver["max_abs_lateral_speed"] = max(
-                maneuver["max_abs_lateral_speed"], abs(float(lateral_speed))
+        if current_position_error:
+            action = {
+                "valid": False,
+                "error": current_position_error,
+                "mode": "route",
+                "lookahead": None,
+                "route_lookahead": None,
+                "lateral_displacement": 0.0,
+                "target_lateral_distance": None,
+            }
+        else:
+            action = build_external_state_lateral_action_lookahead(
+                compiled_path,
+                current_position,
+                lookahead_distance,
+                lateral_speed=lateral_speed,
+                desired_speed=vehicle_state["sumo_desired_speed"],
+                min_forward_speed=0.2,
+                lateral_speed_epsilon=0.05,
+                phase_a_position=observation["position"],
+                phase_step_length=self.physics_step_length,
+                z=vehicle_state["z"],
             )
-            previous_lateral_displacement = maneuver[
-                "lateral_horizon_displacement"
-            ]
-            max_lateral_change = (
-                maneuver["max_abs_lateral_speed"] * self.physics_step_length
-            )
-
-        action = build_external_state_lateral_action_lookahead(
-            compiled_path,
-            observation["position"],
-            lookahead_distance,
-            target_lane_shape=target_lane_shape,
-            lateral_speed=lateral_speed,
-            desired_speed=vehicle_state["sumo_desired_speed"],
-            maneuver_active=maneuver is not None,
-            previous_lateral_displacement=previous_lateral_displacement,
-            max_lateral_displacement_change=max_lateral_change,
-            z=vehicle_state["z"],
-        )
-        if maneuver is not None and action.get("valid", False):
-            maneuver["lateral_horizon_displacement"] = float(
-                action.get("lateral_displacement", 0.0)
-            )
-            settled = (
-                current_lane_id == maneuver["target_lane_id"]
-                and abs(float(lateral_speed)) < 0.05
-                and action.get("target_lateral_distance") is not None
-                and action["target_lateral_distance"] < 0.15
-            )
-            if settled:
-                self.physics_lane_change_maneuvers.pop(vehicle_id, None)
 
         vehicle_state["lookahead_action_mode"] = action.get("mode", "route")
         vehicle_state["lookahead_action_valid"] = bool(action.get("valid", False))
@@ -998,7 +1004,35 @@ class TeraSimCoSimInProcessPlugin(BasePlugin):
         vehicle_state["lookahead_target_lateral_distance"] = action.get(
             "target_lateral_distance"
         )
+        vehicle_state["lookahead_route_tangent_x"] = action.get(
+            "route_tangent_x", 0.0
+        )
+        vehicle_state["lookahead_route_tangent_y"] = action.get(
+            "route_tangent_y", 0.0
+        )
+        vehicle_state["lookahead_world_left_normal_x"] = action.get(
+            "world_left_normal_x"
+        )
+        vehicle_state["lookahead_world_left_normal_y"] = action.get(
+            "world_left_normal_y"
+        )
+        vehicle_state["lookahead_phase_b_lateral_delta"] = action.get(
+            "phase_b_lateral_delta"
+        )
+        vehicle_state["lookahead_expected_phase_b_lateral_distance"] = action.get(
+            "expected_phase_b_lateral_distance"
+        )
+        vehicle_state["lookahead_world_lateral_speed"] = action.get(
+            "world_lateral_speed", 0.0
+        )
+        vehicle_state["lookahead_lane_change_blend"] = 0.0
+        route_lookahead = action.get("route_lookahead")
+        if route_lookahead is not None:
+            vehicle_state["lookahead_route_x"] = route_lookahead[0]
+            vehicle_state["lookahead_route_y"] = route_lookahead[1]
+            vehicle_state["lookahead_route_z"] = route_lookahead[2]
         lookahead = action.get("lookahead")
+        vehicle_state["lookahead_position_valid"] = False
         if lookahead is not None:
             vehicle_state["lookahead_x"] = lookahead[0]
             vehicle_state["lookahead_y"] = lookahead[1]

@@ -121,10 +121,10 @@ class PhysicalCosimTest(unittest.TestCase):
             path,
             (0.0, 0.0),
             7.0,
-            target_lane_shape=((0.0, 3.5), (20.0, 3.5)),
             lateral_speed=1.0,
             desired_speed=5.0,
-            maneuver_active=True,
+            phase_a_position=(0.0, -0.05),
+            phase_step_length=0.05,
             z=0.0,
         )
         self.assertTrue(result["valid"])
@@ -132,22 +132,23 @@ class PhysicalCosimTest(unittest.TestCase):
         self.assertAlmostEqual(result["lookahead"][0], 7.0)
         self.assertAlmostEqual(result["lookahead"][1], 1.4)
         self.assertAlmostEqual(result["lateral_displacement"], 1.4)
+        self.assertAlmostEqual(result["phase_b_lateral_delta"], 0.05)
+        self.assertAlmostEqual(result["world_lateral_speed"], 1.0)
 
-    def test_lateral_action_lookahead_limits_preview_change_per_step(self):
+    def test_lateral_action_uses_world_motion_not_lateral_speed_sign(self):
         path = compile_lane_shapes([((0.0, 0.0), (20.0, 0.0))])
         result = build_external_state_lateral_action_lookahead(
             path,
             (0.0, 0.0),
             7.0,
-            target_lane_shape=((0.0, 3.5), (20.0, 3.5)),
-            lateral_speed=2.0,
+            lateral_speed=-2.0,
             desired_speed=5.0,
-            maneuver_active=True,
-            previous_lateral_displacement=0.2,
-            max_lateral_displacement_change=0.05,
+            phase_a_position=(0.0, -0.1),
+            phase_step_length=0.05,
         )
         self.assertTrue(result["valid"])
-        self.assertAlmostEqual(result["lateral_displacement"], 0.25)
+        self.assertAlmostEqual(result["lateral_displacement"], 2.8)
+        self.assertAlmostEqual(result["world_lateral_speed"], 2.0)
 
     def test_phase_a_immediate_move_does_not_advance_sumo_time(self):
         calls = []
@@ -190,6 +191,83 @@ class PhysicalCosimTest(unittest.TestCase):
         observation = plugin.physics_feedback_observations["vehicle0"]
         self.assertAlmostEqual(observation["phase_a_time"], 12.5)
         self.assertEqual(observation["source_carla_frame"], 123)
+        self.assertEqual(observation["requested_lane_id"], "edge_0_0")
+
+    def test_phase_b_adapter_exports_live_route_and_world_lateral_motion(self):
+        fake_vehicle = SimpleNamespace(
+            getSpeedWithoutTraCI=lambda _actor_id: 5.0,
+            getEmergencyDecel=lambda _actor_id: 8.0,
+            getLaneID=lambda _actor_id: "edge_current_0",
+            getPosition=lambda _actor_id: (10.0, 0.0),
+            getLanePosition=lambda _actor_id: 10.0,
+            getRoute=lambda _actor_id: ("edge_current", "edge_next"),
+            getSlope=lambda _actor_id: 0.0,
+            getLaneChangeState=lambda _actor_id, _direction: (0, 0),
+            getLateralSpeed=lambda _actor_id: -1.0,
+            getNextLinks=lambda _actor_id: (),
+        )
+        fake_lane = SimpleNamespace(
+            getEdgeID=lambda _lane_id: "edge_current",
+            getShape=lambda _lane_id: ((0.0, 0.0), (100.0, 0.0)),
+            getLength=lambda _lane_id: 100.0,
+        )
+        fake_traci = SimpleNamespace(
+            vehicle=fake_vehicle,
+            lane=fake_lane,
+            simulation=SimpleNamespace(getTime=lambda: 12.55),
+            constants=SimpleNamespace(LCA_LEFT=1, LCA_RIGHT=2),
+        )
+
+        plugin = object.__new__(TeraSimCoSimInProcessPlugin)
+        plugin.physics_external_state_enabled = True
+        plugin.physics_feedback_actor_ids = {"*"}
+        plugin.physics_step_length = 0.05
+        plugin.physics_lookahead_min_distance = 7.0
+        plugin.physics_lookahead_max_distance = 15.0
+        plugin.physics_lane_geometry_cache = {}
+        plugin.physics_lookahead_path_cache = {}
+        plugin.physics_feedback_observations = {
+            "vehicle0": {
+                "position": (9.75, -0.05),
+                "sumo_angle": 90.0,
+                "speed": 5.0,
+                "acceleration": 0.0,
+                "requested_lane_id": "edge_requested_0",
+                "lane_id": "edge_current_0",
+                "lane_position": 9.75,
+                "lane_length": 100.0,
+                "phase_a_time": 12.5,
+                "source_carla_frame": 77,
+            }
+        }
+        vehicle_state = {
+            "x": 999.0,
+            "y": 999.0,
+            "z": 0.0,
+            "speed": 5.0,
+            "lane_id": "stale_0",
+            "lane_position": 0.0,
+        }
+
+        with patch.object(cosim_inprocess, "traci", fake_traci):
+            plugin._populate_physics_action_state("vehicle0", vehicle_state)
+
+        self.assertEqual(
+            vehicle_state["feedback_requested_lane_id"], "edge_requested_0"
+        )
+        self.assertEqual(
+            vehicle_state["feedback_observed_lane_id"], "edge_current_0"
+        )
+        self.assertEqual(vehicle_state["lane_id"], "edge_current_0")
+        self.assertEqual(vehicle_state["sumo_route"], ("edge_current", "edge_next"))
+        self.assertAlmostEqual(vehicle_state["feedback_longitudinal_error"], 0.0)
+        self.assertAlmostEqual(vehicle_state["lookahead_origin_x"], 10.0)
+        self.assertAlmostEqual(vehicle_state["lookahead_origin_y"], 0.0)
+        self.assertAlmostEqual(
+            vehicle_state["lookahead_phase_b_lateral_delta"], 0.05
+        )
+        self.assertAlmostEqual(vehicle_state["lookahead_world_lateral_speed"], 1.0)
+        self.assertTrue(vehicle_state["lookahead_position_valid"])
 
     def test_create_simulator_passes_optional_step_length(self):
         config = {
