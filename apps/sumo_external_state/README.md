@@ -1,9 +1,10 @@
-# Physical co-simulation SUMO build
+# Physical co-simulation SUMO external-state build
 
 This directory contains the pinned SUMO 1.23.1 patch used by the optional
 Autoware x CARLA x TeraSim physical co-simulation mode.
 
-The patch adds:
+The patch adds the low-level API used by the service's `setExternalState`
+operation:
 
 ```python
 traci.vehicle.moveToXYImmediate(
@@ -20,8 +21,10 @@ traci.vehicle.moveToXYImmediate(
 ```
 
 Unlike normal `moveToXY`, this call updates pose immediately without advancing
-SUMO time. The in-process service then releases any TraCI speed override and
-calls `setPreviousSpeed` with CARLA measured speed and acceleration.
+SUMO time. It also completes the remote-control operation immediately, rebases
+the lane-change model onto the realized CARLA lateral state, releases stale
+TraCI speed overrides, and lets the in-process service apply CARLA measured
+speed and acceleration with `setPreviousSpeed`.
 
 The cycle is intentionally serial:
 
@@ -58,11 +61,11 @@ export USE_LIBSUMO=0
 python -m terasim_service.run_cosim --tick_mode master ...
 ```
 
-The dedicated physical launcher sets `USE_LIBSUMO=0`, matching the source
-experiment workflow. This runs the patched SUMO engine as a TraCI child
-process instead of loading libsumo into TeraSim's simulation thread. Both
-generated Python APIs expose `moveToXYImmediate`; the Odaiba physical 3-way
-run is validated through TraCI.
+The dedicated physical launcher sets `USE_LIBSUMO=0`, matching the 3-way
+workflow. This runs the patched SUMO engine as a TraCI child process instead
+of loading libsumo into TeraSim's simulation thread. Both generated Python
+APIs expose `moveToXYImmediate`; focused integration tests cover TraCI and
+libsumo, while the Odaiba physical 3-way run is validated through TraCI.
 
 `examples/scripts/check_physics_motion.py` requires a non-ego CARLA vehicle to
 show both displacement and non-zero speed. The personal one-command launcher
@@ -71,4 +74,5 @@ reported as physical co-sim success.
 
 All flags default to the legacy teleport behavior. Missing immediate-move API,
 current-lane projection failure, frame mismatch, invalid lookahead, or excessive
-position error fails closed instead of rematching another lane.
+position error fails closed instead of rematching another lane. In strict-lane
+mode, SUMO never rematches an adjacent, predecessor, or unrelated internal lane.
