@@ -217,6 +217,99 @@ class PhysicalCosimTest(unittest.TestCase):
         self.assertAlmostEqual(result["lateral_displacement"], 2.8)
         self.assertAlmostEqual(result["world_lateral_speed"], 2.0)
 
+    def test_unresolved_lateral_delta_returns_valid_route_only_lookahead(self):
+        path = compile_lane_shapes([((0.0, 0.0), (20.0, 0.0))])
+        result = build_external_state_lateral_action_lookahead(
+            path,
+            (1.0, 0.0),
+            7.0,
+            lateral_speed=0.95,
+            desired_speed=5.0,
+            phase_a_position=(0.75, 0.0),
+            phase_step_length=0.05,
+        )
+
+        self.assertTrue(result["valid"])
+        self.assertEqual(result["error"], "")
+        self.assertEqual(result["warning"], "unresolved_phase_b_lateral_direction")
+        self.assertEqual(result["mode"], "route_only_unresolved_lateral")
+        self.assertEqual(result["lateral_direction_source"], "route_only")
+        self.assertEqual(result["lookahead"], result["route_lookahead"])
+        self.assertAlmostEqual(result["lateral_displacement"], 0.0)
+        self.assertAlmostEqual(result["world_lateral_speed"], 0.0)
+
+    def test_unresolved_lateral_delta_reuses_aligned_previous_direction(self):
+        path = compile_lane_shapes([((0.0, 0.0), (20.0, 0.0))])
+        result = build_external_state_lateral_action_lookahead(
+            path,
+            (1.0, 0.0),
+            7.0,
+            lateral_speed=-1.0,
+            desired_speed=5.0,
+            phase_a_position=(0.75, 0.0),
+            phase_step_length=0.05,
+            previous_world_lateral_direction=(0.0, 1.0),
+        )
+
+        self.assertTrue(result["valid"])
+        self.assertEqual(result["warning"], "")
+        self.assertEqual(result["lateral_direction_source"], "previous_confirmed")
+        self.assertAlmostEqual(result["world_lateral_speed"], 1.0)
+        self.assertAlmostEqual(result["lookahead"][1], 1.4)
+
+    def test_unresolved_lateral_delta_rejects_unaligned_previous_direction(self):
+        path = compile_lane_shapes([((0.0, 0.0), (20.0, 0.0))])
+        result = build_external_state_lateral_action_lookahead(
+            path,
+            (1.0, 0.0),
+            7.0,
+            lateral_speed=1.0,
+            desired_speed=5.0,
+            phase_a_position=(0.75, 0.0),
+            phase_step_length=0.05,
+            previous_world_lateral_direction=(1.0, 0.0),
+        )
+
+        self.assertTrue(result["valid"])
+        self.assertEqual(result["lateral_direction_source"], "route_only")
+        self.assertEqual(result["warning"], "unresolved_phase_b_lateral_direction")
+
+    def test_invalid_route_or_missing_phase_a_remains_fail_closed(self):
+        path = compile_lane_shapes([((0.0, 0.0), (20.0, 0.0))])
+        missing_route = build_external_state_lateral_action_lookahead(
+            None,
+            (1.0, 0.0),
+            7.0,
+            lateral_speed=1.0,
+            desired_speed=5.0,
+            phase_a_position=(1.0, 0.0),
+        )
+        missing_phase_a = build_external_state_lateral_action_lookahead(
+            path,
+            (1.0, 0.0),
+            7.0,
+            lateral_speed=1.0,
+            desired_speed=5.0,
+            phase_a_position=None,
+        )
+        non_finite_position = build_external_state_lateral_action_lookahead(
+            path,
+            (float("nan"), 0.0),
+            7.0,
+            lateral_speed=1.0,
+            desired_speed=5.0,
+            phase_a_position=(1.0, 0.0),
+        )
+
+        self.assertFalse(missing_route["valid"])
+        self.assertEqual(missing_route["error"], "missing_route_geometry")
+        self.assertFalse(missing_phase_a["valid"])
+        self.assertEqual(
+            missing_phase_a["error"], "missing_phase_a_world_position"
+        )
+        self.assertFalse(non_finite_position["valid"])
+        self.assertEqual(non_finite_position["error"], "non_finite_route_input")
+
     def test_phase_a_immediate_move_does_not_advance_sumo_time(self):
         calls = []
         fake_vehicle = _FakeVehicle(calls)
@@ -335,6 +428,217 @@ class PhysicalCosimTest(unittest.TestCase):
         )
         self.assertAlmostEqual(vehicle_state["lookahead_world_lateral_speed"], 1.0)
         self.assertTrue(vehicle_state["lookahead_position_valid"])
+
+    def test_phase_b_lane_transition_reuses_only_immediately_confirmed_direction(self):
+        phase_b_time = {"value": 12.55}
+        lateral_speed = {"value": 0.95}
+        fake_vehicle = SimpleNamespace(
+            getSpeedWithoutTraCI=lambda _actor_id: 5.0,
+            getEmergencyDecel=lambda _actor_id: 8.0,
+            getLaneID=lambda _actor_id: "edge_125_0",
+            getPosition=lambda _actor_id: (10.0, 0.0),
+            getLanePosition=lambda _actor_id: 10.0,
+            getRoute=lambda _actor_id: ("edge_125", "edge_next"),
+            getSlope=lambda _actor_id: 0.0,
+            getLaneChangeState=lambda _actor_id, direction: (
+                (0, 0) if direction == 1 else (0, 2)
+            ),
+            getLateralSpeed=lambda _actor_id: lateral_speed["value"],
+            getNextLinks=lambda _actor_id: (),
+        )
+        fake_lane = SimpleNamespace(
+            getEdgeID=lambda _lane_id: "edge_125",
+            getShape=lambda _lane_id: ((0.0, 0.0), (100.0, 0.0)),
+            getLength=lambda _lane_id: 100.0,
+        )
+        fake_traci = SimpleNamespace(
+            vehicle=fake_vehicle,
+            lane=fake_lane,
+            simulation=SimpleNamespace(getTime=lambda: phase_b_time["value"]),
+            constants=SimpleNamespace(LCA_LEFT=1, LCA_RIGHT=2),
+        )
+        warnings = []
+        recoveries = []
+
+        plugin = object.__new__(TeraSimCoSimInProcessPlugin)
+        plugin.logger = SimpleNamespace(
+            warning=lambda *args: warnings.append(args),
+            info=lambda *args: recoveries.append(args),
+        )
+        plugin.physics_external_state_enabled = True
+        plugin.physics_feedback_actor_ids = {"*"}
+        plugin.physics_step_length = 0.05
+        plugin.physics_lookahead_min_distance = 7.0
+        plugin.physics_lookahead_max_distance = 15.0
+        plugin.physics_lane_geometry_cache = {}
+        plugin.physics_lookahead_path_cache = {}
+        plugin.physics_lateral_direction_states = {
+            "vehicle1593": {
+                "confirmed_world_direction": (0.0, 1.0),
+                "confirmed_sumo_time": 12.5,
+                "confirmed_lateral_speed": 0.95,
+                "unresolved_count": 0,
+            }
+        }
+        plugin.physics_feedback_observations = {
+            "vehicle1593": {
+                "position": (9.75, 0.0),
+                "sumo_angle": 90.0,
+                "speed": 5.0,
+                "acceleration": 0.0,
+                "requested_lane_id": "edge_125_1",
+                "lane_id": "edge_125_1",
+                "lane_position": 9.75,
+                "lane_length": 100.0,
+                "phase_a_time": 12.5,
+                "source_carla_frame": 77,
+            }
+        }
+
+        def vehicle_state():
+            return {
+                "x": 10.0,
+                "y": 0.0,
+                "z": 0.0,
+                "speed": 5.0,
+                "lane_id": "edge_125_0",
+                "lane_position": 10.0,
+            }
+
+        with patch.object(cosim_inprocess, "traci", fake_traci):
+            first = vehicle_state()
+            plugin._populate_physics_action_state("vehicle1593", first)
+            self.assertTrue(first["lookahead_action_valid"])
+            self.assertEqual(
+                first["lookahead_lateral_direction_source"], "previous_confirmed"
+            )
+            self.assertAlmostEqual(first["lookahead_world_lateral_speed"], 0.95)
+            self.assertTrue(first["lookahead_lane_change_intent_conflict"])
+            self.assertEqual(
+                plugin.physics_lateral_direction_states["vehicle1593"][
+                    "confirmed_sumo_time"
+                ],
+                12.5,
+            )
+
+            phase_b_time["value"] = 12.6
+            plugin.physics_feedback_observations["vehicle1593"][
+                "phase_a_time"
+            ] = 12.55
+            second = vehicle_state()
+            plugin._populate_physics_action_state("vehicle1593", second)
+            self.assertTrue(second["lookahead_action_valid"])
+            self.assertEqual(second["lookahead_action_error"], "")
+            self.assertEqual(
+                second["lookahead_action_warning"],
+                "unresolved_phase_b_lateral_direction",
+            )
+            self.assertEqual(second["lookahead_lateral_direction_source"], "route_only")
+            self.assertEqual(
+                second["lookahead_lateral_direction_unresolved_count"], 1
+            )
+            self.assertEqual(second["lookahead_x"], second["lookahead_route_x"])
+            self.assertEqual(second["lookahead_y"], second["lookahead_route_y"])
+
+            phase_b_time["value"] = 12.65
+            plugin.physics_feedback_observations["vehicle1593"][
+                "phase_a_time"
+            ] = 12.6
+            third = vehicle_state()
+            plugin._populate_physics_action_state("vehicle1593", third)
+            self.assertTrue(third["lookahead_action_valid"])
+            self.assertEqual(
+                third["lookahead_lateral_direction_unresolved_count"], 2
+            )
+            self.assertEqual(len(warnings), 1)
+
+            lateral_speed["value"] = 0.0
+            phase_b_time["value"] = 12.7
+            plugin.physics_feedback_observations["vehicle1593"][
+                "phase_a_time"
+            ] = 12.65
+            inactive = vehicle_state()
+            plugin._populate_physics_action_state("vehicle1593", inactive)
+            self.assertEqual(inactive["lookahead_lateral_direction_source"], "inactive")
+            self.assertNotIn("vehicle1593", plugin.physics_lateral_direction_states)
+            self.assertEqual(len(recoveries), 1)
+
+    def test_departed_actor_lateral_direction_history_is_pruned_immediately(self):
+        plugin = object.__new__(TeraSimCoSimInProcessPlugin)
+        plugin.physics_lateral_direction_states = {
+            "active": {"confirmed_sumo_time": 12.5},
+            "departed": {"confirmed_sumo_time": 12.5},
+        }
+
+        plugin._prune_departed_physics_lateral_directions(["active"])
+
+        self.assertEqual(
+            plugin.physics_lateral_direction_states,
+            {"active": {"confirmed_sumo_time": 12.5}},
+        )
+
+    def test_unresolved_lateral_warning_is_rate_limited(self):
+        warnings = []
+        plugin = object.__new__(TeraSimCoSimInProcessPlugin)
+        plugin.logger = SimpleNamespace(
+            warning=lambda *args: warnings.append(args),
+        )
+        plugin.physics_lateral_direction_states = {}
+        state = {}
+
+        for previous_count in range(100):
+            unresolved_count, conflict = (
+                plugin._record_unresolved_physics_lateral_direction(
+                    plugin.physics_lateral_direction_states,
+                    state,
+                    "vehicle1593",
+                    previous_count,
+                    0.95,
+                    "right",
+                )
+            )
+            self.assertEqual(unresolved_count, previous_count + 1)
+            self.assertFalse(conflict)
+
+        self.assertEqual(len(warnings), 2)
+        self.assertEqual(warnings[0][2], 1)
+        self.assertEqual(warnings[1][2], 100)
+
+    def test_route_only_lateral_warning_is_not_authoritative_action_error(self):
+        cosim = object.__new__(CarlaCosim)
+        cosim.ackermann_feedback_apply_enabled = True
+        cosim.ackermann_feedback_actor_ids = {"*"}
+        location = cosim._resolve_sumo_lookahead_location(
+            "vehicle1593",
+            {
+                "lookahead_action_valid": True,
+                "lookahead_action_warning": "unresolved_phase_b_lateral_direction",
+                "lookahead_action_mode": "route_only_unresolved_lateral",
+                "lookahead_position_valid": True,
+                "lookahead_x": 17.0,
+                "lookahead_y": 0.0,
+                "lookahead_z": 0.0,
+            },
+            [10.0, 0.0, 0.0],
+            90.0,
+        )
+
+        self.assertEqual(location, [17.0, 0.0, 0.0])
+
+        with self.assertRaisesRegex(ValueError, "missing authoritative SUMO lookahead"):
+            cosim._resolve_sumo_lookahead_location(
+                "vehicle1593",
+                {
+                    "lookahead_action_valid": True,
+                    "lookahead_action_warning": (
+                        "unresolved_phase_b_lateral_direction"
+                    ),
+                    "lookahead_action_mode": "route_only_unresolved_lateral",
+                    "lookahead_position_valid": False,
+                },
+                [10.0, 0.0, 0.0],
+                90.0,
+            )
 
     def test_create_simulator_passes_optional_step_length(self):
         config = {

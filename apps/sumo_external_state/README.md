@@ -99,12 +99,25 @@ run is exercised for 12,000 synchronized steps with TraCI and again with
 libsumo before adding the Autoware ego for the 6,000-step three-way run.
 `odaiba_osmlike` and CARLA `odaiba_tl_mapping` are not acceptance maps.
 
+An active SUMO lateral speed does not by itself prove a usable steering
+direction: Phase A and Phase B can report the same world position for one
+step. The service first uses the current measured lateral displacement, then a
+world direction measured in the immediately preceding SUMO step. If neither
+is usable, it keeps the action valid and drives toward the route-only
+lookahead with warning `unresolved_phase_b_lateral_direction`. SUMO
+lane-change intent is recorded only as a diagnostic conflict and never selects
+the steering direction. This warning does not escalate to fail-closed, even if
+it repeats.
+
 `examples/scripts/check_physics_motion.py` requires a non-ego CARLA vehicle to
 show both displacement and non-zero speed. The personal one-command launcher
 uses it after the normal 3-way health check, so actor existence alone is not
 reported as physical co-sim success.
 
 All flags default to the legacy teleport behavior. Missing immediate-move API,
-current-lane projection failure, frame mismatch, invalid lookahead, or excessive
-position error fails closed instead of rematching another lane. In strict-lane
-mode, SUMO never rematches an adjacent, predecessor, or unrelated internal lane.
+current-lane projection failure, frame mismatch, non-finite or missing route
+geometry, SUMO assimilation failure, or excessive position error fails closed
+instead of rematching another lane. An unresolved lateral direction alone is
+the warning-level route-only case described above, not an invalid lookahead. In
+strict-lane mode, SUMO never rematches an adjacent, predecessor, or unrelated
+internal lane.

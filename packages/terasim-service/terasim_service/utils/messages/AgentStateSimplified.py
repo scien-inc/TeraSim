@@ -33,6 +33,10 @@ class AgentStateSimplified(BaseModel):
     lookahead_action_mode: str = "route"
     lookahead_action_valid: bool = True
     lookahead_action_error: str = ""
+    lookahead_action_warning: str = ""
+    lookahead_lateral_direction_source: str = "inactive"
+    lookahead_lateral_direction_unresolved_count: int = 0
+    lookahead_lane_change_intent_conflict: bool = False
     lookahead_lateral_horizon_displacement: float = 0.0
     lookahead_target_lateral_distance: float | None = None
     lookahead_route_tangent_x: float | None = None

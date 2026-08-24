@@ -7,8 +7,8 @@ history of `kawai/feat/physic-cosim`. The canonical source tip is `b04321c`;
 | Ported area | Canonical source | Main implementation | Port rule |
 | --- | --- | --- | --- |
 | Patched SUMO `setExternalState` | `b04321c:apps/Docker/sumo-v1.23.1-set-external-state.patch` | Same path | Identical patch blob; retain the main in-process Docker base |
-| Route/lateral helper | `f1d46ac:packages/terasim-service/terasim_service/utils/sumo_lane_geometry.py` | Same path | Identical file blob (`8bf78ce2c81ae9ce13defdab31ee173c6e371d7c`) |
-| Phase-aligned state schema | `f1d46ac:packages/terasim-service/terasim_service/utils/messages/AgentStateSimplified.py` | Same path | Identical file blob (`bee890e256c2930bd636bb00e09fce031cec0b3b`) |
+| Route/lateral helper | `f1d46ac:packages/terasim-service/terasim_service/utils/sumo_lane_geometry.py` | Same path | Canonical geometry and lateral math, plus the warning-level unresolved-direction hardening described below |
+| Phase-aligned state schema | `f1d46ac:packages/terasim-service/terasim_service/utils/messages/AgentStateSimplified.py` | Same path | Canonical fields plus optional warning, direction-source, unresolved-count, and intent-conflict diagnostics |
 | Live local route | `b6897d5` and `f1d46ac` in `plugins/cosim.py` | `plugins/cosim_inprocess.py` | Adapter obtains live Phase B lane, position, route and first next link, then calls the canonical helper |
 | Requested/observed/live lane split | `f1d46ac` in `plugins/cosim.py` | `plugins/cosim_inprocess.py` | Adapter stores Phase A requested/observed values separately from Phase B live values |
 | Initial pose state | `b04321c:plugins/cosim.py` state export and `_populate_lane_relative_position` | `plugins/cosim_inprocess.py` | Adapter exports SUMO slope before the first feedback and passes declared lane length plus raw SUMO x/y to the canonical reconstruction helper |
@@ -19,10 +19,21 @@ history of `kawai/feat/physic-cosim`. The canonical source tip is `b04321c`;
 | Initialization/collision diagnostics | `0d3899c` as present at `b04321c` | `utils/carla/cosim.py` | JSONL and summary code retained and defaulted off |
 | Master physical tick pipeline | `b04321c:utils/carla/cosim.py` `_tick_ackermann_feedback_apply_direct` | `utils/carla/cosim.py` `_tick_master` | Resolve the previous SUMO result, apply state, tick CARLA once, collect that frame's feedback, and defer the newly requested SUMO result until the next cycle |
 | Phase A feedback order | `b04321c:utils/carla/cosim.py` `_collect_ackermann_feedback` | `utils/carla/cosim.py` `_build_physics_feedback_commands` | Selected background actors are emitted in the same lexicographic actor-ID order; this preserves deterministic eager `moveToXYImmediate` lane-change neighborhood updates |
+| Unresolved lateral direction | `b04321c` fail-closed baseline in `sumo_lane_geometry.py` and `utils/carla/cosim.py` | `sumo_lane_geometry.py`, `plugins/cosim_inprocess.py`, state schema, and control trace | Intentional post-port hardening: current measured delta, then only the immediately previous measured world direction; otherwise valid route-only lookahead with a rate-limited warning. Lane-change intent is diagnostic only |
 
 The adapter preserves main's state filter, actor index, batched controls, and
 master/follower/async tick structure. It does not restore Redis, HTTP, gRPC, or
 direct-link transports.
+
+The unresolved-direction row is an intentional behavior change from the
+canonical source. Both the feature branch and the initial port reproduced a
+stop at SUMO time 560.75 when `vehicle1593` moved from `edge_125_1` to
+`edge_125_0`, kept lateral speed 0.95 m/s, and produced effectively zero
+Phase-A-to-B lateral displacement. A single missing displacement measurement
+does not invalidate the finite route geometry or the longitudinal action, so
+the port now treats only that condition as warning-level. Non-finite state,
+missing route geometry, Phase A absence, and SUMO assimilation failures retain
+their existing fail-closed behavior.
 
 CARLA adapter-only differences are limited to reading the current in-process
 state, using main's persistent `role_name` actor index, appending control to

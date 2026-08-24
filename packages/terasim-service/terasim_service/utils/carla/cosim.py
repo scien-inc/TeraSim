@@ -1078,6 +1078,7 @@ class CarlaCosim(object):
 
         if authoritative_feedback and veh_info.get("lookahead_action_mode") in {
             "route",
+            "route_only_unresolved_lateral",
             "sumo_lateral_velocity",
             "deferred",
         }:
@@ -2944,6 +2945,19 @@ class CarlaCosim(object):
             "lookahead_action_mode": veh_info.get("lookahead_action_mode"),
             "lookahead_action_valid": bool(veh_info.get("lookahead_action_valid", True)),
             "lookahead_action_error": veh_info.get("lookahead_action_error", ""),
+            "lookahead_action_warning": veh_info.get(
+                "lookahead_action_warning", ""
+            ),
+            "lookahead_lateral_direction_source": veh_info.get(
+                "lookahead_lateral_direction_source", "inactive"
+            ),
+            "lookahead_lateral_direction_unresolved_count": int(
+                veh_info.get("lookahead_lateral_direction_unresolved_count", 0)
+                or 0
+            ),
+            "lookahead_lane_change_intent_conflict": bool(
+                veh_info.get("lookahead_lane_change_intent_conflict", False)
+            ),
             "external_state_maneuver_current_lane_id": veh_info.get("lane_id"),
             "external_state_maneuver_source_lane_id": veh_info.get(
                 "external_state_maneuver_source_lane_id", ""

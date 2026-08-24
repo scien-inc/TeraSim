@@ -185,6 +185,10 @@ class TeraSimCoSimInProcessPlugin(BasePlugin):
     # cadence (in steps) for pruning per-vehicle caches of departed ids
     CACHE_PRUNE_EVERY_STEPS = 1200
 
+    LATERAL_SPEED_EPSILON = 0.05
+    LATERAL_DIRECTION_MIN_ALIGNMENT = 0.5
+    LATERAL_DIRECTION_WARNING_INTERVAL = 100
+
     def __init__(
         self,
         simulation_uuid: str,
@@ -268,6 +272,7 @@ class TeraSimCoSimInProcessPlugin(BasePlugin):
             ),
         )
         self.physics_feedback_observations = {}
+        self.physics_lateral_direction_states = {}
         self.physics_lane_geometry_cache = {}
         self.physics_lookahead_path_cache = {}
         self.physics_lookahead_min_distance = max(
@@ -572,6 +577,7 @@ class TeraSimCoSimInProcessPlugin(BasePlugin):
         pass
 
     def function_after_env_stop(self, simulator: Simulator, ctx):
+        self.physics_lateral_direction_states.clear()
         self._finish("finished")
         self.logger.info(f"Simulation {self.simulation_uuid} finished!")
 
@@ -845,9 +851,178 @@ class TeraSimCoSimInProcessPlugin(BasePlugin):
             self.physics_lookahead_path_cache.setdefault(tuple(valid_ids), compiled)
         return compiled
 
+    def _physics_previous_lateral_direction(
+        self, vehicle_id, observation, lateral_speed
+    ):
+        """Return only a direction measured in the immediately preceding step."""
+        states = getattr(self, "physics_lateral_direction_states", None)
+        if states is None:
+            self.physics_lateral_direction_states = {}
+            states = self.physics_lateral_direction_states
+        state = states.get(vehicle_id)
+        if state is None or abs(lateral_speed) <= self.LATERAL_SPEED_EPSILON + 1e-9:
+            return None
+        previous_speed = self._as_finite_float(state.get("confirmed_lateral_speed"))
+        confirmed_time = self._as_finite_float(state.get("confirmed_sumo_time"))
+        phase_a_time = self._as_finite_float(observation.get("phase_a_time"))
+        if (
+            previous_speed is None
+            or abs(previous_speed) <= self.LATERAL_SPEED_EPSILON + 1e-9
+            or confirmed_time is None
+            or phase_a_time is None
+            or abs(confirmed_time - phase_a_time) > 1e-9
+        ):
+            return None
+        return state.get("confirmed_world_direction")
+
+    def _prune_departed_physics_lateral_directions(self, all_vehicle_ids):
+        states = getattr(self, "physics_lateral_direction_states", {})
+        if not states:
+            return
+        alive_vehicle_ids = set(all_vehicle_ids)
+        for stale_id in [key for key in states if key not in alive_vehicle_ids]:
+            del states[stale_id]
+
+    def _update_physics_lateral_direction_state(
+        self,
+        vehicle_id,
+        *,
+        phase_b_time,
+        lateral_speed,
+        lane_change_intent,
+        action,
+    ):
+        """Update diagnostic state without letting SUMO intent steer CARLA."""
+        states = getattr(self, "physics_lateral_direction_states", None)
+        if states is None:
+            self.physics_lateral_direction_states = {}
+            states = self.physics_lateral_direction_states
+        state = states.get(vehicle_id, {})
+        previous_unresolved = int(state.get("unresolved_count", 0))
+        source = action.get("lateral_direction_source", "inactive")
+
+        if not action.get("valid", False):
+            return previous_unresolved, False
+
+        if abs(lateral_speed) <= self.LATERAL_SPEED_EPSILON + 1e-9:
+            if previous_unresolved:
+                self.logger.info(
+                    "Physical co-sim lateral direction recovered: actor=%s "
+                    "unresolved_frames=%s source=inactive",
+                    vehicle_id,
+                    previous_unresolved,
+                )
+            states.pop(vehicle_id, None)
+            return 0, False
+
+        world_lateral_speed = self._as_finite_float(
+            action.get("world_lateral_speed")
+        )
+        if source == "phase_b_delta" and world_lateral_speed not in (None, 0.0):
+            state = self._record_confirmed_physics_lateral_direction(
+                states,
+                vehicle_id,
+                phase_b_time,
+                lateral_speed,
+                world_lateral_speed,
+                action,
+                previous_unresolved,
+            )
+        elif source == "previous_confirmed":
+            state["unresolved_count"] = 0
+            states[vehicle_id] = state
+        elif source == "route_only":
+            return self._record_unresolved_physics_lateral_direction(
+                states,
+                state,
+                vehicle_id,
+                previous_unresolved,
+                lateral_speed,
+                lane_change_intent,
+            )
+        intent_conflict = self._physics_lateral_intent_conflict(
+            lane_change_intent, world_lateral_speed
+        )
+        state["last_lane_change_intent"] = lane_change_intent
+        state["last_intent_conflict"] = intent_conflict
+        return 0, intent_conflict
+
+    def _record_confirmed_physics_lateral_direction(
+        self,
+        states,
+        vehicle_id,
+        phase_b_time,
+        lateral_speed,
+        world_lateral_speed,
+        action,
+        previous_unresolved,
+    ):
+        normal_x = self._as_finite_float(action.get("world_left_normal_x"))
+        normal_y = self._as_finite_float(action.get("world_left_normal_y"))
+        state = states.get(vehicle_id, {})
+        if normal_x is not None and normal_y is not None:
+            direction_sign = math.copysign(1.0, world_lateral_speed)
+            state = {
+                "confirmed_world_direction": (
+                    direction_sign * normal_x,
+                    direction_sign * normal_y,
+                ),
+                "confirmed_sumo_time": phase_b_time,
+                "confirmed_lateral_speed": lateral_speed,
+                "unresolved_count": 0,
+            }
+            states[vehicle_id] = state
+        if previous_unresolved:
+            self.logger.info(
+                "Physical co-sim lateral direction recovered: actor=%s "
+                "unresolved_frames=%s source=phase_b_delta",
+                vehicle_id,
+                previous_unresolved,
+            )
+        return state
+
+    def _record_unresolved_physics_lateral_direction(
+        self,
+        states,
+        state,
+        vehicle_id,
+        previous_unresolved,
+        lateral_speed,
+        lane_change_intent,
+    ):
+        unresolved_count = previous_unresolved + 1
+        state["unresolved_count"] = unresolved_count
+        states[vehicle_id] = state
+        if (
+            unresolved_count == 1
+            or unresolved_count % self.LATERAL_DIRECTION_WARNING_INTERVAL == 0
+        ):
+            self.logger.warning(
+                "Physical co-sim lateral direction unresolved: actor=%s "
+                "frames=%s lateral_speed=%.6g intent=%s; using route-only lookahead",
+                vehicle_id,
+                unresolved_count,
+                lateral_speed,
+                lane_change_intent,
+            )
+        return unresolved_count, False
+
+    @staticmethod
+    def _physics_lateral_intent_conflict(lane_change_intent, world_lateral_speed):
+        if world_lateral_speed in (None, 0.0):
+            return False
+        intent_sign = {"left": 1.0, "right": -1.0}.get(lane_change_intent)
+        return bool(
+            intent_sign is not None
+            and intent_sign != math.copysign(1.0, world_lateral_speed)
+        )
+
     def _populate_physics_action_state(self, vehicle_id, vehicle_state):
         """Export the Phase-B SUMO action consumed by CARLA in the next frame."""
         if not self._is_physics_feedback_actor(vehicle_id):
+            states = getattr(self, "physics_lateral_direction_states", None)
+            if states is not None:
+                states.pop(vehicle_id, None)
             return
         observation = self.physics_feedback_observations.get(vehicle_id)
         if observation is None:
@@ -948,6 +1123,9 @@ class TeraSimCoSimInProcessPlugin(BasePlugin):
         except Exception:
             lateral_speed = 0.0
         vehicle_state["lateral_speed"] = lateral_speed
+        previous_lateral_direction = self._physics_previous_lateral_direction(
+            vehicle_id, observation, lateral_speed
+        )
 
         compiled_path = self._physics_compiled_lookahead_path(
             vehicle_id, current_lane_id
@@ -990,12 +1168,30 @@ class TeraSimCoSimInProcessPlugin(BasePlugin):
                 lateral_speed_epsilon=0.05,
                 phase_a_position=observation["position"],
                 phase_step_length=self.physics_step_length,
+                previous_world_lateral_direction=previous_lateral_direction,
+                previous_direction_min_alignment=self.LATERAL_DIRECTION_MIN_ALIGNMENT,
                 z=vehicle_state["z"],
             )
+
+        unresolved_count, intent_conflict = self._update_physics_lateral_direction_state(
+            vehicle_id,
+            phase_b_time=phase_b_time,
+            lateral_speed=lateral_speed,
+            lane_change_intent=intent,
+            action=action,
+        )
 
         vehicle_state["lookahead_action_mode"] = action.get("mode", "route")
         vehicle_state["lookahead_action_valid"] = bool(action.get("valid", False))
         vehicle_state["lookahead_action_error"] = action.get("error", "")
+        vehicle_state["lookahead_action_warning"] = action.get("warning", "")
+        vehicle_state["lookahead_lateral_direction_source"] = action.get(
+            "lateral_direction_source", "inactive"
+        )
+        vehicle_state["lookahead_lateral_direction_unresolved_count"] = (
+            unresolved_count
+        )
+        vehicle_state["lookahead_lane_change_intent_conflict"] = intent_conflict
         vehicle_state["lookahead_lateral_horizon_displacement"] = float(
             action.get("lateral_displacement", 0.0)
         )
@@ -1087,6 +1283,7 @@ class TeraSimCoSimInProcessPlugin(BasePlugin):
         vehicle_ids, vehicle_position_cache = self._filter_vehicle_ids_for_state(
             all_vehicle_ids
         )
+        self._prune_departed_physics_lateral_directions(all_vehicle_ids)
         simulation_state.agent_count = {
             "vehicle": len(vehicle_ids),
             "vru": len(vru_ids),
@@ -1100,7 +1297,10 @@ class TeraSimCoSimInProcessPlugin(BasePlugin):
             self._cache_prune_countdown = self.CACHE_PRUNE_EVERY_STEPS
             alive = set(all_vehicle_ids)
             alive.update(vru_ids)
-            for cache in (self.last_orientations, self._static_attr_cache):
+            for cache in (
+                self.last_orientations,
+                self._static_attr_cache,
+            ):
                 for stale_id in [key for key in cache if key not in alive]:
                     del cache[stale_id]
 

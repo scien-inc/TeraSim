@@ -535,6 +535,8 @@ def build_external_state_lateral_action_lookahead(
     lateral_speed_epsilon=0.05,
     phase_a_position=None,
     phase_step_length=0.05,
+    previous_world_lateral_direction=None,
+    previous_direction_min_alignment=0.5,
     z=0.0,
 ):
     """Build a rolling lookahead from live route geometry and SUMO lateral speed.
@@ -542,8 +544,10 @@ def build_external_state_lateral_action_lookahead(
     The live Phase B front position remains the origin. SUMO route geometry supplies
     longitudinal displacement. The raw Phase A-to-B world displacement determines
     which side of the live route SUMO moved toward; only the magnitude of speedLat
-    is used. No target lane, adjacent-lane lookup, angle, or cross-cycle maneuver
-    latch is used.
+    is used. If one Phase-B step has no measurable lateral displacement, a direction
+    confirmed from the immediately preceding step may be projected onto the live
+    route normal. Otherwise the action remains valid and uses route-only lookahead.
+    SUMO lane-change intent is deliberately not an input to steering direction.
     """
 
     def invalid(reason):
@@ -562,6 +566,8 @@ def build_external_state_lateral_action_lookahead(
             "phase_b_lateral_delta": None,
             "expected_phase_b_lateral_distance": None,
             "world_lateral_speed": 0.0,
+            "warning": "",
+            "lateral_direction_source": "inactive",
         }
 
     try:
@@ -654,6 +660,7 @@ def build_external_state_lateral_action_lookahead(
     result = {
         "valid": True,
         "error": "",
+        "warning": "",
         "mode": "route",
         "lookahead": route_lookahead,
         "route_lookahead": route_lookahead,
@@ -666,6 +673,7 @@ def build_external_state_lateral_action_lookahead(
         "phase_b_lateral_delta": phase_b_lateral_delta,
         "expected_phase_b_lateral_distance": None,
         "world_lateral_speed": 0.0,
+        "lateral_direction_source": "inactive",
     }
 
     try:
@@ -683,12 +691,40 @@ def build_external_state_lateral_action_lookahead(
         result["error"] = "missing_phase_a_world_position"
         result["lookahead"] = None
         return result
-    if abs(phase_b_lateral_delta) <= 1e-9:
-        result["valid"] = False
-        result["error"] = "unresolved_phase_b_lateral_direction"
-        result["lookahead"] = None
+    direction_sign = None
+    if abs(phase_b_lateral_delta) > 1e-9:
+        direction_sign = math.copysign(1.0, phase_b_lateral_delta)
+        result["lateral_direction_source"] = "phase_b_delta"
+    elif previous_world_lateral_direction is not None:
+        try:
+            previous_direction = np.asarray(
+                [
+                    float(previous_world_lateral_direction[0]),
+                    float(previous_world_lateral_direction[1]),
+                ],
+                dtype=np.float64,
+            )
+            previous_direction_min_alignment = min(
+                1.0, max(0.0, float(previous_direction_min_alignment))
+            )
+        except (TypeError, ValueError, IndexError):
+            previous_direction = None
+        if previous_direction is not None and np.all(np.isfinite(previous_direction)):
+            previous_norm = float(np.linalg.norm(previous_direction))
+            if previous_norm > 1e-12:
+                previous_direction = previous_direction / previous_norm
+                alignment = float(np.dot(previous_direction, left_normal))
+                if abs(alignment) >= previous_direction_min_alignment:
+                    direction_sign = math.copysign(1.0, alignment)
+                    result["lateral_direction_source"] = "previous_confirmed"
+
+    if direction_sign is None:
+        result["mode"] = "route_only_unresolved_lateral"
+        result["warning"] = "unresolved_phase_b_lateral_direction"
+        result["lateral_direction_source"] = "route_only"
         return result
-    world_lateral_speed = math.copysign(abs(lateral_speed), phase_b_lateral_delta)
+
+    world_lateral_speed = direction_sign * abs(lateral_speed)
     result["world_lateral_speed"] = world_lateral_speed
 
     try:
