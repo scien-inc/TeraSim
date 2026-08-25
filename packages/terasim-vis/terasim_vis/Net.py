@@ -816,14 +816,19 @@ class Net:
     :ivar netOffset: (x, y) tuple of the netOffset parameter from the net file
     :ivar projParameter: the projParameter from the net file
     """
-    def __init__(self, file, additional_files=None):
+    def __init__(self, file, additional_files=None, center=None, radius=None):
         """
         Initializes a Net object from a Sumo network file
 
         :param file: path to Sumo network file
         :param additional_files: optional path to additional file (or list of paths) to include with the network.
+        :param center: optional (x, y) tuple. When provided with radius, only elements within
+                       the given radius of this point are loaded.
+        :param radius: distance threshold in meters. Requires center to be set.
         :type file: str
         :type additional_files: Union[str, list[str]]
+        :type center: tuple[float, float] or None
+        :type radius: float or None
         """
         self.additionals = []
         self.edges = dict()
@@ -832,6 +837,23 @@ class Net:
         self.connections = []
         self.netOffset = (0, 0)
         self.projParameter = "!"
+
+        # Spatial filter: pre-compute squared radius for fast distance checks
+        use_spatial_filter = center is not None and radius is not None
+        if use_spatial_filter:
+            cx, cy = center
+            r_sq = radius * radius
+
+        def _coords_within_radius(shape_str):
+            """Check if any coordinate in a SUMO shape string is within radius of center."""
+            for xy in shape_str.split(" "):
+                parts = xy.split(",")
+                dx = float(parts[0]) - cx
+                dy = float(parts[1]) - cy
+                if dx * dx + dy * dy <= r_sq:
+                    return True
+            return False
+
         net = ET.parse(file).getroot()
         for obj in net:
             if obj.tag == "location":
@@ -842,6 +864,13 @@ class Net:
             if obj.tag == "edge":
                 if "function" in obj.attrib and obj.attrib["function"] == "walkingarea":
                     continue
+                # Spatial filter: skip edge if none of its lanes are near the center
+                if use_spatial_filter:
+                    lane_elems = [ch for ch in obj if ch.tag == "lane"]
+                    if lane_elems and not any(
+                        _coords_within_radius(ch.attrib["shape"]) for ch in lane_elems
+                    ):
+                        continue
                 edge = _Edge(obj.attrib)
                 for edgeChild in obj:
                     if edgeChild.tag == "stopOffset":
@@ -858,6 +887,10 @@ class Net:
                         edge.append_lane(lane)
                 self.edges[edge.id] = edge
             elif obj.tag == "junction":
+                # Spatial filter: skip junction if its shape is outside the radius
+                if use_spatial_filter and "shape" in obj.attrib:
+                    if not _coords_within_radius(obj.attrib["shape"]):
+                        continue
                 junction = _Junction(obj.attrib)
                 for jnChild in obj:
                     if jnChild.tag == "request":

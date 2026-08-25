@@ -1,0 +1,34 @@
+# Example configuration for visualize_conflict.py
+# Visualizes conflict trajectories from a JSONL file on a SUMO network map.
+# Paths (jsonl, net, output_dir) are passed via command-line arguments.
+
+# Network loading
+net_radius: 500           # Only load roads within this radius (meters) of the conflict vehicle.
+                          # Set to null to load the entire network.
+
+# Visualization mode
+animate: false            # true for animation (MP4), false for static image (PNG)
+video_name: "conflict_0"  # Base name for animation output (only used when animate: true)
+fps: 10                   # Animation frame rate
+
+# Plot appearance
+figsize: "12,8"           # Figure size in inches (width,height)
+dpi: 150                  # Resolution for saved images/animations
+
+# Map styling
+map_style:
+  style: "EUR"
+  zoom_to_extents: false          # Set false to use custom view centered on conflict
+  show_title: false
+  show_labels: false
+
+  # Custom view settings (used when zoom_to_extents: false)
+  view:
+    width: 80                     # View width in meters
+    height: 80                    # View height in meters
+    center_on_conflict: true      # Center view on conflict midpoint
+
+  # Colors for map elements
+  colors:
+    lane_color: '0.9'
+    lane_marking_color: '0.2'
