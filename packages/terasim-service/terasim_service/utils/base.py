@@ -2,9 +2,6 @@ import importlib
 from loguru import logger
 from omegaconf import OmegaConf
 from pathlib import Path
-from pydantic import BaseModel, Field
-import redis
-import sys
 import yaml
 
 from terasim.logger.infoextractor import InfoExtractor
@@ -12,39 +9,6 @@ from terasim.simulator import Simulator
 
 from terasim_nde_nade.vehicle import NDEVehicleFactory
 from terasim_nde_nade.vru import NDEVulnerableRoadUserFactory
-
-from .messages import AgentCommand
-
-
-class SimulationConfig(BaseModel):
-    config_file: str = Field(
-        ..., description="Path to the simulation configuration file"
-    )
-    auto_run: bool = Field(
-        False,
-        description="Whether to automatically run the simulation or wait for manual control",
-    )
-
-
-class SimulationStatus(BaseModel):
-    id: str = Field(..., description="Unique identifier for the simulation")
-    status: str = Field(..., description="Current status of the simulation")
-    progress: float = Field(
-        0.0, description="Progress of the simulation as a percentage"
-    )
-
-
-class SimulationCommand(BaseModel):
-    command: str = Field(
-        ...,
-        description="Control command for the simulation (e.g., 'pause', 'resume', 'stop')",
-    )
-
-
-class AgentCommandBatch(BaseModel):
-    commands: list[AgentCommand] = Field(
-        ..., description="List of agent commands to execute"
-    )
 
 
 def load_config(config_file):
@@ -131,14 +95,12 @@ def create_environment(config, base_dir):
     )
 
 
-def create_simulator(config, base_dir, step_length=None):
+def create_simulator(config, base_dir):
     """Create the simulator based on the configuration.
 
     Args:
         config (dict): The configuration dictionary with resolved paths.
         base_dir (str): Base directory for the simulator.
-        step_length (float, optional): Override SUMO's configured step length.
-            Defaults to the scenario parameter, then the SUMO config value.
 
     Returns:
         Simulator: The simulator object.
@@ -158,13 +120,7 @@ def create_simulator(config, base_dir, step_length=None):
         seed=config["simulator"]["parameters"].get("sumo_seed", None),
         additional_sumo_args=["--start", "--quit-on-end"],
         traffic_scale=config["simulator"]["parameters"].get("traffic_scale", 1),
-        step_length=(
-            step_length
-            if step_length is not None
-            else config["simulator"]["parameters"].get("step_length")
-        ),
     )
-
 
 def set_random_seed(seed):
     """Set the random seed for the simulation.
@@ -179,15 +135,3 @@ def set_random_seed(seed):
     except ImportError:
         pass
     logger.info(f"Setting random seed to {seed}")
-
-# Add this function to check Redis connection
-def check_redis_connection():
-    """Check the connection to Redis.
-    """
-    try:
-        redis_client = redis.Redis(host="localhost", port=6379, db=0)
-        redis_client.ping()
-        logger.info("Successfully connected to Redis")
-    except redis.ConnectionError:
-        logger.error("Failed to connect to Redis. Exiting...")
-        sys.exit(1)

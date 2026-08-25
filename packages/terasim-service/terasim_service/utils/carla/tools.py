@@ -298,7 +298,6 @@ def destroy_all_actors(world):
     carla_actors = (
         list(world.get_actors().filter("vehicle.*"))
         + list(world.get_actors().filter("walker.pedestrian.*"))
-        + list(world.get_actors().filter("sensor.*"))
         + list(world.get_actors().filter("static.prop.constructioncone"))
     )
 
@@ -418,16 +417,6 @@ def carla_to_utm(x, y):
     utm_x, utm_y, _, _ = utm.from_latlon(lat, lon)
 
     return utm_x, utm_y
-
-
-def sumo_point_to_carla(sumo_location, offset):
-    # SUMO point is [x, y, z] without vehicle shape correction.
-    return carla.Location(
-        x=sumo_location[0] + offset[0],
-        y=-sumo_location[1] + offset[1],
-        z=sumo_location[2] + offset[2],
-    )
-
 
 def sumo_to_carla(sumo_location, sumo_rotation, shape, offset):
     # SUMO location is [x,y,z], repsernting the head center of the agent

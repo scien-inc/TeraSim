@@ -16,7 +16,6 @@ from terasim.agent.agent import Agent, AgentInitialInfo
 
 from .overlay import has_libsumo, traci
 from .pipeline import Pipeline, PipelineElement
-from .profiling import timed as profile_timed
 
 
 class Context:
@@ -252,8 +251,7 @@ class Simulator(object):
             simulator (Simulator): Simulator object.
             ctx (dict): Context information.
         """
-        with profile_timed(ctx, "terasim_internal.sumo_simulation_step_s"):
-            traci.simulationStep()
+        traci.simulationStep()
 
     def record_step_start_time(self, simulator, ctx):
         """Record the starting time of the step.
@@ -272,13 +270,12 @@ class Simulator(object):
             ctx (dict): Context information.
         """
         if self.realtime_flag:
-            with profile_timed(ctx, "terasim_internal.realtime_compensation_s"):
-                step_time = time.time() - self.step_start_time
-                sim_step_size = utils.get_step_size()
-                if step_time < sim_step_size:
-                    time.sleep(sim_step_size - step_time)
-                else:
-                    logger.critical(step_time)
+            step_time = time.time() - self.step_start_time
+            sim_step_size = utils.get_step_size()
+            if step_time < sim_step_size:
+                time.sleep(sim_step_size - step_time)
+            else:
+                logger.critical(step_time)
 
     def run(self):
         """Run the specific episode.

@@ -60,13 +60,13 @@ environment:
     log_flag: true
     run_time: 600
     stochastic_acc_flag: false
-    sumo_cfg_file_path: /app/examples/maps/town01/Town01.sumocfg
+    sumo_cfg_file_path: /app/examples/maps/town01/Town01_dt005.sumocfg
     sumo_net_file_path: /app/examples/maps/town01/Town01.net.xml
     vehicle_factory: terasim_nde_nade.vehicle.nde_vehicle_factory.NDEVehicleFactory
     warmup_time_lb: 1
     warmup_time_ub: 2
 input:
-  sumo_config_file: /app/examples/maps/town01/Town01.sumocfg
+  sumo_config_file: /app/examples/maps/town01/Town01_dt005.sumocfg
   sumo_net_file: /app/examples/maps/town01/Town01.net.xml
 logging:
   levels:
@@ -75,7 +75,7 @@ logging:
 output:
   aggregated_dir: aggregated
   dir: /app/outputs
-  name: town01_test
+  name: town01_dt005_test
   nth: '0_0'
 parameters:
   num_cars: 8
