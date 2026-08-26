@@ -1,0 +1,345 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<!-- generated on 2026-08-26 15:57:43.011174 by randomTrips.py UNKNOWN
+<configuration>
+    <net-file value="kashiwanoha.net.xml"/>
+    <additional-files value="vtypes.add.xml"/>
+    <output-trip-file value="kashiwanoha.trips.xml"/>
+    <trip-attributes value="type=&quot;NDE_URBAN&quot;"/>
+    <validate value="True"/>
+    <period value="12.0"/>
+</configuration>
+-->
+
+<!-- generated on 2026-08-26 15:57:43 by Eclipse SUMO duarouter Version 1.23.1
+<duarouterConfiguration xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/duarouterConfiguration.xsd">
+
+    <input>
+        <net-file value="kashiwanoha.net.xml"/>
+        <additional-files value="vtypes.add.xml"/>
+        <route-files value="kashiwanoha.trips.xml"/>
+    </input>
+
+    <output>
+        <output-file value="kashiwanoha.trips.xml.tmp"/>
+        <alternatives-output value="NUL"/>
+        <write-trips value="true"/>
+    </output>
+
+    <time>
+        <begin value="0.0"/>
+        <end value="3600.0"/>
+    </time>
+
+    <report>
+        <no-warnings value="true"/>
+        <ignore-errors value="true"/>
+        <no-step-log value="true"/>
+    </report>
+
+</duarouterConfiguration>
+-->
+
+<routes xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/routes_file.xsd">
+    <vType id="NDE_URBAN" length="5.00" minGap="3.28" maxSpeed="10.00" speedFactor="normc(1.00,0.10,0.80,1.20)" width="1.85" lcCooperative="0" lcSpeedGain="0.0001" lcKeepRight="1" carFollowModel="IDM" accel="1.84" decel="1.29" emergencyDecel="7.06" tau="1.17"/>
+    <trip id="0" type="NDE_URBAN" depart="0.00" from="32.0" to="1.0"/>
+    <trip id="1" type="NDE_URBAN" depart="12.00" from="19.0" to="17.0"/>
+    <trip id="2" type="NDE_URBAN" depart="24.00" from="37.0" to="34.0"/>
+    <trip id="3" type="NDE_URBAN" depart="36.00" from="5.0" to="11.0"/>
+    <trip id="4" type="NDE_URBAN" depart="48.00" from="24.0" to="1.0"/>
+    <trip id="5" type="NDE_URBAN" depart="60.00" from="17.0" to="28.0"/>
+    <trip id="6" type="NDE_URBAN" depart="72.00" from="1.0" to="16.0"/>
+    <trip id="7" type="NDE_URBAN" depart="84.00" from="33.0" to="29.0"/>
+    <trip id="8" type="NDE_URBAN" depart="96.00" from="17.0" to="30.0"/>
+    <trip id="9" type="NDE_URBAN" depart="108.00" from="4.0" to="0.0"/>
+    <trip id="10" type="NDE_URBAN" depart="120.00" from="4.0" to="35.0"/>
+    <trip id="11" type="NDE_URBAN" depart="132.00" from="21.0" to="14.0"/>
+    <trip id="12" type="NDE_URBAN" depart="144.00" from="8.0" to="21.0"/>
+    <trip id="13" type="NDE_URBAN" depart="156.00" from="11.0" to="12.0"/>
+    <trip id="14" type="NDE_URBAN" depart="168.00" from="41.0" to="31.0"/>
+    <trip id="15" type="NDE_URBAN" depart="180.00" from="4.0" to="37.0"/>
+    <trip id="16" type="NDE_URBAN" depart="192.00" from="29.0" to="8.0"/>
+    <trip id="17" type="NDE_URBAN" depart="204.00" from="22.0" to="3.0"/>
+    <trip id="18" type="NDE_URBAN" depart="216.00" from="40.0" to="31.0"/>
+    <trip id="19" type="NDE_URBAN" depart="228.00" from="42.0" to="30.0"/>
+    <trip id="20" type="NDE_URBAN" depart="240.00" from="35.0" to="1.0"/>
+    <trip id="21" type="NDE_URBAN" depart="252.00" from="17.0" to="2.0"/>
+    <trip id="22" type="NDE_URBAN" depart="264.00" from="11.0" to="17.0"/>
+    <trip id="23" type="NDE_URBAN" depart="276.00" from="12.0" to="19.0"/>
+    <trip id="24" type="NDE_URBAN" depart="288.00" from="32.0" to="22.0"/>
+    <trip id="25" type="NDE_URBAN" depart="300.00" from="22.0" to="16.0"/>
+    <trip id="26" type="NDE_URBAN" depart="312.00" from="19.0" to="7.0"/>
+    <trip id="27" type="NDE_URBAN" depart="324.00" from="33.0" to="31.0"/>
+    <trip id="28" type="NDE_URBAN" depart="336.00" from="15.0" to="37.0"/>
+    <trip id="29" type="NDE_URBAN" depart="348.00" from="14.0" to="22.0"/>
+    <trip id="30" type="NDE_URBAN" depart="360.00" from="9.0" to="32.0"/>
+    <trip id="31" type="NDE_URBAN" depart="372.00" from="3.0" to="34.0"/>
+    <trip id="32" type="NDE_URBAN" depart="384.00" from="41.0" to="39.0"/>
+    <trip id="33" type="NDE_URBAN" depart="396.00" from="17.0" to="1.0"/>
+    <trip id="34" type="NDE_URBAN" depart="408.00" from="20.0" to="19.0"/>
+    <trip id="35" type="NDE_URBAN" depart="420.00" from="16.0" to="7.0"/>
+    <trip id="36" type="NDE_URBAN" depart="432.00" from="42.0" to="20.0"/>
+    <trip id="37" type="NDE_URBAN" depart="444.00" from="33.0" to="23.0"/>
+    <trip id="38" type="NDE_URBAN" depart="456.00" from="6.0" to="26.0"/>
+    <trip id="39" type="NDE_URBAN" depart="468.00" from="19.0" to="18.0"/>
+    <trip id="40" type="NDE_URBAN" depart="480.00" from="3.0" to="19.0"/>
+    <trip id="41" type="NDE_URBAN" depart="492.00" from="30.0" to="5.0"/>
+    <trip id="42" type="NDE_URBAN" depart="504.00" from="23.0" to="17.0"/>
+    <trip id="43" type="NDE_URBAN" depart="516.00" from="9.0" to="28.0"/>
+    <trip id="44" type="NDE_URBAN" depart="528.00" from="11.0" to="1.0"/>
+    <trip id="45" type="NDE_URBAN" depart="540.00" from="12.0" to="32.0"/>
+    <trip id="46" type="NDE_URBAN" depart="552.00" from="4.0" to="24.0"/>
+    <trip id="47" type="NDE_URBAN" depart="564.00" from="10.0" to="23.0"/>
+    <trip id="48" type="NDE_URBAN" depart="576.00" from="9.0" to="29.0"/>
+    <trip id="49" type="NDE_URBAN" depart="588.00" from="8.0" to="42.0"/>
+    <trip id="50" type="NDE_URBAN" depart="600.00" from="0.0" to="37.0"/>
+    <trip id="51" type="NDE_URBAN" depart="612.00" from="34.0" to="29.0"/>
+    <trip id="52" type="NDE_URBAN" depart="624.00" from="19.0" to="32.0"/>
+    <trip id="53" type="NDE_URBAN" depart="636.00" from="12.0" to="25.0"/>
+    <trip id="54" type="NDE_URBAN" depart="648.00" from="26.0" to="8.0"/>
+    <trip id="55" type="NDE_URBAN" depart="660.00" from="42.0" to="19.0"/>
+    <trip id="56" type="NDE_URBAN" depart="672.00" from="28.0" to="15.0"/>
+    <trip id="57" type="NDE_URBAN" depart="684.00" from="6.0" to="42.0"/>
+    <trip id="58" type="NDE_URBAN" depart="696.00" from="2.0" to="32.0"/>
+    <trip id="59" type="NDE_URBAN" depart="708.00" from="31.0" to="14.0"/>
+    <trip id="60" type="NDE_URBAN" depart="720.00" from="39.0" to="29.0"/>
+    <trip id="61" type="NDE_URBAN" depart="732.00" from="39.0" to="29.0"/>
+    <trip id="62" type="NDE_URBAN" depart="744.00" from="0.0" to="20.0"/>
+    <trip id="63" type="NDE_URBAN" depart="756.00" from="0.0" to="7.0"/>
+    <trip id="64" type="NDE_URBAN" depart="768.00" from="42.0" to="40.0"/>
+    <trip id="65" type="NDE_URBAN" depart="780.00" from="2.0" to="10.0"/>
+    <trip id="66" type="NDE_URBAN" depart="792.00" from="42.0" to="7.0"/>
+    <trip id="67" type="NDE_URBAN" depart="804.00" from="11.0" to="27.0"/>
+    <trip id="68" type="NDE_URBAN" depart="816.00" from="10.0" to="38.0"/>
+    <trip id="69" type="NDE_URBAN" depart="828.00" from="39.0" to="13.0"/>
+    <trip id="70" type="NDE_URBAN" depart="840.00" from="26.0" to="3.0"/>
+    <trip id="71" type="NDE_URBAN" depart="852.00" from="19.0" to="42.0"/>
+    <trip id="72" type="NDE_URBAN" depart="864.00" from="24.0" to="16.0"/>
+    <trip id="73" type="NDE_URBAN" depart="876.00" from="29.0" to="37.0"/>
+    <trip id="74" type="NDE_URBAN" depart="888.00" from="16.0" to="20.0"/>
+    <trip id="75" type="NDE_URBAN" depart="900.00" from="9.0" to="33.0"/>
+    <trip id="76" type="NDE_URBAN" depart="912.00" from="25.0" to="28.0"/>
+    <trip id="77" type="NDE_URBAN" depart="924.00" from="13.0" to="17.0"/>
+    <trip id="78" type="NDE_URBAN" depart="936.00" from="21.0" to="30.0"/>
+    <trip id="79" type="NDE_URBAN" depart="948.00" from="17.0" to="17.0"/>
+    <trip id="80" type="NDE_URBAN" depart="960.00" from="10.0" to="32.0"/>
+    <trip id="81" type="NDE_URBAN" depart="972.00" from="17.0" to="6.0"/>
+    <trip id="82" type="NDE_URBAN" depart="984.00" from="42.0" to="10.0"/>
+    <trip id="83" type="NDE_URBAN" depart="996.00" from="17.0" to="34.0"/>
+    <trip id="84" type="NDE_URBAN" depart="1008.00" from="16.0" to="13.0"/>
+    <trip id="85" type="NDE_URBAN" depart="1020.00" from="7.0" to="3.0"/>
+    <trip id="86" type="NDE_URBAN" depart="1032.00" from="26.0" to="39.0"/>
+    <trip id="87" type="NDE_URBAN" depart="1044.00" from="4.0" to="15.0"/>
+    <trip id="88" type="NDE_URBAN" depart="1056.00" from="12.0" to="25.0"/>
+    <trip id="89" type="NDE_URBAN" depart="1068.00" from="24.0" to="26.0"/>
+    <trip id="90" type="NDE_URBAN" depart="1080.00" from="37.0" to="34.0"/>
+    <trip id="91" type="NDE_URBAN" depart="1092.00" from="9.0" to="12.0"/>
+    <trip id="92" type="NDE_URBAN" depart="1104.00" from="23.0" to="21.0"/>
+    <trip id="93" type="NDE_URBAN" depart="1116.00" from="42.0" to="18.0"/>
+    <trip id="94" type="NDE_URBAN" depart="1128.00" from="15.0" to="25.0"/>
+    <trip id="95" type="NDE_URBAN" depart="1140.00" from="24.0" to="19.0"/>
+    <trip id="96" type="NDE_URBAN" depart="1152.00" from="18.0" to="6.0"/>
+    <trip id="97" type="NDE_URBAN" depart="1164.00" from="25.0" to="42.0"/>
+    <trip id="98" type="NDE_URBAN" depart="1176.00" from="3.0" to="10.0"/>
+    <trip id="99" type="NDE_URBAN" depart="1188.00" from="9.0" to="41.0"/>
+    <trip id="100" type="NDE_URBAN" depart="1200.00" from="8.0" to="6.0"/>
+    <trip id="101" type="NDE_URBAN" depart="1212.00" from="41.0" to="14.0"/>
+    <trip id="102" type="NDE_URBAN" depart="1224.00" from="27.0" to="16.0"/>
+    <trip id="103" type="NDE_URBAN" depart="1236.00" from="23.0" to="10.0"/>
+    <trip id="104" type="NDE_URBAN" depart="1248.00" from="22.0" to="9.0"/>
+    <trip id="105" type="NDE_URBAN" depart="1260.00" from="19.0" to="39.0"/>
+    <trip id="106" type="NDE_URBAN" depart="1272.00" from="26.0" to="24.0"/>
+    <trip id="107" type="NDE_URBAN" depart="1284.00" from="8.0" to="9.0"/>
+    <trip id="108" type="NDE_URBAN" depart="1296.00" from="3.0" to="37.0"/>
+    <trip id="109" type="NDE_URBAN" depart="1308.00" from="14.0" to="2.0"/>
+    <trip id="110" type="NDE_URBAN" depart="1320.00" from="8.0" to="30.0"/>
+    <trip id="111" type="NDE_URBAN" depart="1332.00" from="29.0" to="38.0"/>
+    <trip id="112" type="NDE_URBAN" depart="1344.00" from="10.0" to="30.0"/>
+    <trip id="113" type="NDE_URBAN" depart="1356.00" from="28.0" to="41.0"/>
+    <trip id="114" type="NDE_URBAN" depart="1368.00" from="14.0" to="8.0"/>
+    <trip id="115" type="NDE_URBAN" depart="1380.00" from="11.0" to="15.0"/>
+    <trip id="116" type="NDE_URBAN" depart="1392.00" from="30.0" to="34.0"/>
+    <trip id="117" type="NDE_URBAN" depart="1404.00" from="17.0" to="13.0"/>
+    <trip id="118" type="NDE_URBAN" depart="1416.00" from="5.0" to="18.0"/>
+    <trip id="119" type="NDE_URBAN" depart="1428.00" from="30.0" to="32.0"/>
+    <trip id="120" type="NDE_URBAN" depart="1440.00" from="24.0" to="30.0"/>
+    <trip id="121" type="NDE_URBAN" depart="1452.00" from="28.0" to="7.0"/>
+    <trip id="122" type="NDE_URBAN" depart="1464.00" from="16.0" to="37.0"/>
+    <trip id="123" type="NDE_URBAN" depart="1476.00" from="18.0" to="23.0"/>
+    <trip id="124" type="NDE_URBAN" depart="1488.00" from="34.0" to="2.0"/>
+    <trip id="125" type="NDE_URBAN" depart="1500.00" from="20.0" to="38.0"/>
+    <trip id="126" type="NDE_URBAN" depart="1512.00" from="11.0" to="26.0"/>
+    <trip id="127" type="NDE_URBAN" depart="1524.00" from="9.0" to="9.0"/>
+    <trip id="128" type="NDE_URBAN" depart="1536.00" from="11.0" to="16.0"/>
+    <trip id="129" type="NDE_URBAN" depart="1548.00" from="19.0" to="7.0"/>
+    <trip id="130" type="NDE_URBAN" depart="1560.00" from="42.0" to="42.0"/>
+    <trip id="131" type="NDE_URBAN" depart="1572.00" from="22.0" to="14.0"/>
+    <trip id="132" type="NDE_URBAN" depart="1584.00" from="41.0" to="35.0"/>
+    <trip id="133" type="NDE_URBAN" depart="1596.00" from="31.0" to="9.0"/>
+    <trip id="134" type="NDE_URBAN" depart="1608.00" from="33.0" to="0.0"/>
+    <trip id="135" type="NDE_URBAN" depart="1620.00" from="40.0" to="2.0"/>
+    <trip id="136" type="NDE_URBAN" depart="1632.00" from="33.0" to="7.0"/>
+    <trip id="137" type="NDE_URBAN" depart="1644.00" from="13.0" to="12.0"/>
+    <trip id="138" type="NDE_URBAN" depart="1656.00" from="12.0" to="3.0"/>
+    <trip id="139" type="NDE_URBAN" depart="1668.00" from="19.0" to="31.0"/>
+    <trip id="140" type="NDE_URBAN" depart="1680.00" from="37.0" to="16.0"/>
+    <trip id="141" type="NDE_URBAN" depart="1692.00" from="32.0" to="19.0"/>
+    <trip id="142" type="NDE_URBAN" depart="1704.00" from="27.0" to="6.0"/>
+    <trip id="143" type="NDE_URBAN" depart="1716.00" from="41.0" to="11.0"/>
+    <trip id="144" type="NDE_URBAN" depart="1728.00" from="24.0" to="19.0"/>
+    <trip id="145" type="NDE_URBAN" depart="1740.00" from="0.0" to="39.0"/>
+    <trip id="146" type="NDE_URBAN" depart="1752.00" from="32.0" to="19.0"/>
+    <trip id="147" type="NDE_URBAN" depart="1764.00" from="38.0" to="3.0"/>
+    <trip id="148" type="NDE_URBAN" depart="1776.00" from="24.0" to="0.0"/>
+    <trip id="149" type="NDE_URBAN" depart="1788.00" from="11.0" to="5.0"/>
+    <trip id="150" type="NDE_URBAN" depart="1800.00" from="5.0" to="29.0"/>
+    <trip id="151" type="NDE_URBAN" depart="1812.00" from="41.0" to="30.0"/>
+    <trip id="152" type="NDE_URBAN" depart="1824.00" from="14.0" to="13.0"/>
+    <trip id="153" type="NDE_URBAN" depart="1836.00" from="2.0" to="5.0"/>
+    <trip id="154" type="NDE_URBAN" depart="1848.00" from="4.0" to="42.0"/>
+    <trip id="155" type="NDE_URBAN" depart="1860.00" from="5.0" to="16.0"/>
+    <trip id="156" type="NDE_URBAN" depart="1872.00" from="18.0" to="12.0"/>
+    <trip id="157" type="NDE_URBAN" depart="1884.00" from="39.0" to="5.0"/>
+    <trip id="158" type="NDE_URBAN" depart="1896.00" from="24.0" to="32.0"/>
+    <trip id="159" type="NDE_URBAN" depart="1908.00" from="14.0" to="7.0"/>
+    <trip id="160" type="NDE_URBAN" depart="1920.00" from="42.0" to="9.0"/>
+    <trip id="161" type="NDE_URBAN" depart="1932.00" from="40.0" to="5.0"/>
+    <trip id="162" type="NDE_URBAN" depart="1944.00" from="1.0" to="37.0"/>
+    <trip id="163" type="NDE_URBAN" depart="1956.00" from="20.0" to="7.0"/>
+    <trip id="164" type="NDE_URBAN" depart="1968.00" from="4.0" to="42.0"/>
+    <trip id="165" type="NDE_URBAN" depart="1980.00" from="40.0" to="19.0"/>
+    <trip id="166" type="NDE_URBAN" depart="1992.00" from="4.0" to="12.0"/>
+    <trip id="167" type="NDE_URBAN" depart="2004.00" from="42.0" to="42.0"/>
+    <trip id="168" type="NDE_URBAN" depart="2016.00" from="17.0" to="40.0"/>
+    <trip id="169" type="NDE_URBAN" depart="2028.00" from="26.0" to="2.0"/>
+    <trip id="170" type="NDE_URBAN" depart="2040.00" from="4.0" to="17.0"/>
+    <trip id="171" type="NDE_URBAN" depart="2052.00" from="0.0" to="16.0"/>
+    <trip id="172" type="NDE_URBAN" depart="2064.00" from="20.0" to="42.0"/>
+    <trip id="173" type="NDE_URBAN" depart="2076.00" from="8.0" to="19.0"/>
+    <trip id="174" type="NDE_URBAN" depart="2088.00" from="32.0" to="23.0"/>
+    <trip id="175" type="NDE_URBAN" depart="2100.00" from="9.0" to="29.0"/>
+    <trip id="176" type="NDE_URBAN" depart="2112.00" from="7.0" to="12.0"/>
+    <trip id="177" type="NDE_URBAN" depart="2124.00" from="8.0" to="15.0"/>
+    <trip id="178" type="NDE_URBAN" depart="2136.00" from="8.0" to="19.0"/>
+    <trip id="179" type="NDE_URBAN" depart="2148.00" from="12.0" to="25.0"/>
+    <trip id="180" type="NDE_URBAN" depart="2160.00" from="37.0" to="20.0"/>
+    <trip id="181" type="NDE_URBAN" depart="2172.00" from="31.0" to="28.0"/>
+    <trip id="182" type="NDE_URBAN" depart="2184.00" from="23.0" to="30.0"/>
+    <trip id="183" type="NDE_URBAN" depart="2196.00" from="18.0" to="35.0"/>
+    <trip id="184" type="NDE_URBAN" depart="2208.00" from="0.0" to="6.0"/>
+    <trip id="185" type="NDE_URBAN" depart="2220.00" from="29.0" to="37.0"/>
+    <trip id="186" type="NDE_URBAN" depart="2232.00" from="38.0" to="34.0"/>
+    <trip id="187" type="NDE_URBAN" depart="2244.00" from="22.0" to="10.0"/>
+    <trip id="188" type="NDE_URBAN" depart="2256.00" from="33.0" to="20.0"/>
+    <trip id="189" type="NDE_URBAN" depart="2268.00" from="20.0" to="41.0"/>
+    <trip id="190" type="NDE_URBAN" depart="2280.00" from="37.0" to="2.0"/>
+    <trip id="191" type="NDE_URBAN" depart="2292.00" from="2.0" to="24.0"/>
+    <trip id="192" type="NDE_URBAN" depart="2304.00" from="23.0" to="2.0"/>
+    <trip id="193" type="NDE_URBAN" depart="2316.00" from="13.0" to="24.0"/>
+    <trip id="194" type="NDE_URBAN" depart="2328.00" from="7.0" to="34.0"/>
+    <trip id="195" type="NDE_URBAN" depart="2340.00" from="5.0" to="31.0"/>
+    <trip id="196" type="NDE_URBAN" depart="2352.00" from="2.0" to="3.0"/>
+    <trip id="197" type="NDE_URBAN" depart="2364.00" from="0.0" to="2.0"/>
+    <trip id="198" type="NDE_URBAN" depart="2376.00" from="25.0" to="30.0"/>
+    <trip id="199" type="NDE_URBAN" depart="2388.00" from="33.0" to="26.0"/>
+    <trip id="200" type="NDE_URBAN" depart="2400.00" from="25.0" to="16.0"/>
+    <trip id="201" type="NDE_URBAN" depart="2412.00" from="26.0" to="5.0"/>
+    <trip id="202" type="NDE_URBAN" depart="2424.00" from="4.0" to="15.0"/>
+    <trip id="203" type="NDE_URBAN" depart="2436.00" from="11.0" to="28.0"/>
+    <trip id="204" type="NDE_URBAN" depart="2448.00" from="32.0" to="21.0"/>
+    <trip id="205" type="NDE_URBAN" depart="2460.00" from="40.0" to="38.0"/>
+    <trip id="206" type="NDE_URBAN" depart="2472.00" from="34.0" to="17.0"/>
+    <trip id="207" type="NDE_URBAN" depart="2484.00" from="16.0" to="1.0"/>
+    <trip id="208" type="NDE_URBAN" depart="2496.00" from="18.0" to="26.0"/>
+    <trip id="209" type="NDE_URBAN" depart="2508.00" from="41.0" to="11.0"/>
+    <trip id="210" type="NDE_URBAN" depart="2520.00" from="24.0" to="32.0"/>
+    <trip id="211" type="NDE_URBAN" depart="2532.00" from="16.0" to="35.0"/>
+    <trip id="212" type="NDE_URBAN" depart="2544.00" from="27.0" to="18.0"/>
+    <trip id="213" type="NDE_URBAN" depart="2556.00" from="33.0" to="0.0"/>
+    <trip id="214" type="NDE_URBAN" depart="2568.00" from="38.0" to="39.0"/>
+    <trip id="215" type="NDE_URBAN" depart="2580.00" from="12.0" to="24.0"/>
+    <trip id="216" type="NDE_URBAN" depart="2592.00" from="15.0" to="8.0"/>
+    <trip id="217" type="NDE_URBAN" depart="2604.00" from="28.0" to="10.0"/>
+    <trip id="218" type="NDE_URBAN" depart="2616.00" from="18.0" to="41.0"/>
+    <trip id="219" type="NDE_URBAN" depart="2628.00" from="26.0" to="4.0"/>
+    <trip id="220" type="NDE_URBAN" depart="2640.00" from="34.0" to="9.0"/>
+    <trip id="221" type="NDE_URBAN" depart="2652.00" from="31.0" to="7.0"/>
+    <trip id="222" type="NDE_URBAN" depart="2664.00" from="5.0" to="31.0"/>
+    <trip id="223" type="NDE_URBAN" depart="2676.00" from="37.0" to="28.0"/>
+    <trip id="224" type="NDE_URBAN" depart="2688.00" from="40.0" to="3.0"/>
+    <trip id="225" type="NDE_URBAN" depart="2700.00" from="5.0" to="38.0"/>
+    <trip id="226" type="NDE_URBAN" depart="2712.00" from="26.0" to="18.0"/>
+    <trip id="227" type="NDE_URBAN" depart="2724.00" from="18.0" to="32.0"/>
+    <trip id="228" type="NDE_URBAN" depart="2736.00" from="39.0" to="28.0"/>
+    <trip id="229" type="NDE_URBAN" depart="2748.00" from="32.0" to="19.0"/>
+    <trip id="230" type="NDE_URBAN" depart="2760.00" from="11.0" to="2.0"/>
+    <trip id="231" type="NDE_URBAN" depart="2772.00" from="19.0" to="20.0"/>
+    <trip id="232" type="NDE_URBAN" depart="2784.00" from="29.0" to="13.0"/>
+    <trip id="233" type="NDE_URBAN" depart="2796.00" from="17.0" to="35.0"/>
+    <trip id="234" type="NDE_URBAN" depart="2808.00" from="35.0" to="10.0"/>
+    <trip id="235" type="NDE_URBAN" depart="2820.00" from="24.0" to="29.0"/>
+    <trip id="236" type="NDE_URBAN" depart="2832.00" from="24.0" to="16.0"/>
+    <trip id="237" type="NDE_URBAN" depart="2844.00" from="24.0" to="6.0"/>
+    <trip id="238" type="NDE_URBAN" depart="2856.00" from="30.0" to="35.0"/>
+    <trip id="239" type="NDE_URBAN" depart="2868.00" from="41.0" to="39.0"/>
+    <trip id="240" type="NDE_URBAN" depart="2880.00" from="22.0" to="0.0"/>
+    <trip id="241" type="NDE_URBAN" depart="2892.00" from="21.0" to="38.0"/>
+    <trip id="242" type="NDE_URBAN" depart="2904.00" from="41.0" to="8.0"/>
+    <trip id="243" type="NDE_URBAN" depart="2916.00" from="24.0" to="38.0"/>
+    <trip id="244" type="NDE_URBAN" depart="2928.00" from="29.0" to="31.0"/>
+    <trip id="245" type="NDE_URBAN" depart="2940.00" from="17.0" to="17.0"/>
+    <trip id="246" type="NDE_URBAN" depart="2952.00" from="25.0" to="1.0"/>
+    <trip id="247" type="NDE_URBAN" depart="2964.00" from="21.0" to="34.0"/>
+    <trip id="248" type="NDE_URBAN" depart="2976.00" from="23.0" to="14.0"/>
+    <trip id="249" type="NDE_URBAN" depart="2988.00" from="26.0" to="13.0"/>
+    <trip id="250" type="NDE_URBAN" depart="3000.00" from="32.0" to="1.0"/>
+    <trip id="251" type="NDE_URBAN" depart="3012.00" from="23.0" to="3.0"/>
+    <trip id="252" type="NDE_URBAN" depart="3024.00" from="1.0" to="32.0"/>
+    <trip id="253" type="NDE_URBAN" depart="3036.00" from="13.0" to="26.0"/>
+    <trip id="254" type="NDE_URBAN" depart="3048.00" from="10.0" to="22.0"/>
+    <trip id="255" type="NDE_URBAN" depart="3060.00" from="16.0" to="20.0"/>
+    <trip id="256" type="NDE_URBAN" depart="3072.00" from="38.0" to="22.0"/>
+    <trip id="257" type="NDE_URBAN" depart="3084.00" from="38.0" to="40.0"/>
+    <trip id="258" type="NDE_URBAN" depart="3096.00" from="18.0" to="11.0"/>
+    <trip id="259" type="NDE_URBAN" depart="3108.00" from="0.0" to="29.0"/>
+    <trip id="260" type="NDE_URBAN" depart="3120.00" from="9.0" to="21.0"/>
+    <trip id="261" type="NDE_URBAN" depart="3132.00" from="33.0" to="39.0"/>
+    <trip id="262" type="NDE_URBAN" depart="3144.00" from="33.0" to="38.0"/>
+    <trip id="263" type="NDE_URBAN" depart="3156.00" from="7.0" to="16.0"/>
+    <trip id="264" type="NDE_URBAN" depart="3168.00" from="0.0" to="14.0"/>
+    <trip id="265" type="NDE_URBAN" depart="3180.00" from="13.0" to="34.0"/>
+    <trip id="266" type="NDE_URBAN" depart="3192.00" from="3.0" to="17.0"/>
+    <trip id="267" type="NDE_URBAN" depart="3204.00" from="35.0" to="39.0"/>
+    <trip id="268" type="NDE_URBAN" depart="3216.00" from="15.0" to="31.0"/>
+    <trip id="269" type="NDE_URBAN" depart="3228.00" from="38.0" to="12.0"/>
+    <trip id="270" type="NDE_URBAN" depart="3240.00" from="40.0" to="8.0"/>
+    <trip id="271" type="NDE_URBAN" depart="3252.00" from="12.0" to="1.0"/>
+    <trip id="272" type="NDE_URBAN" depart="3264.00" from="20.0" to="34.0"/>
+    <trip id="273" type="NDE_URBAN" depart="3276.00" from="8.0" to="23.0"/>
+    <trip id="274" type="NDE_URBAN" depart="3288.00" from="37.0" to="11.0"/>
+    <trip id="275" type="NDE_URBAN" depart="3300.00" from="35.0" to="32.0"/>
+    <trip id="276" type="NDE_URBAN" depart="3312.00" from="12.0" to="39.0"/>
+    <trip id="277" type="NDE_URBAN" depart="3324.00" from="41.0" to="31.0"/>
+    <trip id="278" type="NDE_URBAN" depart="3336.00" from="13.0" to="9.0"/>
+    <trip id="279" type="NDE_URBAN" depart="3348.00" from="39.0" to="21.0"/>
+    <trip id="280" type="NDE_URBAN" depart="3360.00" from="24.0" to="22.0"/>
+    <trip id="281" type="NDE_URBAN" depart="3372.00" from="28.0" to="21.0"/>
+    <trip id="282" type="NDE_URBAN" depart="3384.00" from="41.0" to="40.0"/>
+    <trip id="283" type="NDE_URBAN" depart="3396.00" from="12.0" to="8.0"/>
+    <trip id="284" type="NDE_URBAN" depart="3408.00" from="32.0" to="40.0"/>
+    <trip id="285" type="NDE_URBAN" depart="3420.00" from="35.0" to="25.0"/>
+    <trip id="286" type="NDE_URBAN" depart="3432.00" from="37.0" to="8.0"/>
+    <trip id="287" type="NDE_URBAN" depart="3444.00" from="19.0" to="4.0"/>
+    <trip id="288" type="NDE_URBAN" depart="3456.00" from="29.0" to="27.0"/>
+    <trip id="289" type="NDE_URBAN" depart="3468.00" from="25.0" to="37.0"/>
+    <trip id="290" type="NDE_URBAN" depart="3480.00" from="19.0" to="41.0"/>
+    <trip id="291" type="NDE_URBAN" depart="3492.00" from="40.0" to="11.0"/>
+    <trip id="292" type="NDE_URBAN" depart="3504.00" from="5.0" to="18.0"/>
+    <trip id="293" type="NDE_URBAN" depart="3516.00" from="26.0" to="31.0"/>
+    <trip id="294" type="NDE_URBAN" depart="3528.00" from="22.0" to="1.0"/>
+    <trip id="295" type="NDE_URBAN" depart="3540.00" from="41.0" to="15.0"/>
+    <trip id="296" type="NDE_URBAN" depart="3552.00" from="16.0" to="4.0"/>
+    <trip id="297" type="NDE_URBAN" depart="3564.00" from="21.0" to="42.0"/>
+    <trip id="298" type="NDE_URBAN" depart="3576.00" from="35.0" to="19.0"/>
+    <trip id="299" type="NDE_URBAN" depart="3588.00" from="0.0" to="7.0"/>
+</routes>
