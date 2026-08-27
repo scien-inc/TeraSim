@@ -90,14 +90,14 @@ The dedicated physical launcher sets `USE_LIBSUMO=0`, matching the 3-way
 workflow. This runs the patched SUMO engine as a TraCI child process instead
 of loading libsumo into TeraSim's simulation thread. Both generated Python
 APIs expose `moveToXYImmediate`; focused integration tests cover TraCI and
-libsumo, while the Odaiba physical 3-way run is validated through TraCI.
+libsumo, and the physical 3-way run is validated through TraCI.
 
-Acceptance uses CARLA world `odaiba_default_carla_repaired`, SUMO net
-`/var/tmp/share/maps_0821/network.repaired_geometry.net.xml`, and route
-`/var/tmp/share/maps_0821/vehicles.filtered_r300.rou.xml`. The two-way physical
-run is exercised for 12,000 synchronized steps with TraCI and again with
-libsumo before adding the Autoware ego for the 6,000-step three-way run.
-`odaiba_osmlike` and CARLA `odaiba_tl_mapping` are not acceptance maps.
+Acceptance runs on a dense urban map whose CARLA world and SUMO net describe
+the same road geometry. The two-way physical run is exercised for 12,000
+synchronized steps with TraCI and again with libsumo before adding the Autoware
+ego for the 6,000-step three-way run. A map whose SUMO net only approximates
+the CARLA geometry is not an acceptance map: the feedback path needs the two
+descriptions to agree on lane centrelines.
 
 An active SUMO lateral speed does not by itself prove a usable steering
 direction: Phase A and Phase B can report the same world position for one
