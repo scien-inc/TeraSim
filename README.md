@@ -88,8 +88,8 @@ python scripts/xodr_to_sumo_converter.py --help
 ```
 
 For the full 3-way setup (Autoware + CARLA + TeraSim in passive mode) see
-`docker-compose.cosim-odaiba-3cosim-inprocess.yml` and
-`examples/scripts/run_3cosim_odaiba_inprocess.sh`.
+`docker-compose.cosim-inprocess.yml` and
+`examples/scripts/run_3cosim_inprocess.sh`.
 
 ## Publications
 
