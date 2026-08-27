@@ -1,4 +1,4 @@
-ARG TERASIM_BASE_IMAGE=terasim-service:inprocess-20260810-local
+ARG TERASIM_BASE_IMAGE=terasim-service:inprocess
 
 FROM ${TERASIM_BASE_IMAGE} AS sumo-builder
 

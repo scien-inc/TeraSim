@@ -26,18 +26,6 @@ def project_root() -> Path:
     return PROJECT_ROOT
 
 
-@pytest.fixture(scope="session") 
-def test_data_dir() -> Path:
-    """Provide the test data directory path."""
-    return PROJECT_ROOT / "tests" / "fixtures" / "data"
-
-
-@pytest.fixture(scope="session")
-def test_config_dir() -> Path:
-    """Provide the test configuration directory path."""
-    return PROJECT_ROOT / "tests" / "fixtures" / "configs"
-
-
 @pytest.fixture
 def temp_dir():
     """Provide a temporary directory for test outputs."""

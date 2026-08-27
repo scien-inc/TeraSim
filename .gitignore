@@ -195,7 +195,6 @@ apps/deploy/outputs
 apps/deploy/examples/maps
 
 # Local generated artifacts
-reports/
 reference_code/
 
 # Visualization outputs (upstream)

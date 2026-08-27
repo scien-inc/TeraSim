@@ -64,9 +64,18 @@ python scripts/run_experiments_debug.py --config examples/scenarios/Mcity_safety
 python -m terasim_service.run_cosim --config examples/scenarios/cosim_town01_dt005.yaml
 ```
 
-For the full three-way setup, `docker-compose.cosim-inprocess.yml` builds on
-`Dockerfile.cosim` and runs `examples/scripts/run_3cosim_inprocess.sh` against a
-CARLA server that an Autoware bridge is already attached to.
+For the full three-way setup, build the image and bring up the compose file,
+which runs `examples/scripts/run_3cosim_inprocess.sh` against a CARLA server
+that an Autoware bridge is already attached to:
+
+```bash
+docker build -f Dockerfile.cosim -t terasim-service:inprocess .
+SCENARIO=/app/examples/scenarios/cosim_town01_dt005.yaml \
+    docker compose -f docker-compose.cosim-inprocess.yml up
+```
+
+Physics-based background vehicles additionally need the patched SUMO build from
+`Dockerfile.sumo-external-state`, which layers onto the image above.
 
 ## **📄 License**
 

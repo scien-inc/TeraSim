@@ -16,7 +16,7 @@ This is a **reduced fork of mcity/TeraSim**, reworked for three-way co-simulatio
 ./setup_environment.sh
 
 # Docker (co-simulation image)
-docker build -f Dockerfile.cosim -t terasim-service:latest .
+docker build -f Dockerfile.cosim -t terasim-service:inprocess .
 ```
 
 ### Testing
