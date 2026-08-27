@@ -726,10 +726,28 @@ class TeraSimCoSimInProcessPlugin(BasePlugin):
             prefer_current_lane=True,
         )
         if projection is None:
-            raise RuntimeError(
-                "physical feedback current-lane mapping failed "
-                f"actor={actor_id} lane={lane_id} position={position}"
-            )
+            # Do not kill the whole run when one actor's measured pose cannot be
+            # projected onto its current lane (e.g. lanes whose SUMO centerline is
+            # offset from the xodr geometry): skip assimilation for this actor this
+            # tick and let the SUMO-side model drive the mirror instead. A global
+            # raise here ended the entire run twice, deterministically, on the
+            # Kashiwanoha map (physics-inprocess-findings.md §2).
+            skips = getattr(self, "_physics_mapping_skips", None)
+            if skips is None:
+                skips = {}
+                self._physics_mapping_skips = skips
+            skips[actor_id] = skips.get(actor_id, 0) + 1
+            count = skips[actor_id]
+            if count <= 3 or count % 200 == 0:
+                self.logger.warning(
+                    "physical feedback current-lane mapping failed; skipping "
+                    "assimilation this tick actor=%s lane=%s position=%s count=%d",
+                    actor_id,
+                    lane_id,
+                    position,
+                    count,
+                )
+            return None
 
         requested_route = tuple(traci.vehicle.getRoute(actor_id))
         phase_a_time = traci.simulation.getTime()
