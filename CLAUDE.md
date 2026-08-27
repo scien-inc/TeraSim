@@ -25,7 +25,7 @@ docker build -f Dockerfile.cosim -t terasim-service:latest .
 pytest
 
 # Run a specific test file
-pytest tests/test_core/test_physics.py::test_dummy
+pytest tests/test_service/test_physics_cosim.py
 ```
 
 ### Code Quality
