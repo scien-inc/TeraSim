@@ -195,7 +195,6 @@ apps/deploy/outputs
 apps/deploy/examples/maps
 
 # Local generated artifacts
-examples/maps/odaiba_ll2/
 reports/
 reference_code/
 
