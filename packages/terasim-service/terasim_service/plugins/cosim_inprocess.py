@@ -1593,7 +1593,7 @@ class TeraSimCoSimInProcessPlugin(BasePlugin):
                             command.agent_id, "", 0, x, y, command.data.get("sumo_angle", 0), 0
                         )
 
-                        # 3-cosim fix (dense maps, e.g. Odaiba): right after moveToXY, append one
+                        # 3-cosim fix (dense maps): right after moveToXY, append one
                         # successor edge so the externally-driven AV's route is never a single
                         # terminal edge. With keepRoute=0 a dense network can map the AV onto an
                         # off-route edge, collapsing its route to that one edge; the AV then reaches
