@@ -19,11 +19,10 @@ Its objective is to **efficiently uncover real-world unknown unsafe events** by
 automatically creating diverse and statistically realistic traffic environments:
 
 - **Naturalistic driving environment (NDE)** — background traffic derived from
-  large-scale naturalistic driving data, statistically realistic rather than
-  hand-scripted.
-- **Adversarial scenario synthesis (NADE)** — rare, high-risk interactions
-  (aggressive cut-ins, unexpected crossings, ...) injected into that traffic to
-  reach failures a nominal drive never encounters.
+  large-scale naturalistic driving data, with statistical realism.
+- **Adversarial scenario synthesis (NADE)** — rare, high-risk interactions such
+  as aggressive cut-ins and unexpected crossings, injected into that traffic to
+  reach the failures that matter for safety validation.
 - Built on [SUMO](https://www.eclipse.org/sumo/), and able to drive third-party
   simulators such as [CARLA](https://carla.org/) and
   [Autoware](https://github.com/autowarefoundation/autoware).
@@ -42,11 +41,8 @@ and TeraSim supplies the background traffic around it.
   server; the externally driven ego is fed back into SUMO so the background
   traffic reacts to it. TeraSim can follow the ego side's clock or own it.
 - **Optional physics-based background vehicles**: selected CARLA vehicles are
-  driven by Ackermann control instead of being teleported, and their measured
-  pose is written back into SUMO.
-- **Everything outside that scope was removed**: TeraSim-World/Cosmos generative
-  sensor simulation, environment generation, dataset tooling, and the
-  Redis/FastAPI service with its clients. See the upstream repository for those.
+  driven by Ackermann control, and their measured pose is written back into
+  SUMO.
 
 Detailed documentation of the co-simulation setup will follow.
 
@@ -54,16 +50,14 @@ Detailed documentation of the co-simulation setup will follow.
 
 Everything map-specific (SUMO net, routes, adversity setup, run time) lives in a
 scenario YAML under `examples/scenarios/`, which you pass to the runner. Three
-maps ship with the repository: **Town01** (CARLA's stock map), **Kashiwanoha**
-(a public Japanese campus map) and **Mcity** (standalone runs only, since CARLA
-has no matching world).
+maps ship with the repository: **Town01**, **Kashiwanoha** and **Mcity**.
 
 ```bash
 # Install (Python 3.10-3.12, gcc/g++ for the Cython extensions)
 conda create -n terasim python=3.10 -y && conda activate terasim
 ./setup_environment.sh
 
-# Standalone NADE run, no CARLA needed
+# Standalone NADE run, on SUMO alone
 python scripts/run_experiments_debug.py --config examples/scenarios/Mcity_safety_assessment.yaml
 
 # Co-simulation against a running CARLA server
@@ -73,19 +67,6 @@ python -m terasim_service.run_cosim --config examples/scenarios/cosim_town01_dt0
 For the full three-way setup, `docker-compose.cosim-inprocess.yml` builds on
 `Dockerfile.cosim` and runs `examples/scripts/run_3cosim_inprocess.sh` against a
 CARLA server that an Autoware bridge is already attached to.
-
-## Publications
-
-TeraSim builds on the following research:
-
-* **NDE** – Learning naturalistic driving environment with statistical realism
-  [Paper](https://doi.org/10.1038/s41467-023-37677-5) | [Code](https://github.com/michigan-traffic-lab/Learning-Naturalistic-Driving-Environment)
-
-* **NADE** – Intelligent driving intelligence test with naturalistic and adversarial environment
-  [Paper](https://doi.org/10.1038/s41467-021-21007-8) | [Code](https://github.com/michigan-traffic-lab/Naturalistic-and-Adversarial-Driving-Environment)
-
-* **D2RL** – Dense deep reinforcement learning for AV safety validation
-  [Paper](https://doi.org/10.1038/s41586-023-05732-2) | [Code](https://github.com/michigan-traffic-lab/Dense-Deep-Reinforcement-Learning)
 
 ## **📄 License**
 

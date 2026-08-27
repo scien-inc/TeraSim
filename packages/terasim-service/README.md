@@ -8,9 +8,8 @@ for example — is fed back into SUMO as the "AV", so the background traffic
 reacts to it.
 
 The TeraSim simulation loop and the CARLA client run as two threads of a single
-process and exchange states and commands as plain Python objects. There is no
-transport, no serialization and no separate service to start, despite the
-package name.
+process and exchange states and commands as plain Python objects, so a run is a
+single command against a CARLA server.
 
 ## Layout
 
