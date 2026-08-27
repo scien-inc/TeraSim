@@ -1,4 +1,5 @@
-# cosim_town01_dt005.yaml の逆境ゼロ版(検証用: 全 adversity probability=0)
+# Zero-adversity variant of cosim_town01_dt005.yaml (verification runs: every
+# adversity probability set to 0).
 environment:
   class: NADEWithAV
   module: terasim_nde_nade.envs
