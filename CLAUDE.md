@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 TeraSim is an open-source traffic simulation platform designed for naturalistic and adversarial testing of autonomous vehicles (AVs), built upon SUMO (Simulation of Urban MObility).
 
-This is the **tier4 fork**, reduced to the minimum needed for 3-way co-simulation (Autoware × CARLA × TeraSim): the core simulation engine, the NDE-NADE algorithms, a single-process CARLA co-simulation link (`terasim-service`), and FCD visualization tools. The upstream extras (TeraSim-World/Cosmos, environment generation, dataset tooling, the Redis/FastAPI service) were removed from this fork.
+This is a **reduced fork of mcity/TeraSim**, reworked for three-way co-simulation (Autoware × CARLA × TeraSim): the core simulation engine, the NDE-NADE algorithms, a single-process CARLA co-simulation link (`terasim-service`), and FCD visualization tools. The upstream extras (TeraSim-World/Cosmos, environment generation, dataset tooling, the Redis/FastAPI service) were removed from this fork.
 
 ## Common Development Commands
 
@@ -38,12 +38,13 @@ ruff check packages/
 ### Running Simulations
 
 The runners are generic; everything map-specific lives in the scenario YAML.
-Bundled ready-to-run scenarios: `cosim_town01.yaml` (co-sim + standalone) and
-`Mcity_safety_assessment.yaml` (standalone NADE only — CARLA has no Mcity map).
+Bundled ready-to-run scenarios: `cosim_town01.yaml` and `cosim_kashiwanoha_dt005.yaml`
+(co-sim + standalone) and `Mcity_safety_assessment.yaml` (standalone NADE only —
+CARLA has no Mcity map).
 
 ```bash
 # CARLA co-simulation, single process (a CARLA server must be running)
-python -m terasim_service.run_cosim --config examples/scenarios/cosim_town01.yaml --carla_port 2013
+python -m terasim_service.run_cosim --config examples/scenarios/cosim_town01.yaml
 
 # Standalone NADE run (no CARLA), GUI controlled by the scenario yaml
 python scripts/run_experiments_debug.py --config examples/scenarios/Mcity_safety_assessment.yaml
@@ -101,11 +102,11 @@ TeraSim/
   (two threading.Events; states/commands passed as plain Python objects, no serialization)
 - `CarlaCosim` (`utils/carla/cosim.py`) mirrors SUMO background traffic into CARLA and feeds an
   externally driven ego (role_name `ego_vehicle`) back into SUMO as the "AV"
-- Three tick modes (`--tick_mode`): `follow` (default) — the psim bridge owns `world.tick()`
-  and this process only follows via `world.wait_for_tick()`; `master` (stage 3a) — this
+- Three tick modes (`--tick_mode`): `follow` (default) — the ego-side bridge owns `world.tick()`
+  and this process only follows via `world.wait_for_tick()`; `master` — this
   process is the clock master, ticking CARLA on a fixed `step_length` cadence and running
   one SUMO step serially inside each cycle (the bridge must run with `tick_follower:=true`);
-  `async` (stage 3b) — nobody ticks: this process clears `synchronous_mode` so CARLA
+  `async` — nobody ticks: this process clears `synchronous_mode` so CARLA
   free-runs with a variable delta, and paces SUMO on a `step_length` wall-clock timer
   with catch-up for late cycles (the bridge must run with `tick_follower:=true` and must
   be started BEFORE this process — the last settings write wins)

@@ -7,89 +7,72 @@
 </div>
 
 <p align="center">
-<strong>TeraSim (tier4 fork) — naturalistic & adversarial traffic simulation with a single-process CARLA co-simulation link</strong>
+<strong>Naturalistic and adversarial traffic simulation for discovering unknown unsafe events</strong>
 </p>
 
 ---
 
 ## Overview
 
-This is the [tier4](https://github.com/tier4/TeraSim) fork of [mcity/TeraSim](https://github.com/mcity/TeraSim), reduced to the minimum needed for **3-way co-simulation (Autoware × CARLA × TeraSim)**:
+TeraSim is an open-source platform for automated autonomous-vehicle simulation.
+Its objective is to **efficiently uncover real-world unknown unsafe events** by
+automatically creating diverse and statistically realistic traffic environments:
 
-- **NDE/NADE traffic simulation** on SUMO: naturalistic background traffic with adversarial maneuvers (`terasim`, `terasim-nde-nade`)
-- **A single-process CARLA co-simulation link** (`terasim-service`): the TeraSim simulation loop and the CARLA-facing client run as two threads of one process, exchanging states and commands as plain Python objects. TeraSim background traffic is mirrored into a running CARLA server; an externally driven ego (e.g. Autoware via `autoware_carla_interface`) is fed back into SUMO so background traffic reacts to it.
-- **FCD visualization** (`terasim-vis` + `scripts/visualize_fcd.py`) and an **OpenDRIVE→SUMO map conversion pipeline** (`scripts/xodr_to_sumo_converter.py`, sample maps in `examples/xodr_sumo_maps/`)
+- **Naturalistic driving environment (NDE)** — background traffic derived from
+  large-scale naturalistic driving data, statistically realistic rather than
+  hand-scripted.
+- **Adversarial scenario synthesis (NADE)** — rare, high-risk interactions
+  (aggressive cut-ins, unexpected crossings, ...) injected into that traffic to
+  reach failures a nominal drive never encounters.
+- Built on [SUMO](https://www.eclipse.org/sumo/), and able to drive third-party
+  simulators such as [CARLA](https://carla.org/) and
+  [Autoware](https://github.com/autowarefoundation/autoware).
 
-The upstream extras (TeraSim-World/Cosmos generative sensor simulation, environment generation, dataset tooling, the Redis/FastAPI service and its clients) have been removed from this fork; see the upstream repository for those.
+## About this fork
 
-## Repository Layout
+This is a reduced fork of [mcity/TeraSim](https://github.com/mcity/TeraSim),
+reworked for **three-way co-simulation: Autoware × CARLA × TeraSim**. Autoware
+drives the ego vehicle through
+[`autoware_carla_interface`](https://github.com/autowarefoundation/autoware_universe/tree/main/simulator/autoware_carla_interface),
+and TeraSim supplies the background traffic around it.
 
-```
-TeraSim/
-├── packages/
-│   ├── terasim/            # Core simulation engine (SUMO integration, agents, pipeline)
-│   ├── terasim-nde-nade/   # Naturalistic & adversarial environment algorithms (Cython)
-│   ├── terasim-service/    # Single-process CARLA co-simulation link
-│   └── terasim-vis/        # Visualization tools (FCD plots/videos)
-├── examples/
-│   ├── maps/               # SUMO nets used by the example scenarios (Town01, ...)
-│   ├── scenarios/          # Scenario YAMLs (cosim_town01.yaml, ...)
-│   ├── scripts/            # Co-simulation launcher script
-│   └── xodr_sumo_maps/     # OpenDRIVE→SUMO converter test maps
-├── configs/visulation/     # visualize_fcd.py config example
-├── scripts/                # Runners and tooling (see below)
-├── docs/                   # OpenDRIVE / SUMO plain-XML format notes
-└── tests/                  # Test suites (core, NDE-NADE)
-```
+- **Single-process CARLA link** (`terasim-service`): the TeraSim loop and the
+  CARLA client run as two threads of one process, exchanging states and commands
+  as plain Python objects. TeraSim traffic is mirrored into a running CARLA
+  server; the externally driven ego is fed back into SUMO so the background
+  traffic reacts to it. TeraSim can follow the ego side's clock or own it.
+- **Optional physics-based background vehicles**: selected CARLA vehicles are
+  driven by Ackermann control instead of being teleported, and their measured
+  pose is written back into SUMO.
+- **Everything outside that scope was removed**: TeraSim-World/Cosmos generative
+  sensor simulation, environment generation, dataset tooling, and the
+  Redis/FastAPI service with its clients. See the upstream repository for those.
 
-## Installation
-
-### Native (conda)
-
-```bash
-git clone https://github.com/tier4/TeraSim.git
-cd TeraSim
-conda create -n terasim python=3.10 -y
-conda activate terasim
-./setup_environment.sh
-```
-
-### Docker (co-simulation image)
-
-```bash
-docker build -f Dockerfile.cosim -t terasim-service:latest .
-```
-
-**Requirements**: Python 3.10–3.12, SUMO 1.23.1 (installed by the setup script), gcc/g++ (Cython extensions).
+Detailed documentation of the co-simulation setup will follow.
 
 ## Running
 
-The runners are generic: everything map-specific (SUMO net paths, routes,
-adversity setup, run time) lives in a scenario YAML under
-`examples/scenarios/`, which you pass to the runner. Two ready-to-run
-scenarios ship with their maps: **Town01** (CARLA's stock map — works for
-both co-simulation and standalone runs) and **Mcity** (standalone NADE runs;
-CARLA has no matching map here).
+Everything map-specific (SUMO net, routes, adversity setup, run time) lives in a
+scenario YAML under `examples/scenarios/`, which you pass to the runner. Three
+maps ship with the repository: **Town01** (CARLA's stock map), **Kashiwanoha**
+(a public Japanese campus map) and **Mcity** (standalone runs only, since CARLA
+has no matching world).
 
 ```bash
-# CARLA co-simulation, single process (a CARLA server must be running)
-python -m terasim_service.run_cosim \
-    --config examples/scenarios/cosim_town01.yaml --carla_port 2013
+# Install (Python 3.10-3.12, gcc/g++ for the Cython extensions)
+conda create -n terasim python=3.10 -y && conda activate terasim
+./setup_environment.sh
 
-# Standalone NADE run (no CARLA needed)
+# Standalone NADE run, no CARLA needed
 python scripts/run_experiments_debug.py --config examples/scenarios/Mcity_safety_assessment.yaml
-python scripts/run_experiments_debug.py --config examples/scenarios/cosim_town01.yaml
 
-# FCD trajectory visualization (fcd_all output -> plots/video)
-python scripts/visualize_fcd.py configs/visulation/example.yaml
-
-# OpenDRIVE -> SUMO net conversion
-python scripts/xodr_to_sumo_converter.py --help
+# Co-simulation against a running CARLA server
+python -m terasim_service.run_cosim --config examples/scenarios/cosim_town01_dt005.yaml
 ```
 
-For the full 3-way setup (Autoware + CARLA + TeraSim in passive mode) see
-`docker-compose.cosim-inprocess.yml` and
-`examples/scripts/run_3cosim_inprocess.sh`.
+For the full three-way setup, `docker-compose.cosim-inprocess.yml` builds on
+`Dockerfile.cosim` and runs `examples/scripts/run_3cosim_inprocess.sh` against a
+CARLA server that an Autoware bridge is already attached to.
 
 ## Publications
 

@@ -1,7 +1,7 @@
 # Repository Guidelines
 
-This is the tier4 fork of mcity/TeraSim, reduced to the minimum needed for
-3-way co-simulation (Autoware × CARLA × TeraSim). See `CLAUDE.md` for the
+This is a reduced fork of mcity/TeraSim, reworked for three-way
+co-simulation (Autoware × CARLA × TeraSim). See `CLAUDE.md` for the
 full guide (layout, commands, architecture); it applies to all coding agents.
 
 - `packages/`: `terasim` (core), `terasim-nde-nade` (adversarial algorithms),
