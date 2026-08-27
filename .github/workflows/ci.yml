@@ -32,8 +32,8 @@ jobs:
     - name: Install dependencies
       run: uv sync --all-packages --group dev
 
-    - name: Run physical co-simulation tests
-      run: uv run --with carla==0.9.16 pytest tests/test_service/test_physics_cosim.py
+    - name: Run tests
+      run: uv run --with carla==0.9.16 pytest tests
 
     - name: Build package wheels
       run: |
