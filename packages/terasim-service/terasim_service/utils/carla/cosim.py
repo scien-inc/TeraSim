@@ -3102,7 +3102,7 @@ class CarlaCosim(object):
         print("AckermannControlTrace " + json.dumps(trace, sort_keys=True), flush=True)
 
     def tick(self):
-        """One co-sim step. Dispatches on the tick mode (design: stage 3a/3b docs).
+        """One co-sim step. Dispatches on the tick mode.
 
         follow (default): _tick_follow() - the passive pipeline (the bridge
         owns world.tick(); this process follows via wait_for_tick).
@@ -3206,14 +3206,14 @@ class CarlaCosim(object):
         return True
 
     def _tick_async(self):
-        """One cycle in async mode (stage 3b: free-running CARLA, wall-paced SUMO).
+        """One cycle in async mode (free-running CARLA, wall-paced SUMO).
 
         Nobody calls world.tick(): run_cosim cleared synchronous_mode, so the
         server advances by itself with a variable delta (sim time tracks real
         time by construction). This loop paces SUMO on the same step_length
         wall-clock grid as _tick_master; a cycle that arrives late additionally
         runs the missed periods as extra SUMO steps so SUMO time keeps tracking
-        real time (traffic-cosim-sync-design.md §4.1), capped at
+        real time, capped at
         _async_catchup_max_steps (debt beyond the cap is dropped = slow motion,
         never a long burst). All CARLA reads in the cycle (get_snapshot(),
         get_transform()) are served from the client-side state cache fed by the
@@ -3424,9 +3424,9 @@ class CarlaCosim(object):
             if not getattr(self.args, "skip_tls", False):
                 self.sync_cosim_tls_to_carla(self._inproc_prev_state)
 
-        # 3-cosim passive mode: the psim bridge (autoware_carla_interface) is the sole
+        # passive mode: the ego-side bridge (autoware_carla_interface) is the sole
         # owner of world.tick(). CarlaCosim does not tick the world; it waits for the
-        # psim tick so the two clients stay synchronized on one CARLA server.
+        # bridge's tick so the two clients stay synchronized on one CARLA server.
         if getattr(self.args, "passive_tick", False):
             snapshot = self.world.wait_for_tick()
             self._last_world_frame = getattr(snapshot, "frame", None)
@@ -4496,7 +4496,7 @@ class CarlaCosim(object):
         """
         self._shutdown_collision_sensors()
 
-        # In all 3-cosim modes (follow, master AND async) the psim side is
+        # In all three tick modes (follow, master AND async) the ego side is
         # still alive when this process exits, so the world settings and the
         # ego are preserved. In follow mode the bridge owns synchronous_mode;
         # in master mode nobody ticks after us and the operating rule is the

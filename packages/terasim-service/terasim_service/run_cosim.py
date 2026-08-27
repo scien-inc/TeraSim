@@ -8,27 +8,26 @@ main thread, and the two rendezvous through TeraSimCoSimInProcessPlugin
 serialization of states or commands).
 
 Three tick modes (--tick_mode):
-  follow (default) - 3-cosim passive mode, preserved as-is: the psim bridge
-    (autoware_carla_interface) owns world.tick(); this process only follows via
+  follow (default) - passive mode: the ego-side bridge (for example
+    autoware_carla_interface) owns world.tick(); this process only follows via
     world.wait_for_tick() and mirrors TeraSim/SUMO background traffic into
     CARLA.
-  master (stage 3a) - this process is the clock master: it applies the previous
+  master - this process is the clock master: it applies the previous
     SUMO result, owns one world.tick() on a fixed step_length cadence, collects
     that CARLA frame's feedback, and requests one SUMO step whose result is
     consumed by the next cycle. At most one SUMO step is pending; the bridge
-    must run passively (tick_follower:=true). Design:
-    traffic-cosim-sync-design.md §4.2.
-  async (stage 3b) - nobody ticks: this process clears synchronous_mode so the
+    must run passively (tick_follower:=true).
+  async - nobody ticks: this process clears synchronous_mode so the
     CARLA server free-runs with a variable delta (sim time tracks real time by
     construction) and paces SUMO on a step_length wall-clock timer, catching up
     missed periods after a slow cycle; the bridge must run passively
-    (tick_follower:=true). Design: traffic-cosim-sync-design.md §4.1.
-In both modes the psim ego (role_name="ego_vehicle") is protected from cleanup
+    (tick_follower:=true).
+In all three modes the ego (role_name="ego_vehicle") is protected from cleanup
 and its pose is fed back to the SUMO "AV" so background traffic avoids it.
 
 Usage:
   python -m terasim_service.run_cosim \
-      --config examples/scenarios/cosim_town01.yaml --carla_port 2013
+      --config examples/scenarios/cosim_town01_dt005.yaml
 """
 
 import argparse
@@ -72,29 +71,29 @@ def main():
                    help="max seconds to wait for the SUMO network to load")
     # CARLA client options (same set the removed two-process client scripts took)
     p.add_argument("--carla_host", default="127.0.0.1")
-    p.add_argument("--carla_port", default=2013, type=int,
-                   help="psim CARLA RPC port (default 2013)")
+    p.add_argument("--carla_port", default=2000, type=int,
+                   help="CARLA RPC port (default 2000)")
     p.add_argument("--carla_timeout", default=600.0, type=float,
                    help="CARLA client timeout; large to tolerate procedurally-generated "
                         "worlds where get_map().to_opendrive() may take time")
     p.add_argument("-s", "--step_length", default=0.05, type=float)
     p.add_argument("--map_name", default="", type=str,
-                   help="leave empty: psim already loaded the world; do NOT reload")
+                   help="leave empty: the ego-side bridge already loaded the world; do NOT reload")
     p.add_argument("--tick_mode", default="follow", choices=["follow", "master", "async"],
-                   help="follow (default): the psim bridge owns world.tick(); this "
-                        "process follows via wait_for_tick (current behavior). "
-                        "master: this process is the clock master (stage 3a) -- it "
+                   help="follow (default): the ego-side bridge owns world.tick(); this "
+                        "process follows via wait_for_tick. "
+                        "master: this process is the clock master -- it "
                         "applies the previous SUMO result, ticks CARLA on a fixed "
                         "step_length cadence, and requests the next SUMO step after "
                         "collecting feedback; the bridge must run with "
-                        "tick_follower:=true. async: nobody ticks (stage 3b) -- "
+                        "tick_follower:=true. async: nobody ticks -- "
                         "CARLA free-runs with a variable delta and this process "
                         "paces SUMO on a step_length wall-clock timer; the bridge "
                         "must run with tick_follower:=true")
     p.add_argument("--sync_tls", action="store_true",
                    help="also sync SUMO traffic lights -> CARLA (off by default)")
     p.add_argument("--protected_roles", nargs="+", default=["AV", "ego_vehicle"],
-                   help="CARLA role_names never destroyed by cleanup (psim ego = ego_vehicle)")
+                   help="CARLA role_names never destroyed by cleanup (the bridge spawns the ego as ego_vehicle)")
     p.add_argument("--av_carla_role", default="ego_vehicle",
                    help="CARLA role_name whose pose is fed back to the SUMO AV")
     args = p.parse_args()
@@ -110,10 +109,10 @@ def main():
     logger.info(f"[run_cosim] GIL switch interval: {sys.getswitchinterval() * 1000:.2f}ms")
 
     # 3-cosim mode flags consumed by CarlaCosim.tick()/_cleanup_actors()/close().
-    # follow (default): the psim bridge owns world.tick(); we only wait_for_tick.
-    # master (stage 3a): we own world.tick() on a fixed cadence; the bridge runs
+    # follow (default): the ego-side bridge owns world.tick(); we only wait_for_tick.
+    # master: we own world.tick() on a fixed cadence; the bridge runs
     # passively with tick_follower:=true.
-    # async (stage 3b): nobody ticks; CARLA free-runs (variable delta) and we
+    # async: nobody ticks; CARLA free-runs (variable delta) and we
     # pace SUMO on a wall-clock timer; the bridge runs passively as in master.
     args.passive_tick = args.tick_mode == "follow"
     args.tick_master = args.tick_mode == "master"
@@ -231,7 +230,7 @@ def main():
             f"[run_cosim] tick_mode=async: CARLA free-runs (variable delta); "
             f"SUMO paced by a {args.step_length * 1000:.0f}ms wall-clock timer"
         )
-    # In follow mode do NOT apply world settings: the psim bridge owns
+    # In follow mode do NOT apply world settings: the ego-side bridge owns
     # synchronous_mode and fixed_delta_seconds.
 
     exit_code = 0
