@@ -6,26 +6,23 @@ environment:
       cache_radius: 100
       control_radius: 50
       route:
-      - '20.0'
-      - '40.0'
-      - '42.0'
-      - '27.0'
-      - '24.0'
-      - '35.0'
-      - '15.0'
-      - '38.0'
-      - '18.0'
-      - '0.0'
-      - '2.0'
-      - '26.0'
-      - '17.0'
-      - '8.0'
-      - '9.0'
-      - '12.0'
-      - '6.0'
-      - '29.0'
-      - '30.0'
-      - '11.0'
+      - edge_27
+      - edge_62
+      - edge_42
+      - edge_14
+      - edge_13
+      - edge_39
+      - edge_40
+      - edge_45
+      - edge_46
+      - edge_63
+      - edge_21
+      - edge_66
+      - edge_67
+      - edge_20
+      - edge_19
+      - edge_57
+      - edge_77
       type: NDE_URBAN
     MOBIL_lc_flag: true
     adversity_cfg:
